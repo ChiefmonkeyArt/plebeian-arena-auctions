@@ -1,0 +1,48 @@
+name: Release
+
+# On a v* tag: build the self-contained Linux x86_64 tarball the Torii Suite
+# installs (scripts/package.sh) and attach it, with its SHA-256, to a GitHub
+# release. The Suite pins that SHA-256; nothing is built on the VPS.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: chain/go.mod
+          cache-dependency-path: chain/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: astral-sh/setup-uv@v6
+      - name: Package
+        env:
+          TAG: ${{ github.ref_name }}
+        run: scripts/package.sh "$TAG" out
+      - name: Build provenance
+        # Needs a public repo (or GitHub Enterprise); the Suite's pinned SHA-256 is the check either way.
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: out/plebeian-auctions-*.tar.gz
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" out/plebeian-auctions-"$TAG".tar.gz out/plebeian-auctions-"$TAG".tar.gz.sha256 \
+            --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Fake-sats auction arena for Torii nodes. SHA-256: $(cut -d' ' -f1 out/plebeian-auctions-"$TAG".tar.gz.sha256)"

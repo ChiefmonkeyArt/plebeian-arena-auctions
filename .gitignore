@@ -3,3 +3,5 @@ run/
 bin/
 web/node_modules/
 web/dist/
+node_modules
+dist-release/

@@ -121,7 +121,7 @@ func cmdGateway(args []string) {
 	fs := flag.NewFlagSet("gateway", flag.ExitOnError)
 	root := fs.String("root", "run/chain", "chain root")
 	static := fs.String("static", "web/dist", "front end dir")
-	addr := fs.String("addr", "0.0.0.0:8080", "listen addr")
+	addr := fs.String("addr", "127.0.0.1:8080", "listen addr")
 	mint := fs.String("mint", "http://127.0.0.1:3338", "mint")
 	fs.Parse(args)
 	bin, _ := os.Executable()

@@ -1,0 +1,4 @@
+cashu==0.20.2
+# environs 9.5 needs marshmallow 3; slowapi 0.1.9 needs the limits 3 strategies
+marshmallow<4
+limits<4

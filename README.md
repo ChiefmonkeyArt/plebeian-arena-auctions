@@ -40,3 +40,15 @@ Open http://127.0.0.1:8080. Other commands:
 - Native NUT-11 3-of-4 multisig instead of FROST; CometBFT p2p instead of FIPS; cashu-ts instead of Coco.
 - Per-browser generated Nostr keys (no NIP-07 yet); chat is signed but held in gateway memory, not on chain.
 - App state is in memory and replays from genesis on restart.
+
+## Torii node install
+
+Tagging `v*` runs `.github/workflows/release.yml`, which builds `plebeian-auctions-<tag>.tar.gz` with `scripts/package.sh`. The tarball holds the static `bin/arena`, the built front end and a private CPython 3.12 with Nutshell, installed from the hash-pinned `mint/requirements.txt` using prebuilt wheels only. Nothing is built on the VPS.
+
+The Torii Suite installs a pinned release with `installers/install-auctions.sh` (opt-in, `INSTALL_AUCTIONS=1`) at `https://auctions.<domain>/`. It has no launcher card: it is for the team, not the public. The gateway listens on loopback only and nginx fronts it. The four validators, the co-signers and the mint all bind `127.0.0.1`.
+
+Build a tarball locally:
+
+```bash
+scripts/package.sh v0.1.0 dist-release
+```
