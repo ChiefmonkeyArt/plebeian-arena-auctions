@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Plebeian Auctions · Arena (fake sats, 4 validators)</title>
+<script>window.__API_BASE__ = '__PORT_8080__';</script>
+<link rel="icon" href="./assets/logo.svg">
+</head>
+<body data-layout="c">
+
+<header class="topbar">
+  <div class="brand">
+    <img src="./assets/logo.svg" alt="" width="26" height="26">
+    <span class="brand-name">Plebeian <em>Auctions</em></span>
+    <span class="mock-tag">Fake sats · 4 validators</span>
+  </div>
+  <nav class="switch" role="tablist" aria-label="Act as" data-users></nav>
+  <div class="top-actions">
+    <button class="wallet-chip" data-act="wallet" aria-label="Open wallet">
+      <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M13 2 4 14h6l-1 8 9-12h-6l1-8z"/></svg>
+      <span data-v="balance">0</span><small>sats</small>
+    </button>
+    <button class="pg-btn net-btn" data-act="network" aria-label="Open validator network">
+      <span class="net-dots" data-v="netdots"></span>
+      <span>Network</span>
+    </button>
+  </div>
+</header>
+
+<main id="app">
+<div class="c-wrap">
+  <div class="arena-ticker" aria-hidden="true"><div class="arena-ticker-track" data-ticker></div></div>
+  <header class="c-head">
+    <div>
+      <div class="c-tags"><span class="live-badge" data-v="livebadge"><i></i>LIVE</span><span class="tag">Lot <span data-v="lotno"></span></span><span class="tag" data-v="closemode"></span><span class="tag" data-v="consensus"></span></div>
+      <h1 data-v="title">Loading the arena…</h1>
+    </div>
+    <button class="c-seller" data-act="seller-sheet"><img src="./assets/live-frame.jpg" alt=""><span><b data-v="sellername">Seller</b><small data-v="sellermeta"></small></span></button>
+  </header>
+
+  <div class="c-grid">
+    <section class="c-media">
+      <div class="c-screen">
+        <video class="live-video c-video" muted loop playsinline autoplay preload="metadata" poster="./assets/live-frame.jpg" src="./assets/live-pitch-v6.mp4"></video>
+        <img class="c-still" data-v="mainimg" alt="Lot photo" hidden>
+        <span class="live-badge"><i></i>LIVE</span>
+      </div>
+      <div class="c-strip">
+        <button class="c-strip-live on" data-act="show-live"><span class="live-dot"></span>Live</button>
+        <div class="c-thumbs" data-thumbs></div>
+      </div>
+    </section>
+
+    <section class="c-core">
+      <div class="ring" data-urgent>
+        <svg viewBox="0 0 200 200" aria-hidden="true">
+          <circle cx="100" cy="100" r="88" class="ring-bg"/>
+          <circle cx="100" cy="100" r="88" class="ring-fg" data-v="ring"/>
+        </svg>
+        <div class="ring-inner">
+          <div class="ring-time" data-v="timer">–:––</div>
+          <div class="ring-label" data-v="ringlabel"></div>
+        </div>
+      </div>
+      <div class="c-price">
+        <div class="label" data-v="pricelabel">Starting bid</div>
+        <div class="num"><span data-v="price">0</span><small>sats</small></div>
+        <div class="c-leader" data-v="leaderline"></div>
+      </div>
+      <div class="mystatus" data-v="mystatus"></div>
+      <div class="c-ladder">
+        <button data-act="bid-step" data-steps="0"><small>Next</small><b data-v="step0"></b></button>
+        <button data-act="bid-step" data-steps="2"><small>Jump</small><b data-v="step2"></b></button>
+        <button data-act="bid-step" data-steps="5"><small>Big move</small><b data-v="step5"></b></button>
+      </div>
+      <div class="c-custom">
+        <div class="mode-toggle dark" role="radiogroup" aria-label="Bid type">
+          <button data-act="mode" data-mode="bid" class="on">Exact</button>
+          <button data-act="mode" data-mode="max">Max</button>
+        </div>
+        <label class="amount-field dark">
+          <input data-in="bid" inputmode="numeric" aria-label="Bid amount in sats">
+          <span>sats</span>
+        </label>
+        <button class="btn-primary" data-act="bid-custom"><span data-v="bidcta">Place bid</span></button>
+      </div>
+      <div class="swipe" data-swipe aria-label="Swipe to bid">
+        <div class="swipe-fill"></div>
+        <span class="swipe-label">Swipe to bid <b data-v="step0b"></b></span>
+        <span class="swipe-knob">›</span>
+      </div>
+      <div class="escrow-note" data-v="escrownote"></div>
+    </section>
+
+    <section class="c-feeds">
+      <div class="c-tabs" role="tablist">
+        <button class="on" data-act="ctab" data-tab="bids">Bids <span data-v="bidcountn"></span></button>
+        <button data-act="ctab" data-tab="chat">Chat</button>
+        <button data-act="ctab" data-tab="chain">Chain</button>
+      </div>
+      <ol class="feed bidfeed dark c-pane" data-pane="bids" data-feed="bids"><li class="empty">The arena is quiet…</li></ol>
+      <div class="c-pane" data-pane="chat" hidden>
+        <ol class="feed comfeed dark" data-feed="comments"></ol>
+        <form class="comment-form dark" data-act="comment-form">
+          <input data-in="comment" placeholder="Talk some trash…" aria-label="Chat message" maxlength="280">
+          <button class="btn-primary">Send</button>
+        </form>
+      </div>
+      <ol class="feed dark c-pane chainfeed" data-pane="chain" data-feed="chain" hidden></ol>
+    </section>
+  </div>
+
+  <section class="c-board">
+    <div class="c-board-head"><h2>Leaderboard</h2><span class="muted">Highest bid per bidder</span></div>
+    <ol class="leader-list" data-slot="leaderboard"></ol>
+    <div class="c-stats">
+      <div><b data-v="bidcountn"></b><span>bids</span></div>
+      <div><b data-v="bidders"></b><span>bidders</span></div>
+      <div><b data-v="extensionsn"></b><span>time extensions</span></div>
+      <div><b data-v="held"></b><span>sats you have held</span></div>
+    </div>
+    <div class="v-strip" data-slot="vstrip"></div>
+  </section>
+
+  <section class="c-next">
+    <div class="c-board-head"><h2>Next in the arena</h2><button class="btn-ghost sm dark" data-act="new-lot">List a lot</button></div>
+    <div class="next-row" data-slot="queue"></div>
+  </section>
+
+  <div class="c-sticky">
+    <div><b><span data-v="price"></span></b><span class="timer" data-v="timer"></span></div>
+    <button class="btn-primary" data-act="bid-step" data-steps="0">Bid <span data-v="step0"></span></button>
+  </div>
+</div>
+</main>
+
+<div class="toasts" aria-live="polite"></div>
+<div class="going" aria-hidden="true"><span></span></div>
+<div class="sold-stamp" aria-hidden="true"><div class="stamp"><small>Lot <i></i></small><b>SOLD</b><em></em></div></div>
+<canvas class="confetti" aria-hidden="true"></canvas>
+<div class="fly-layer" aria-hidden="true"></div>
+
+<div class="drawer" data-drawer="wallet" hidden>
+  <div class="drawer-bg" data-act="close-drawer"></div>
+  <aside class="drawer-card" role="dialog" aria-label="Wallet">
+    <header><h2><span data-v="username"></span>'s wallet</h2><button class="x" data-act="close-drawer" aria-label="Close">×</button></header>
+    <div class="w-balance">
+      <div class="w-big"><span data-v="balance"></span><small> sats</small></div>
+      <div class="muted"><span data-v="held"></span> sats locked in 3-of-4 escrow</div>
+    </div>
+    <p class="w-note">Real Cashu ecash from a test mint that pays its own invoices. Fake sats only, no value.</p>
+    <div class="w-topups">
+      <button data-act="topup" data-amt="1000">+1k</button>
+      <button data-act="topup" data-amt="10000">+10k</button>
+      <button data-act="topup" data-amt="50000">+50k</button>
+      <button data-act="topup" data-amt="100000">+100k</button>
+    </div>
+    <label class="switch-row"><input type="checkbox" data-in="autotopup" checked> <span>Top up automatically when a bid needs it</span></label>
+    <h3>Escrows</h3>
+    <ol class="ledger" data-slot="escrows"></ol>
+    <h3>Activity</h3>
+    <ol class="ledger" data-slot="ledger"></ol>
+    <h3>Keys (this browser only)</h3>
+    <p class="w-keys" data-v="keys"></p>
+  </aside>
+</div>
+
+<div class="drawer" data-drawer="network" hidden>
+  <div class="drawer-bg" data-act="close-drawer"></div>
+  <aside class="drawer-card" role="dialog" aria-label="Validator network">
+    <header><h2>Validators</h2><button class="x" data-act="close-drawer" aria-label="Close">×</button></header>
+    <p class="w-note" data-v="netsummary"></p>
+    <div class="v-cards" data-slot="vcards"></div>
+    <h3>Rival bidders</h3>
+    <div class="seg" data-seg="bots">
+      <button data-v="off">Off</button><button data-v="chill">Chill</button><button data-v="busy">Busy</button><button data-v="frenzy">Frenzy</button>
+    </div>
+    <p class="hint">Rivals are the other local users. Their bids go through the real flow: lock, sign, consensus, refund.</p>
+    <h3>Rejected by consensus</h3>
+    <ol class="ledger" data-slot="rejections"></ol>
+  </aside>
+</div>
+
+<div class="drawer" data-drawer="newlot" hidden>
+  <div class="drawer-bg" data-act="close-drawer"></div>
+  <aside class="drawer-card" role="dialog" aria-label="List a lot">
+    <header><h2>List a lot</h2><button class="x" data-act="close-drawer" aria-label="Close">×</button></header>
+    <p class="w-note">Listing as <b data-v="username"></b>. The clock starts when validators include it in a block.</p>
+    <form class="lot-form" data-act="lot-form">
+      <label>Title<input name="title" required maxlength="120" value="Leica M3 rangefinder, 1957"></label>
+      <label>Description<textarea name="description" rows="3" maxlength="2000">Clean glass, recent service, original strap.</textarea></label>
+      <label>Photo<select name="image"><option value="./assets/lot-camera.jpg">Camera</option><option value="./assets/lot-keyboard.jpg">Keyboard</option><option value="./assets/watch-1.jpg">Watch</option></select></label>
+      <div class="lf-row"><label>Start (sats)<input name="startPrice" type="number" min="1" value="1000"></label><label>Step (sats)<input name="minIncrement" type="number" min="1" value="100"></label></div>
+      <label>Duration<select name="durationSec"><option value="60">1 minute</option><option value="120" selected>2 minutes</option><option value="300">5 minutes</option><option value="900">15 minutes</option></select></label>
+      <button class="btn-primary block">Sign and list</button>
+    </form>
+  </aside>
+</div>
+
+<div class="modal" data-modal="outcome" hidden>
+  <div class="drawer-bg" data-act="close-modal"></div>
+  <div class="modal-card" role="dialog" aria-label="Auction outcome">
+    <button class="x" data-act="close-modal" aria-label="Close">×</button>
+    <div class="o-tabs" role="tablist">
+      <button data-act="otab" data-o="winner">Winning buyer</button>
+      <button data-act="otab" data-o="seller">Seller</button>
+      <button data-act="otab" data-o="loser">Outbid bidders</button>
+    </div>
+    <div class="o-body" data-slot="outcome"></div>
+  </div>
+</div>
+
+<div class="modal" data-modal="seller" hidden>
+  <div class="drawer-bg" data-act="close-modal"></div>
+  <div class="modal-card narrow" role="dialog" aria-label="Seller">
+    <button class="x" data-act="close-modal" aria-label="Close">×</button>
+    <div data-slot="seller-full"></div>
+  </div>
+</div>
+
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>

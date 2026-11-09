@@ -1,0 +1,625 @@
+import './template.css';
+import './arena.css';
+import { ArenaClient, newIdentity, idPub, walletPub, totalSats, lockOf } from './lib/arena.js';
+
+// ---------- basics ----------
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+const fmt = (n) => Math.round(n || 0).toLocaleString('en-GB');
+const esc = (t) => String(t ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const clock = (s) => new Date(s * 1000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const rawApi = window.__API_BASE__ || '';
+const base = (rawApi && !rawApi.startsWith('__PORT_'))
+  ? new URL(rawApi, location.href).href.replace(/\/$/, '')
+  : new URL('.', location.href).href.replace(/\/$/, '');
+const api = new ArenaClient(base);
+const LS = 'arena.v1.';
+const load = (k, d) => { try { return JSON.parse(localStorage.getItem(LS + k)) ?? d; } catch { return d; } };
+const save = (k, v) => localStorage.setItem(LS + k, JSON.stringify(v));
+
+const USERS = ['Seller', 'Alice', 'Bob', 'Carol'];
+const COLORS = { Seller: '#FF3EB5', Alice: '#16A35A', Bob: '#F7931A', Carol: '#6C5CE7' };
+const ids = load('ids', null) || Object.fromEntries(USERS.map((n) => [n, newIdentity(n)]));
+save('ids', ids);
+const pubToUser = {};
+USERS.forEach((n) => { pubToUser[idPub(ids[n])] = n; });
+
+// per-user wallet: { proofs:[], ledger:[], stranded:[{locked, auction, at}] }
+const W = load('wallets', {});
+USERS.forEach((n) => { W[n] = W[n] || { proofs: [], ledger: [], stranded: [] }; });
+const claimed = new Set(load('claimed', []));
+const saveW = () => { save('wallets', W); save('claimed', [...claimed]); };
+
+const ui = {
+  me: load('me', 'Alice'), lot: null, mode: 'bid', ctab: 'bids', img: 0, showLive: true, bots: load('bots', 'chill'),
+  autotopup: load('autotopup', true), max: load('max', {}), otab: null,
+};
+let S = null; // latest chain state
+let NET = [];
+let CHAT = [];
+let offsetMs = 0; // chain time - local time
+let busy = new Set();
+const seenBids = new Set();
+const seenClosed = new Set();
+let firstState = true;
+
+const chainNow = () => (Date.now() + offsetMs) / 1000;
+const meId = () => ids[ui.me];
+const mePub = () => idPub(meId());
+const nameOfPub = (pk) => pubToUser[pk] || pk.slice(0, 8);
+const nameOfBid = (b) => b.name || nameOfPub(b.bidder);
+const bal = (n) => totalSats(W[n].proofs);
+const ledger = (n, type, amount, note) => { W[n].ledger.unshift({ type, amount, note, ts: Date.now() / 1000 }); W[n].ledger = W[n].ledger.slice(0, 60); };
+
+function avatar(name, size = 28) {
+  if (name === 'Seller') return `<span class="av" style="width:${size}px;height:${size}px"><img src="./assets/live-frame.jpg" alt=""></span>`;
+  const c = COLORS[name] || '#7a6f66';
+  return `<span class="av" style="width:${size}px;height:${size}px;background:${c}">${esc((name || '?')[0].toUpperCase())}</span>`;
+}
+
+// ---------- toasts / fx (from the template) ----------
+function toast(html, kind = '', action) {
+  const box = $('.toasts');
+  const t = document.createElement('div');
+  t.className = 'toast ' + kind;
+  t.innerHTML = `<span>${html}</span>` + (action ? `<button data-act="${action[1]}">${action[0]}</button>` : '');
+  box.appendChild(t);
+  while (box.children.length > 3) box.firstElementChild.remove();
+  setTimeout(() => { t.classList.add('out'); setTimeout(() => t.remove(), 400); }, kind === 'danger' ? 4800 : 3400);
+}
+function pulse(el, cls) { if (!el) return; el.classList.remove(cls); void el.offsetWidth; el.classList.add(cls); }
+function flyCoins(fromEl, n = 7) {
+  if (reduce) return pulse($('.wallet-chip'), 'got');
+  const to = $('.wallet-chip').getBoundingClientRect();
+  const fr = fromEl ? fromEl.getBoundingClientRect() : { left: innerWidth / 2, top: innerHeight / 2, width: 0, height: 0 };
+  const layer = $('.fly-layer');
+  for (let i = 0; i < n; i++) {
+    const c = document.createElement('span'); c.className = 'coin'; c.textContent = '₿';
+    layer.appendChild(c);
+    const sx = fr.left + fr.width / 2 + (Math.random() - 0.5) * 60, sy = fr.top + fr.height / 2 + (Math.random() - 0.5) * 20;
+    const ex = to.left + to.width / 2, ey = to.top + to.height / 2;
+    c.animate([
+      { transform: `translate(${sx}px,${sy}px) scale(.6)`, opacity: 0 },
+      { transform: `translate(${(sx + ex) / 2 + (Math.random() - 0.5) * 120}px,${Math.min(sy, ey) - 60}px) scale(1.1)`, opacity: 1, offset: 0.45 },
+      { transform: `translate(${ex}px,${ey}px) scale(.5)`, opacity: 0.2 },
+    ], { duration: 900 + i * 70, easing: 'cubic-bezier(.5,0,.3,1)', fill: 'forwards' }).onfinish = () => c.remove();
+  }
+  setTimeout(() => pulse($('.wallet-chip'), 'got'), 900);
+}
+const cv = $('.confetti'), cx = cv.getContext('2d'); let parts = [], confRAF = 0;
+function confetti() {
+  if (reduce) return;
+  cv.width = innerWidth * devicePixelRatio; cv.height = innerHeight * devicePixelRatio; cv.style.display = 'block';
+  const cols = ['#FF3EB5', '#F7931A', '#C6FF3D', '#FFF4E8', '#6C5CE7', '#00B894'];
+  for (let i = 0; i < 220; i++) {
+    const left = i % 2 === 0;
+    parts.push({ x: (left ? 0.05 : 0.95) * cv.width, y: cv.height * 0.75, vx: (left ? 1 : -1) * (6 + Math.random() * 14) * devicePixelRatio, vy: -(14 + Math.random() * 16) * devicePixelRatio, r: (4 + Math.random() * 6) * devicePixelRatio, c: cols[i % cols.length], a: Math.random() * 6, va: Math.random() * 0.3 - 0.15, life: 0 });
+  }
+  cancelAnimationFrame(confRAF);
+  const step = () => {
+    cx.clearRect(0, 0, cv.width, cv.height);
+    parts.forEach((p) => { p.vy += 0.42 * devicePixelRatio; p.vx *= 0.985; p.x += p.vx; p.y += p.vy; p.a += p.va; p.life++; cx.save(); cx.translate(p.x, p.y); cx.rotate(p.a); cx.fillStyle = p.c; cx.fillRect(-p.r / 2, -p.r / 4, p.r, p.r / 2); cx.restore(); });
+    parts = parts.filter((p) => p.y < cv.height + 40 && p.life < 400);
+    if (parts.length) confRAF = requestAnimationFrame(step); else cv.style.display = 'none';
+  };
+  step();
+}
+let goingStage = 0;
+function going(stage) {
+  const g = $('.going');
+  if (!stage) { g.classList.remove('show'); return; }
+  g.firstElementChild.textContent = ['', 'Going once…', 'Going twice…', 'Last call!'][stage];
+  pulse(g, 'show');
+}
+
+// ---------- derived state ----------
+function lotImages(a) {
+  if (!a) return ['./assets/watch-1.jpg'];
+  if (!a.image || a.image.includes('watch')) return ['./assets/watch-1.jpg', './assets/watch-2.jpg', './assets/watch-3.jpg', './assets/watch-4.jpg'];
+  return [a.image];
+}
+const hasVideo = (a) => !a || !a.image || a.image.includes('watch');
+function currentLot() {
+  if (!S) return null;
+  if (ui.lot && S.auctions[ui.lot]) {
+    const a = S.auctions[ui.lot];
+    if (a.status === 'open' || chainNow() - a.closedAt < 12 || ui.pinned) return a;
+  }
+  const open = S.order.map((id) => S.auctions[id]).filter((a) => a.status === 'open').sort((x, y) => x.endAt - y.endAt);
+  const a = open[0] || S.auctions[S.order[S.order.length - 1]] || null;
+  ui.lot = a && a.id; ui.pinned = false;
+  return a;
+}
+const bidsOf = (a) => (a ? a.bids.map((id) => S.bids[id]) : []);
+const minNext = (a) => (a.highBid ? a.highAmount + a.minIncrement : a.startPrice);
+const stepAmt = (a, steps) => minNext(a) + steps * a.minIncrement;
+const remaining = (a) => Math.max(0, a.endAt - chainNow());
+function heldBy(n) {
+  if (!S) return 0;
+  const pk = idPub(ids[n]);
+  return Object.values(S.bids).filter((b) => b.bidder === pk && (b.status === 'leading' || ((b.status === 'outbid' || b.status === 'lost') && !claimed.has(b.id)))).reduce((s, b) => s + b.amount, 0)
+    + W[n].stranded.reduce((s, x) => s + totalSats(x.locked), 0);
+}
+function role(a, n = ui.me) {
+  if (!a) return '';
+  const pk = idPub(ids[n]);
+  if (a.seller === pk) return 'seller';
+  const mine = bidsOf(a).filter((b) => b.bidder === pk);
+  if (a.status === 'closed') return a.winner && S.bids[a.winner].bidder === pk ? 'winner' : mine.length ? 'loser' : '';
+  if (a.highBid && S.bids[a.highBid].bidder === pk) return 'winning';
+  return mine.length ? 'outbid' : '';
+}
+
+// ---------- wallet ops ----------
+async function topup(n, amount, quiet) {
+  const ps = await api.faucet(amount);
+  W[n].proofs.push(...ps); ledger(n, 'topup', amount, 'Fake-sats faucet (test mint)'); saveW();
+  if (!quiet && n === ui.me) { pulse($('.wallet-chip'), 'got'); toast(`+${fmt(amount)} fake sats minted`, 'good'); }
+}
+
+async function placeBid(n, a, amount, { quiet = false, auto = false } = {}) {
+  const key = 'bid:' + n;
+  if (busy.has(key)) return { ok: false, reason: 'previous bid still settling' };
+  busy.add(key);
+  try {
+    const id = ids[n];
+    if (a.seller === idPub(id)) throw new Error("You're the seller of this lot");
+    if (bal(n) < amount) {
+      if (n !== ui.me || ui.autotopup) await topup(n, Math.max(amount - bal(n) + 1000, 5000), true);
+      else throw new Error('Not enough fake sats. Top up in the wallet.');
+    }
+    const fresh = await api.state();
+    const fa = fresh.auctions[a.id];
+    const { keep, locked } = await api.lockForBid(id, W[n].proofs, amount, fresh.params, fa, { state: fresh });
+    W[n].proofs = keep;
+    ledger(n, 'hold', amount, `Locked to 3-of-4 validators · ${fa.title.slice(0, 28)}`);
+    saveW();
+    try {
+      const r = await api.bid(id, fa, amount, locked);
+      if (n === ui.me && !quiet) toast(`${auto ? 'Max bid raised you to' : 'Bid'} <b>${fmt(amount)}</b> sent · checked by ${esc(r.via)}`, 'good');
+      return { ok: true };
+    } catch (e) {
+      W[n].stranded.push({ locked, auction: a.id, at: Date.now() / 1000 });
+      ledger(n, 'hold', amount, 'Rejected by validators · reclaimable after locktime');
+      saveW();
+      throw e;
+    }
+  } catch (e) {
+    const msg = String(e.message || e).replace(/^.*log='([^']+)'.*$/, '$1');
+    if (n === ui.me && !quiet) toast(esc(msg), 'danger');
+    return { ok: false, reason: msg };
+  } finally { busy.delete(key); }
+}
+
+// refunds, payouts and expired-lock reclaims for every local user
+async function settleLoop() {
+  if (!S) return;
+  for (const n of USERS) {
+    const pk = idPub(ids[n]);
+    for (const b of Object.values(S.bids)) {
+      if (claimed.has(b.id) || busy.has('c:' + b.id)) continue;
+      const au = S.auctions[b.auction];
+      let purpose = null;
+      if (b.bidder === pk && (b.status === 'outbid' || b.status === 'lost')) purpose = 'refund';
+      if (au.seller === pk && b.status === 'won' && au.sellerWallet === walletPub(ids[n])) purpose = 'payout';
+      if (!purpose) continue;
+      busy.add('c:' + b.id);
+      try {
+        const r = await api.claim(ids[n], b, purpose, S.params);
+        W[n].proofs.push(...r.proofs); claimed.add(b.id);
+        const who = r.cosigners.map((v) => v.replace('Validator ', 'V')).join(', ');
+        if (purpose === 'refund') {
+          ledger(n, 'refund', b.amount, `Refund co-signed by ${who}`);
+          if (n === ui.me) {
+            const by = au.highBid && S.bids[au.highBid] ? nameOfBid(S.bids[au.highBid]) : 'the winner';
+            toast(b.status === 'outbid' ? `Outbid by <b>${esc(by)}</b> · ${fmt(b.amount)} sats refunded by ${who}` : `${fmt(b.amount)} sats returned · co-signed by ${who}`, 'danger', b.status === 'outbid' && au.status === 'open' ? ['Bid again', 'bid-next'] : null);
+            flyCoins($('.c-price'));
+          }
+        } else {
+          ledger(n, 'pay', b.amount, `Payout for “${au.title.slice(0, 24)}” · ${who}`);
+          if (n === ui.me) { toast(`Payout <b>${fmt(b.amount)}</b> sats received · co-signed by ${who}`, 'good'); flyCoins($('.c-price'), 10); }
+        }
+        saveW();
+      } catch (e) {
+        if (/spent/i.test(e.message)) { claimed.add(b.id); saveW(); }
+        else console.warn('claim', b.id, e.message);
+      } finally { busy.delete('c:' + b.id); }
+    }
+    // stranded locks (bid rejected after locking): reclaim alone after locktime
+    for (const s of [...W[n].stranded]) {
+      const lt = lockOf(s.locked[0])?.locktime || 0;
+      if (Date.now() / 1000 < lt + 2 || busy.has('s:' + lt)) continue;
+      busy.add('s:' + lt);
+      try {
+        const ps = await api.reclaimExpired(ids[n], s.locked);
+        W[n].proofs.push(...ps); W[n].stranded = W[n].stranded.filter((x) => x !== s);
+        ledger(n, 'refund', totalSats(ps), 'Reclaimed alone after locktime'); saveW();
+      } catch (e) { if (/spent/i.test(e.message)) { W[n].stranded = W[n].stranded.filter((x) => x !== s); saveW(); } }
+      finally { busy.delete('s:' + lt); }
+    }
+  }
+}
+
+// rivals and max-bid proxy, all through the real flow
+let botAt = 0;
+async function botLoop() {
+  const a = currentLot();
+  if (!S || !a || a.status !== 'open') return;
+  // my max-bid proxy
+  const mx = ui.max[a.id];
+  if (mx && role(a) === 'outbid' && minNext(a) <= mx && !busy.has('bid:' + ui.me)) placeBid(ui.me, a, minNext(a), { auto: true });
+  if (ui.bots === 'off' || Date.now() < botAt) return;
+  const gap = { chill: [6000, 12000], busy: [3000, 6000], frenzy: [1200, 2600] }[ui.bots];
+  botAt = Date.now() + gap[0] + Math.random() * (gap[1] - gap[0]);
+  const rivals = USERS.filter((n) => n !== ui.me && idPub(ids[n]) !== a.seller && !(a.highBid && S.bids[a.highBid].bidder === idPub(ids[n])));
+  if (!rivals.length) return;
+  const ceiling = a.startPrice * (ui.bots === 'frenzy' ? 40 : 12);
+  if (minNext(a) > ceiling && Math.random() < 0.8) return;
+  const n = rivals[Math.floor(Math.random() * rivals.length)];
+  const steps = Math.random() < 0.2 ? 2 : 0;
+  placeBid(n, a, stepAmt(a, steps), { quiet: true });
+}
+
+// ---------- rendering ----------
+function setV(k, v, html = false) {
+  $$(`[data-v="${k}"]`).forEach((el) => {
+    if (el._v === v) return; el._v = v;
+    if (k === 'ring') el.style.strokeDashoffset = v;
+    else if (el.tagName === 'IMG') el.src = v;
+    else if (html) el.innerHTML = v; else el.textContent = v;
+  });
+}
+
+function renderUsers() {
+  $('[data-users]').innerHTML = USERS.map((n) => `<button role="tab" aria-selected="${n === ui.me}" data-act="user" data-u="${n}"><b>${n[0]}</b><span>${n}</span></button>`).join('');
+}
+
+function myStatusHTML(a) {
+  const r = role(a);
+  if (!a) return '';
+  if (r === 'seller') return a.status === 'closed'
+    ? `<div class="ms win">${a.winner ? `Sold for ${fmt(a.highAmount)} sats · payout ${claimed.has(a.winner) ? 'received' : 'settling'}` : 'Ended without bids'} <button data-act="outcome">Outcome →</button></div>`
+    : `<div class="ms neutral">You're the seller · bidding disabled on your own lot</div>`;
+  if (a.status === 'closed') {
+    if (r === 'winner') return `<div class="ms win">You won for ${fmt(a.highAmount)} sats <button data-act="outcome">What happens next →</button></div>`;
+    if (r === 'loser') return `<div class="ms lose">${esc(nameOfBid(S.bids[a.winner]))} won. Your sats are back. <button data-act="outcome">See outcome →</button></div>`;
+    return `<div class="ms neutral">${a.winner ? `Sold to ${esc(nameOfBid(S.bids[a.winner]))} for ${fmt(a.highAmount)}` : 'Ended without bids'} <button data-act="outcome">See outcome →</button></div>`;
+  }
+  if (r === 'winning') return `<div class="ms win"><span class="pulse"></span>You're the top bidder${ui.max[a.id] ? ' · max ' + fmt(ui.max[a.id]) : ''}</div>`;
+  if (r === 'outbid') return `<div class="ms lose">You've been outbid · refund co-signed instantly. Bid again?</div>`;
+  return '';
+}
+
+function timerText(a) {
+  if (!a) return '–:––';
+  if (a.status !== 'open') return 'Ended';
+  const r = remaining(a);
+  if (r <= 0) return 'Closing…';
+  if (r < 10) return r.toFixed(1) + 's';
+  const s = Math.ceil(r), m = Math.floor(s / 60);
+  return m + ':' + String(s % 60).padStart(2, '0');
+}
+
+function renderFrame() {
+  const a = currentLot();
+  if (!S) return requestAnimationFrame(renderFrame);
+  const live = a && a.status === 'open';
+  setV('balance', fmt(bal(ui.me)));
+  setV('held', fmt(heldBy(ui.me)));
+  setV('username', ui.me);
+  const up = NET.filter((v) => v.up).length;
+  setV('netdots', NET.map((v) => `<i class="${v.up ? 'on' : ''}"></i>`).join(''), true);
+  setV('consensus', `${up}/4 validators · needs 3`);
+  if (a) {
+    setV('lotno', a.id.slice(0, 4).toUpperCase());
+    setV('title', a.title);
+    setV('sellername', a.sellerName || nameOfPub(a.seller));
+    setV('sellermeta', `npub ${a.seller.slice(0, 8)}… · signed listing`);
+    setV('closemode', `Soft close · late bids add ${S.params.extendSec}s`);
+    setV('timer', timerText(a));
+    const total = Math.max(1, (a.endAt - a.createdAt));
+    setV('ring', String(553 * (1 - Math.min(1, remaining(a) / Math.min(total, 120)))));
+    setV('ringlabel', a.extensions ? `+${a.extensions} ext` : a.status === 'open' ? 'soft close' : 'ended');
+    setV('pricelabel', live ? (a.highBid ? 'Current bid' : 'Starting bid') : a.winner ? 'Sold for' : 'Final');
+    setV('price', fmt(a.highBid ? a.highAmount : a.startPrice));
+    const lead = a.highBid ? S.bids[a.highBid] : null;
+    setV('leaderline', !lead ? `No bids yet · starts at ${fmt(a.startPrice)}` : a.status === 'closed' ? `${avatar(nameOfBid(lead), 18)} <b>${esc(nameOfBid(lead))}</b> won` : `${avatar(nameOfBid(lead), 18)} <b>${esc(nameOfBid(lead))}</b> ${lead.bidder === mePub() ? 'are' : 'is'} winning <span class="crown">♛</span>`, true);
+    setV('mystatus', myStatusHTML(a), true);
+    setV('step0', fmt(stepAmt(a, 0))); setV('step0b', fmt(stepAmt(a, 0))); setV('step2', fmt(stepAmt(a, 2))); setV('step5', fmt(stepAmt(a, 5)));
+    setV('bidcta', ui.mode === 'max' ? 'Set max bid' : 'Place bid');
+    const bs = bidsOf(a);
+    setV('bidcountn', String(bs.length));
+    setV('bidders', String(new Set(bs.map((b) => b.bidder)).size));
+    setV('extensionsn', String(a.extensions));
+    setV('escrownote', `Bids lock ecash to a 3-of-4 validator escrow. Outbid? 3 validators co-sign your refund at once. Fallback: you can reclaim alone after ${clock(a.hardEnd + S.params.lockMarginSec + 15)}.`);
+    const r = remaining(a);
+    $$('[data-urgent]').forEach((el) => { el.classList.toggle('urgent', live && r < 10); el.classList.toggle('ended', !live); });
+    document.body.classList.toggle('is-ended', !live);
+    document.body.classList.toggle('is-winning', live && role(a) === 'winning');
+    const block = !live || role(a) === 'seller';
+    $$('[data-act^=bid], [data-swipe]').forEach((b) => { b.toggleAttribute('disabled', block); b.classList.toggle('disabled', block); });
+    $$('[data-in=bid]').forEach((inp) => {
+      const v = parseInt((inp.value || '').replace(/\D/g, ''), 10) || 0;
+      if (document.activeElement !== inp && (!inp._dirty || v < minNext(a))) { inp.value = fmt(minNext(a)); inp._dirty = false; }
+    });
+    // going once / twice
+    if (live && a.extensions >= 0) {
+      const st = r < 2 ? 3 : r < 4 ? 2 : r < 6 ? 1 : 0;
+      if (st !== goingStage) { goingStage = st; if (st) going(st); }
+    }
+  }
+  requestAnimationFrame(renderFrame);
+}
+
+function renderMedia(a) {
+  const imgs = lotImages(a);
+  const vid = hasVideo(a) && ui.showLive;
+  $('.c-video').hidden = !vid;
+  $('.c-still').hidden = vid;
+  $('.c-strip-live').hidden = !hasVideo(a);
+  $('.c-strip-live').classList.toggle('on', vid);
+  setV('mainimg', imgs[ui.img % imgs.length]);
+  const html = imgs.map((src, i) => `<button class="thumb ${!vid && i === ui.img % imgs.length ? 'on' : ''}" data-act="img" data-i="${i}" aria-label="Photo ${i + 1}"><img src="${src}" alt=""></button>`).join('');
+  const box = $('[data-thumbs]'); if (box._h !== html) { box.innerHTML = html; box._h = html; }
+}
+
+function renderFeeds(a) {
+  const ol = $('[data-feed=bids]');
+  const bs = bidsOf(a).slice().reverse();
+  const key = (a ? a.id : '') + bs.map((b) => b.id + b.status).join();
+  if (ol._k !== key) {
+    const fresh = ol._lot === (a && a.id);
+    ol.innerHTML = bs.length ? bs.map((b, i) => `<li class="bid-item ${i === 0 ? 'top' : ''} ${b.bidder === mePub() ? 'mine' : ''} ${fresh && !ol._seen?.has(b.id) ? 'enter' : ''}">${avatar(nameOfBid(b))}<span class="bi-name">${esc(nameOfBid(b))}${b.extended ? '<em class="tag-jump">+time</em>' : ''}${b.status === 'outbid' || b.status === 'lost' ? `<em class="tag-auto">${claimed.has(b.id) ? 'refunded' : 'refunding'}</em>` : ''}</span><span class="bi-amt">${fmt(b.amount)}</span><time>${clock(b.time)}</time></li>`).join('') : '<li class="empty">The arena is quiet…</li>';
+    ol._k = key; ol._lot = a && a.id; ol._seen = new Set(bs.map((b) => b.id));
+  }
+  // leaderboard
+  const top = {};
+  bidsOf(a).forEach((b) => { const n = nameOfBid(b); top[n] = Math.max(top[n] || 0, b.amount); });
+  const rows = Object.entries(top).sort((x, y) => y[1] - x[1]).slice(0, 8);
+  const lb = $('[data-slot=leaderboard]');
+  const lk = JSON.stringify(rows) + ui.me;
+  if (lb._k !== lk) {
+    lb._k = lk;
+    const max = rows.length ? rows[0][1] : 1;
+    lb.innerHTML = rows.length ? rows.map(([n, amt], i) => `<li class="lb ${n === ui.me ? 'mine' : ''} ${i === 0 ? 'first' : ''}"><span class="lb-rank">${i + 1}</span>${avatar(n, 26)}<span class="lb-name">${esc(n)}</span><span class="lb-bar"><i style="width:${(amt / max) * 100}%"></i></span><span class="lb-amt">${fmt(amt)}</span></li>`).join('') : '<li class="empty">No bidders yet</li>';
+  }
+  // ticker
+  const tk = $('[data-ticker]');
+  const items = Object.values(S.bids).sort((x, y) => y.height - x.height).slice(0, 8).map((b) => `<span>${esc(nameOfBid(b)).toUpperCase()} → <b>${fmt(b.amount)}</b> · ${esc(S.auctions[b.auction].title.slice(0, 22))}</span>`);
+  const th = (items.length ? items : ['<span>NO BIDS YET</span>', '<span>BE FIRST</span>']).concat(`<span>BLOCK <b>${S.height}</b> · ${NET.filter((v) => v.up).length}/4 VALIDATORS</span>`).join('');
+  if (tk._h !== th) { tk.innerHTML = th + th; tk._h = th; }
+  // chain feed
+  const cf = $('[data-feed=chain]');
+  const rej = S.rejections.slice().reverse().slice(0, 6).map((r) => `<li class="chain-item bad"><b>Rejected</b> ${esc(r.reason)}<time>block ${r.height}</time></li>`);
+  const evs = Object.values(S.bids).filter((b) => b.auction === (a && a.id)).sort((x, y) => y.height - x.height).slice(0, 10).map((b) => `<li class="chain-item"><b>${esc(nameOfBid(b))} ${fmt(b.amount)}</b> · ${b.proofs.length} proofs locked 3-of-4 · DLEQ ok<time>block ${b.height} · ${b.id.slice(0, 10)}…</time></li>`);
+  const ch = [`<li class="chain-item head">Height <b>${S.height}</b> · ${S.txCount} txs accepted · app hash agreed by ${new Set(NET.filter((v) => v.up && v.height === S.height).map((v) => v.appHash)).size === 1 ? NET.filter((v) => v.up && v.height === S.height).length : '–'} nodes</li>`, ...evs, ...rej].join('');
+  if (cf._h !== ch) { cf.innerHTML = ch; cf._h = ch; }
+}
+
+function renderChat(a) {
+  const ol = $('[data-feed=comments]');
+  const msgs = CHAT.filter((m) => m.tags?.some((t) => t[0] === 'e' && t[1] === (a && a.id))).slice(-60).reverse();
+  const k = msgs.map((m) => m.id).join();
+  if (ol._k === k) return; ol._k = k;
+  ol.innerHTML = msgs.length ? msgs.map((m) => { const n = nameOfPub(m.pubkey); const seller = a && m.pubkey === a.seller; return `<li class="com-item ${seller ? 'seller' : ''} ${m.pubkey === mePub() ? 'mine' : ''}">${avatar(n, 26)}<div><b>${esc(n)}${seller ? ' <span class="badge">Seller</span>' : ''}</b><p>${esc(m.content)}</p></div></li>`; }).join('') : '<li class="empty">Say hello. Messages are signed Nostr events.</li>';
+}
+
+function renderQueue(a) {
+  const others = S.order.map((id) => S.auctions[id]).filter((x) => x.id !== (a && a.id)).sort((x, y) => (x.status === y.status ? x.endAt - y.endAt : x.status === 'open' ? -1 : 1)).slice(0, 8);
+  const h = others.map((x) => `<button class="nx ${x.status}" data-act="pick-lot" data-id="${x.id}"><img src="${lotImages(x)[0]}" alt=""><div><b>${esc(x.title)}</b><small>${x.status === 'open' ? `${fmt(x.highBid ? x.highAmount : x.startPrice)} sats · ${timerText(x)}` : x.winner ? `Sold ${fmt(x.highAmount)} sats` : 'Ended, no bids'}</small></div></button>`).join('') || '<p class="muted">No other lots yet. List one.</p>';
+  const box = $('[data-slot=queue]'); if (box._h !== h) { box.innerHTML = h; box._h = h; }
+}
+
+function renderNetwork() {
+  const up = NET.filter((v) => v.up).length;
+  const strip = NET.map((v) => `<button class="v-chip ${v.up ? 'on' : 'off'}" data-act="network"><i></i>${esc(v.name.replace('Validator ', 'V'))}<small>${v.up ? '#' + v.height : 'offline'}</small></button>`).join('');
+  const vs = $('[data-slot=vstrip]'); if (vs._h !== strip) { vs.innerHTML = `<span class="muted">Consensus</span>${strip}`; vs._h = strip; }
+  setV('netsummary', `${up} of 4 validators online. Blocks need 3 signatures; escrow releases need 3 co-signers. ${up >= 3 ? 'The arena keeps running.' : 'Below threshold: the chain is paused until a validator returns.'}`);
+  const cards = NET.map((v) => `<div class="v-card ${v.up ? 'on' : 'off'}"><div class="v-top"><i></i><b>${esc(v.name)}</b><button class="btn-ghost sm" data-act="${v.up || v.process ? 'v-stop' : 'v-start'}" data-i="${v.index}">${v.up || v.process ? 'Stop' : 'Start'}</button></div>
+    <div class="v-meta"><span>Height <b>${v.height ?? '–'}</b></span><span>Peers <b>${v.peers ?? '–'}</b></span><span>App hash <b>${v.appHash ? v.appHash.slice(0, 10) : '–'}</b></span></div>
+    <div class="v-sigs">${(v.signers || []).map((s, i) => `<span class="${s ? 'y' : 'n'}" title="Validator ${i + 1} ${s ? 'signed' : 'missing'}">V${i + 1}</span>`).join('')}<small>signed last block</small></div>
+    <div class="v-key">escrow key ${v.cashuPub ? v.cashuPub.slice(0, 18) + '…' : '–'}</div></div>`).join('');
+  const vc = $('[data-slot=vcards]'); if (vc._h !== cards) { vc.innerHTML = cards; vc._h = cards; }
+  const rj = S ? S.rejections.slice().reverse().slice(0, 12).map((r) => `<li class="lg pay"><span class="lg-type">Block ${r.height}</span><span class="lg-note">${esc(r.reason)}<time>${clock(r.time)} · ${esc(nameOfPub(r.pubkey || ''))}</time></span><b></b></li>`).join('') : '';
+  const rb = $('[data-slot=rejections]'); const rh = rj || '<li class="empty">Nothing rejected yet.</li>'; if (rb._h !== rh) { rb.innerHTML = rh; rb._h = rh; }
+  $$('[data-seg=bots] button').forEach((b) => b.classList.toggle('on', b.dataset.v === ui.bots));
+}
+
+function renderWallet() {
+  const n = ui.me, pk = mePub();
+  const label = { topup: 'Added', hold: 'Locked', refund: 'Refunded', pay: 'Payout' };
+  const lh = W[n].ledger.slice(0, 30).map((l) => `<li class="lg ${l.type}"><span class="lg-type">${label[l.type]}</span><span class="lg-note">${esc(l.note)}<time>${clock(l.ts)}</time></span><b>${l.type === 'hold' ? '−' : '+'}${fmt(l.amount)}</b></li>`).join('') || '<li class="empty">No activity yet.</li>';
+  const lb = $('[data-slot=ledger]'); if (lb._h !== lh) { lb.innerHTML = lh; lb._h = lh; }
+  const es = S ? Object.values(S.bids).filter((b) => b.bidder === pk).sort((x, y) => y.height - x.height).slice(0, 12) : [];
+  const eh = es.map((b) => { const st = claimed.has(b.id) ? 'released' : b.status; return `<li class="lg ${st === 'leading' ? 'hold' : st === 'won' ? 'pay' : 'refund'}"><span class="lg-type">${{ leading: 'Leading', outbid: 'Refunding', lost: 'Refunding', won: 'Won', released: b.status === 'won' ? 'Paid' : 'Refunded' }[st]}</span><span class="lg-note">${esc(S.auctions[b.auction].title.slice(0, 30))}<time>block ${b.height} · ${b.proofs.length} proofs · 3-of-4</time></span><b>${fmt(b.amount)}</b></li>`; }).join('')
+    + W[n].stranded.map((s) => `<li class="lg hold"><span class="lg-type">Stranded</span><span class="lg-note">Rejected bid · reclaim after<time>${clock(lockOf(s.locked[0])?.locktime || 0)}</time></span><b>${fmt(totalSats(s.locked))}</b></li>`).join('');
+  const eb = $('[data-slot=escrows]'); const ehh = eh || '<li class="empty">No escrows.</li>'; if (eb._h !== ehh) { eb.innerHTML = ehh; eb._h = ehh; }
+  setV('keys', `Nostr ${idPub(meId()).slice(0, 16)}… · wallet ${walletPub(meId()).slice(0, 18)}…`);
+  $('[data-in=autotopup]').checked = ui.autotopup;
+}
+
+// outcome screens built from agreed chain state
+function outcomeHTML(a, tab) {
+  if (!a) return '';
+  if (a.status !== 'closed') return `<div class="o-hero neutral"><h2>The auction is still live</h2><p>Outcome screens appear when validators close the lot at block time ≥ end.</p></div>`;
+  const price = fmt(a.highAmount);
+  if (!a.winner) return `<div class="o-hero neutral"><h2>No sale this time</h2><p>Nobody bid on this lot.</p></div>`;
+  const w = S.bids[a.winner], wn = esc(nameOfBid(w));
+  const losers = bidsOf(a).filter((b) => b.id !== a.winner);
+  const facts = (rows) => `<div class="o-facts">${rows.map(([k, v]) => `<div><small>${k}</small><b>${v}</b></div>`).join('')}</div>`;
+  if (tab === 'winner') {
+    const isMe = w.bidder === mePub();
+    return `<div class="o-hero win">${isMe ? '' : `<span class="o-eyebrow">Preview · what ${wn} sees</span>`}<div class="o-trophy">♛</div><h2>${isMe ? 'You won!' : wn + ' won!'}</h2><p>${esc(a.title)} · <b>${price} sats</b></p>
+      ${facts([['Paid from escrow', price], ['Closed at block', a.closedHeight], ['Payout to seller', claimed.has(a.winner) ? 'Released' : 'Settling']])}</div>`;
+  }
+  if (tab === 'seller') {
+    return `<div class="o-hero sell"><span class="o-eyebrow">Seller view · ${esc(a.sellerName || 'Seller')}</span><h2>Sold for ${price} sats</h2><p>to <b>${wn}</b> · ${a.bids.length} bids from ${new Set(bidsOf(a).map((b) => b.bidder)).size} bidders · ${a.extensions} time extensions</p>
+      ${facts([['Hammer price', price], ['Escrow release', '3 of 4 co-signed'], ['Payout', claimed.has(a.winner) || role(a) !== 'seller' ? 'Released to wallet' : 'Settling…']])}</div>`;
+  }
+  const refunded = losers.filter((b) => claimed.has(b.id)).reduce((s, b) => s + b.amount, 0);
+  const total = losers.reduce((s, b) => s + b.amount, 0);
+  return `<div class="o-hero lose"><h2>Outbid this time</h2><p>${wn} won at <b>${price} sats</b>. ${losers.length} losing bids.</p>
+    <div class="refund-card"><span class="rf-ico">↩</span><div><b>${fmt(total)} sats in losing escrows · ${fmt(refunded)} returned by this browser's users</b><small>Each refund is co-signed by 3 of the 4 validators the moment a bid is beaten. If validators vanish, bidders reclaim alone after locktime.</small></div></div></div>`;
+}
+function openOutcome(tab) {
+  const a = currentLot();
+  if (!tab) { const r = role(a); tab = r === 'winner' ? 'winner' : r === 'seller' ? 'seller' : r === 'loser' ? 'loser' : ui.otab || 'winner'; }
+  ui.otab = tab;
+  $$('[data-act=otab]').forEach((b) => b.classList.toggle('on', b.dataset.o === tab));
+  $('[data-slot=outcome]').innerHTML = outcomeHTML(a, tab);
+  $('[data-modal=outcome]').hidden = false;
+}
+
+function onNewState(prev) {
+  const a = currentLot();
+  // closing moments
+  for (const id of S.order) {
+    const au = S.auctions[id];
+    if (au.status === 'closed' && !seenClosed.has(id)) {
+      seenClosed.add(id);
+      if (firstState) continue;
+      if (id === (a && a.id) || chainNow() - au.closedAt < 8) {
+        ui.lot = id; ui.pinned = true;
+        going(0); goingStage = 0;
+        const stamp = $('.sold-stamp');
+        $('i', stamp).textContent = id.slice(0, 4).toUpperCase();
+        $('b', stamp).textContent = au.winner ? 'SOLD' : 'UNSOLD';
+        $('em', stamp).textContent = au.winner ? `to ${nameOfBid(S.bids[au.winner])} · ${fmt(au.highAmount)} sats` : 'no bids';
+        stamp.classList.add('show');
+        const r = role(au);
+        if (r === 'winner' || r === 'seller') confetti();
+        setTimeout(() => { stamp.classList.remove('show'); if (r) openOutcome(); setTimeout(() => { ui.pinned = false; }, 9000); }, 2300);
+      }
+    }
+  }
+  // new bids: extension toast + feed animation
+  for (const b of Object.values(S.bids)) {
+    if (seenBids.has(b.id)) continue;
+    seenBids.add(b.id);
+    if (firstState) continue;
+    if (b.auction === (a && a.id)) {
+      if (b.extended) { toast(`Late bid! <b>+${S.params.extendSec}s</b> on the clock`, 'info'); $$('[data-v=timer]').forEach((el) => pulse(el, 'extend')); }
+      if (b.bidder === mePub()) pulse($('.c-price'), 'bump');
+    }
+  }
+  firstState = false;
+}
+
+// ---------- polling ----------
+async function pollState() {
+  try {
+    const prev = S;
+    S = await api.state();
+    offsetMs = S.time * 1000 + 500 - Date.now();
+    onNewState(prev);
+    const a = currentLot();
+    renderMedia(a); renderFeeds(a); renderChat(a); renderQueue(a); renderWallet();
+    if (!$('[data-modal=outcome]').hidden) $('[data-slot=outcome]').innerHTML = outcomeHTML(a, ui.otab);
+  } catch (e) { /* gateway down */ }
+}
+async function pollNet() { try { NET = await api.network(); renderNetwork(); } catch {} }
+async function pollChat() { try { CHAT = await api.chat(); renderChat(currentLot()); } catch {} }
+
+// ---------- seeding ----------
+const DEMO = [
+  { title: '1970s Steel Chronograph, Burnt-Orange Dial', description: 'Pre-owned · serviced 2025 · light patina', image: './assets/watch-1.jpg', category: 'Watches', startPrice: 2100, minIncrement: 100, durationSec: 180 },
+  { title: 'Rangefinder camera, 1957, recent service', description: 'Clean glass, original strap', image: './assets/lot-camera.jpg', category: 'Cameras', startPrice: 1500, minIncrement: 100, durationSec: 360 },
+  { title: 'Hand-built mechanical keyboard, brass plate', description: 'Lubed switches, PBT caps', image: './assets/lot-keyboard.jpg', category: 'Electronics', startPrice: 800, minIncrement: 50, durationSec: 600 },
+];
+async function seedIfEmpty() {
+  if (!S) return;
+  const open = Object.values(S.auctions).filter((a) => a.status === 'open');
+  if (open.length) return;
+  for (const lot of DEMO) await api.createAuction(ids.Seller, lot).catch(() => {});
+  setTimeout(pollState, 1500);
+}
+
+// ---------- events ----------
+document.addEventListener('click', async (e) => {
+  const el = e.target.closest('[data-act]'); if (!el) return;
+  const act = el.dataset.act; const a = currentLot();
+  switch (act) {
+    case 'user': ui.me = el.dataset.u; save('me', ui.me); renderUsers(); renderWallet(); pollState(); toast(`Now acting as <b>${ui.me}</b>`, 'info'); break;
+    case 'wallet': renderWallet(); $('[data-drawer=wallet]').hidden = false; break;
+    case 'network': renderNetwork(); $('[data-drawer=network]').hidden = false; break;
+    case 'new-lot': $('[data-drawer=newlot]').hidden = false; break;
+    case 'close-drawer': $$('.drawer').forEach((d) => { d.hidden = true; }); break;
+    case 'close-modal': $$('.modal').forEach((d) => { d.hidden = true; }); break;
+    case 'seller-sheet': if (a) { $('[data-slot=seller-full]').innerHTML = `<div class="sc-top"><img class="sc-av" src="./assets/live-frame.jpg" alt=""><div><b>${esc(a.sellerName || 'Seller')}</b><small>npub hex ${esc(a.seller.slice(0, 24))}…</small></div></div><p class="sc-foot">Listing is a signed Nostr event (kind 1440). Payouts go only to the wallet key declared in it: ${esc(a.sellerWallet.slice(0, 20))}…</p>`; $('[data-modal=seller]').hidden = false; } break;
+    case 'topup': el.classList.add('disabled'); try { await topup(ui.me, +el.dataset.amt); } catch (err) { toast(esc(err.message), 'danger'); } el.classList.remove('disabled'); renderWallet(); break;
+    case 'bid-step': case 'bid-next': if (a) { const r = await placeBid(ui.me, a, stepAmt(a, +(el.dataset.steps || 0))); if (r.ok) pulse(el, 'done'); } break;
+    case 'bid-custom': {
+      if (!a) break;
+      const inp = $('[data-in=bid]'); const amt = parseInt(inp.value.replace(/\D/g, ''), 10) || 0;
+      if (ui.mode === 'max') {
+        if (amt < minNext(a)) { toast(`Max must be at least ${fmt(minNext(a))}`, 'danger'); break; }
+        ui.max[a.id] = amt; save('max', ui.max); toast(`Max bid set to <b>${fmt(amt)}</b>. This browser bids for you one step at a time.`, 'good');
+        if (role(a) !== 'winning') placeBid(ui.me, a, minNext(a), { auto: true });
+      } else { const r = await placeBid(ui.me, a, amt); if (!r.ok) pulse(inp.parentElement, 'shake'); }
+      break;
+    }
+    case 'mode': ui.mode = el.dataset.mode; $$('[data-act=mode]').forEach((b) => b.classList.toggle('on', b === el)); break;
+    case 'ctab': ui.ctab = el.dataset.tab; $$('[data-act=ctab]').forEach((b) => b.classList.toggle('on', b === el)); $$('.c-pane').forEach((p) => { p.hidden = p.dataset.pane !== ui.ctab; }); break;
+    case 'img': ui.img = +el.dataset.i; ui.showLive = false; renderMedia(a); break;
+    case 'show-live': ui.showLive = true; renderMedia(a); break;
+    case 'pick-lot': ui.lot = el.dataset.id; ui.pinned = true; ui.img = 0; ui.showLive = true; pollState(); scrollTo({ top: 0, behavior: 'smooth' }); break;
+    case 'outcome': openOutcome(); break;
+    case 'otab': openOutcome(el.dataset.o); break;
+    case 'v-stop': case 'v-start': {
+      el.classList.add('disabled');
+      try { await api.j(`/api/admin/validator/${el.dataset.i}/${act === 'v-stop' ? 'stop' : 'start'}`, { method: 'POST' }); toast(`Validator ${el.dataset.i} ${act === 'v-stop' ? 'stopped. 3 of 4 keep the arena running.' : 'restarting · it will replay blocks and catch up.'}`, 'info'); } catch (err) { toast(esc(err.message), 'danger'); }
+      setTimeout(pollNet, 600); break;
+    }
+  }
+  if (el.closest('[data-seg=bots]') && el.dataset.v) { ui.bots = el.dataset.v; save('bots', ui.bots); renderNetwork(); }
+});
+document.addEventListener('change', (e) => { if (e.target.matches('[data-in=autotopup]')) { ui.autotopup = e.target.checked; save('autotopup', ui.autotopup); } });
+document.addEventListener('input', (e) => { if (e.target.matches('[data-in=bid]')) e.target._dirty = true; });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') $$('.drawer,.modal').forEach((d) => { d.hidden = true; }); });
+document.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  if (f.matches('[data-act=comment-form]')) {
+    const inp = $('[data-in=comment]', f); const t = inp.value.trim(); const a = currentLot();
+    if (!t || !a) return; inp.value = '';
+    try { await api.postChat(meId(), a.id, t); pollChat(); } catch (err) { toast(esc(err.message), 'danger'); }
+  }
+  if (f.matches('[data-act=lot-form]')) {
+    const d = Object.fromEntries(new FormData(f));
+    try {
+      const r = await api.createAuction(meId(), { title: d.title, description: d.description, image: d.image, category: '', startPrice: +d.startPrice, minIncrement: +d.minIncrement, durationSec: +d.durationSec });
+      toast(`Listed <b>${esc(d.title.slice(0, 30))}</b> · signed and accepted by ${esc(r.via)}`, 'good');
+      $$('.drawer').forEach((x) => { x.hidden = true; });
+      setTimeout(() => { ui.lot = r.id; ui.pinned = true; pollState(); }, 1500);
+    } catch (err) { toast(esc(String(err.message).replace(/^.*log='([^']+)'.*$/, '$1')), 'danger'); }
+  }
+});
+
+// swipe to bid (template interaction)
+(function swipe() {
+  const sw = $('[data-swipe]'); const knob = $('.swipe-knob', sw); const fill = $('.swipe-fill', sw);
+  let sx = null; const max = () => sw.clientWidth - 54;
+  const set = (dx) => { knob.style.transform = `translateX(${dx}px)`; fill.style.width = 48 + dx + 'px'; };
+  knob.addEventListener('pointerdown', (e) => { sx = e.clientX; knob.setPointerCapture(e.pointerId); });
+  knob.addEventListener('pointermove', (e) => { if (sx === null) return; set(Math.max(0, Math.min(max(), e.clientX - sx))); });
+  knob.addEventListener('pointerup', async (e) => {
+    const dx = e.clientX - sx; sx = null;
+    if (dx > max() * 0.82) { set(max()); const a = currentLot(); if (a) { const r = await placeBid(ui.me, a, minNext(a)); if (r.ok) pulse(sw, 'done'); } }
+    setTimeout(() => set(0), 380);
+  });
+})();
+
+// ---------- boot ----------
+renderUsers();
+requestAnimationFrame(renderFrame);
+await pollNet();
+await pollState();
+await seedIfEmpty();
+setInterval(pollState, 1000);
+setInterval(pollNet, 2000);
+setInterval(pollChat, 2500);
+setInterval(() => settleLoop().catch(() => {}), 1500);
+setInterval(() => botLoop().catch(() => {}), 700);
+setInterval(seedIfEmpty, 15000);
+pollChat();
