@@ -79,3 +79,4 @@
   .net-btn .net-dots { display: inline-flex !important; gap: 2px; }
   .net-dots i { width: 5px; height: 5px; }
 }
+.arena-loading .c-ladder, .arena-loading .c-custom, .arena-loading .swipe, .arena-loading .c-sticky { opacity: .35; pointer-events: none; }

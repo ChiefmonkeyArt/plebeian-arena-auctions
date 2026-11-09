@@ -15,8 +15,12 @@ const base = (rawApi && !rawApi.startsWith('__PORT_'))
   : new URL('.', location.href).href.replace(/\/$/, '');
 const api = new ArenaClient(base);
 const LS = 'arena.v1.';
-const load = (k, d) => { try { return JSON.parse(localStorage.getItem(LS + k)) ?? d; } catch { return d; } };
-const save = (k, v) => localStorage.setItem(LS + k, JSON.stringify(v));
+// Hosted previews run in a sandboxed iframe without localStorage; fall back to memory.
+const store = (() => { try { const t = LS + 'probe'; localStorage.setItem(t, '1'); localStorage.removeItem(t); return localStorage; }
+  catch { const m = new Map(); return { getItem: k => m.has(k) ? m.get(k) : null, setItem: (k, v) => m.set(k, String(v)) }; } })();
+const load = (k, d) => { try { return JSON.parse(store.getItem(LS + k)) ?? d; } catch { return d; } };
+const short = (t, n) => { if (t.length <= n) return t; const c = t.slice(0, n); const sp = c.lastIndexOf(' '); return (sp > 8 ? c.slice(0, sp) : c).replace(/[,·\s]+$/, '') + '…'; };
+const save = (k, v) => { try { store.setItem(LS + k, JSON.stringify(v)); } catch {} };
 
 const USERS = ['Seller', 'Alice', 'Bob', 'Carol'];
 const COLORS = { Seller: '#FF3EB5', Alice: '#16A35A', Bob: '#F7931A', Carol: '#6C5CE7' };
@@ -48,7 +52,7 @@ const chainNow = () => (Date.now() + offsetMs) / 1000;
 const meId = () => ids[ui.me];
 const mePub = () => idPub(meId());
 const nameOfPub = (pk) => pubToUser[pk] || pk.slice(0, 8);
-const nameOfBid = (b) => b.name || nameOfPub(b.bidder);
+const nameOfBid = (b) => pubToUser[b.bidder] || `${b.name || 'Guest'} ·${b.bidder.slice(0, 4)}`;
 const bal = (n) => totalSats(W[n].proofs);
 const ledger = (n, type, amount, note) => { W[n].ledger.unshift({ type, amount, note, ts: Date.now() / 1000 }); W[n].ledger = W[n].ledger.slice(0, 60); };
 
@@ -173,7 +177,7 @@ async function placeBid(n, a, amount, { quiet = false, auto = false } = {}) {
     const fa = fresh.auctions[a.id];
     const { keep, locked } = await api.lockForBid(id, W[n].proofs, amount, fresh.params, fa, { state: fresh });
     W[n].proofs = keep;
-    ledger(n, 'hold', amount, `Locked to 3-of-4 validators · ${fa.title.slice(0, 28)}`);
+    ledger(n, 'hold', amount, `Locked to 3-of-4 validators · ${short(fa.title, 30)}`);
     saveW();
     try {
       const r = await api.bid(id, fa, amount, locked);
@@ -217,7 +221,7 @@ async function settleLoop() {
             flyCoins($('.c-price'));
           }
         } else {
-          ledger(n, 'pay', b.amount, `Payout for “${au.title.slice(0, 24)}” · ${who}`);
+          ledger(n, 'pay', b.amount, `Payout for “${short(au.title, 26)}” · ${who}`);
           if (n === ui.me) { toast(`Payout <b>${fmt(b.amount)}</b> sats received · co-signed by ${who}`, 'good'); flyCoins($('.c-price'), 10); }
         }
         saveW();
@@ -386,7 +390,7 @@ function renderFeeds(a) {
   }
   // ticker
   const tk = $('[data-ticker]');
-  const items = Object.values(S.bids).sort((x, y) => y.height - x.height).slice(0, 8).map((b) => `<span>${esc(nameOfBid(b)).toUpperCase()} → <b>${fmt(b.amount)}</b> · ${esc(S.auctions[b.auction].title.slice(0, 22))}</span>`);
+  const items = Object.values(S.bids).sort((x, y) => y.height - x.height).slice(0, 8).map((b) => `<span>${esc(nameOfBid(b)).toUpperCase()} → <b>${fmt(b.amount)}</b> · ${esc(short(S.auctions[b.auction].title, 26))}</span>`);
   const th = (items.length ? items : ['<span>NO BIDS YET</span>', '<span>BE FIRST</span>']).concat(`<span>BLOCK <b>${S.height}</b> · ${NET.filter((v) => v.up).length}/4 VALIDATORS</span>`).join('');
   if (tk._h !== th) { tk.innerHTML = th + th; tk._h = th; }
   // chain feed
@@ -473,6 +477,11 @@ function openOutcome(tab) {
 
 function onNewState(prev) {
   const a = currentLot();
+  if (prev && !firstState) {
+    for (const r of S.rejections.slice(prev.rejections.length)) {
+      if (r.kind === 1441 && r.pubkey === mePub()) toast(`Bid not accepted: ${esc(r.reason)}. Those sats return to your wallet automatically after the escrow locktime.`, 'danger');
+    }
+  }
   // closing moments
   for (const id of S.order) {
     const au = S.auctions[id];
@@ -514,6 +523,7 @@ async function pollState() {
     offsetMs = S.time * 1000 + 500 - Date.now();
     onNewState(prev);
     const a = currentLot();
+    document.body.classList.toggle('arena-loading', !a);
     renderMedia(a); renderFeeds(a); renderChat(a); renderQueue(a); renderWallet();
     if (!$('[data-modal=outcome]').hidden) $('[data-slot=outcome]').innerHTML = outcomeHTML(a, ui.otab);
   } catch (e) { /* gateway down */ }
