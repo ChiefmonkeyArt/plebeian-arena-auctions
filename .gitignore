@@ -1,0 +1,5 @@
+.venv-mint/
+run/
+bin/
+web/node_modules/
+web/dist/
