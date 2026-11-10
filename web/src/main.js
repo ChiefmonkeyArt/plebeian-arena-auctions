@@ -6,7 +6,9 @@ import { ArenaClient, newIdentity, ensureSeed, idPub, walletPub, totalSats, lock
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const fmt = (n) => Math.round(n || 0).toLocaleString('en-GB');
-const esc = (t) => String(t ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const esc = (t) => String(t ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+// Listing images: same-site paths only (matches the chain rule and the CSP); anything else shows the placeholder.
+const safeSrc = (s) => (/^(\.\/|\/(?!\/))[A-Za-z0-9._~\/-]*$/.test(String(s || '')) ? s : './assets/watch-1.jpg');
 const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const clock = (s) => new Date(s * 1000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 const rawApi = window.__API_BASE__ || '';
@@ -125,7 +127,7 @@ function going(stage) {
 function lotImages(a) {
   if (!a) return ['./assets/watch-1.jpg'];
   if (!a.image || a.image.includes('watch')) return ['./assets/watch-1.jpg', './assets/watch-2.jpg', './assets/watch-3.jpg', './assets/watch-4.jpg'];
-  return [a.image];
+  return [safeSrc(a.image)];
 }
 const hasVideo = (a) => !a || !a.image || a.image.includes('watch');
 function currentLot() {
@@ -368,7 +370,7 @@ function renderMedia(a) {
   $('.c-strip-live').hidden = !hasVideo(a);
   $('.c-strip-live').classList.toggle('on', vid);
   setV('mainimg', imgs[ui.img % imgs.length]);
-  const html = imgs.map((src, i) => `<button class="thumb ${!vid && i === ui.img % imgs.length ? 'on' : ''}" data-act="img" data-i="${i}" aria-label="Photo ${i + 1}"><img src="${src}" alt=""></button>`).join('');
+  const html = imgs.map((src, i) => `<button class="thumb ${!vid && i === ui.img % imgs.length ? 'on' : ''}" data-act="img" data-i="${i}" aria-label="Photo ${i + 1}"><img src="${esc(safeSrc(src))}" alt=""></button>`).join('');
   const box = $('[data-thumbs]'); if (box._h !== html) { box.innerHTML = html; box._h = html; }
 }
 
@@ -415,7 +417,7 @@ function renderChat(a) {
 
 function renderQueue(a) {
   const others = S.order.map((id) => S.auctions[id]).filter((x) => x.id !== (a && a.id)).sort((x, y) => (x.status === y.status ? x.endAt - y.endAt : x.status === 'open' ? -1 : 1)).slice(0, 8);
-  const h = others.map((x) => `<button class="nx ${x.status}" data-act="pick-lot" data-id="${x.id}"><img src="${lotImages(x)[0]}" alt=""><div><b>${esc(x.title)}</b><small>${x.status === 'open' ? `${fmt(x.highBid ? x.highAmount : x.startPrice)} sats · ${timerText(x)}` : x.winner ? `Sold ${fmt(x.highAmount)} sats` : 'Ended, no bids'}</small></div></button>`).join('') || '<p class="muted">No other lots yet. List one.</p>';
+  const h = others.map((x) => `<button class="nx ${x.status}" data-act="pick-lot" data-id="${esc(x.id)}"><img src="${esc(lotImages(x)[0])}" alt=""><div><b>${esc(x.title)}</b><small>${x.status === 'open' ? `${fmt(x.highBid ? x.highAmount : x.startPrice)} sats · ${timerText(x)}` : x.winner ? `Sold ${fmt(x.highAmount)} sats` : 'Ended, no bids'}</small></div></button>`).join('') || '<p class="muted">No other lots yet. List one.</p>';
   const box = $('[data-slot=queue]'); if (box._h !== h) { box.innerHTML = h; box._h = h; }
 }
 

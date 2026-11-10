@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -20,8 +21,8 @@ type Params struct {
 	MintURL        string            `json:"mintUrl"`
 	KeysetID       string            `json:"keysetId"`
 	Keys           map[string]string `json:"keys"`
-	GroupKey       string            `json:"groupKey"`       // FROST 3-of-4 escrow key (compressed hex); no single validator holds it
-	FrostPublic    json.RawMessage   `json:"frostPublic"`    // FROST public key package: group key + each validator's verifying share
+	GroupKey       string            `json:"groupKey"`    // FROST 3-of-4 escrow key (compressed hex); no single validator holds it
+	FrostPublic    json.RawMessage   `json:"frostPublic"` // FROST public key package: group key + each validator's verifying share
 	ValidatorNames []string          `json:"validatorNames"`
 	SoftCloseSec   int64             `json:"softCloseSec"`
 	ExtendSec      int64             `json:"extendSec"`
@@ -130,7 +131,7 @@ func (a *App) Info(context.Context, *abci.InfoRequest) (*abci.InfoResponse, erro
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	// In-memory app: report height 0 so CometBFT replays the chain from genesis on restart.
-	return &abci.InfoResponse{Data: "arena-auctions", Version: "0.2.0", AppVersion: 1, LastBlockHeight: 0}, nil
+	return &abci.InfoResponse{Data: "arena-auctions", Version: "0.3.0", AppVersion: 1, LastBlockHeight: 0}, nil
 }
 
 func (a *App) InitChain(_ context.Context, req *abci.InitChainRequest) (*abci.InitChainResponse, error) {
@@ -178,6 +179,25 @@ func decodeTx(tx []byte) (*Event, error) {
 	return &ev, nil
 }
 
+// safeImage allows an empty image, a same-site path or an https URL made of
+// URL-safe characters only, so it can never break out of an HTML attribute
+// (internal audit A5).
+func safeImage(s string) bool {
+	if s == "" {
+		return true
+	}
+	if !(strings.HasPrefix(s, "https://") || strings.HasPrefix(s, "./") || strings.HasPrefix(s, "/") && !strings.HasPrefix(s, "//")) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.IndexByte("-._~:/?#[]@!$&()*+,;=%", c) >= 0) {
+			return false
+		}
+	}
+	return true
+}
+
 func isPubHex(s string) bool {
 	if len(s) != 66 || !(strings.HasPrefix(s, "02") || strings.HasPrefix(s, "03")) {
 		return false
@@ -201,6 +221,8 @@ func (s *State) applyCreate(ev *Event, now, height int64, apply bool) error {
 		return errors.New("title required (max 120 chars)")
 	case len(c.Description) > 2000 || len(c.Image) > 500 || len(c.Category) > 40 || len(c.Name) > 40:
 		return errors.New("field too long")
+	case !safeImage(c.Image):
+		return errors.New("image must be a same-site path or an https URL")
 	case c.StartPrice < 1 || c.StartPrice > 10_000_000:
 		return errors.New("start price out of range")
 	case c.MinIncrement < 1 || c.MinIncrement > 1_000_000:
@@ -329,6 +351,9 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 		}
 		seen[y] = true
 		ys = append(ys, y)
+		if sum > math.MaxInt64-pr.Amount {
+			return errors.New("proof total overflows")
+		}
 		sum += pr.Amount
 	}
 	if sum != b.Amount {

@@ -1,4 +1,4 @@
-# Threat model: Plebeian Auctions arena (v0.2.0)
+# Threat model: Plebeian Auctions arena (v0.2.0, status updated for v0.3.0)
 
 Status: draft, 2026-11-10. Covers `ChiefmonkeyArt/plebeian-arena-auctions` v0.2.0 as installed by Torii Suite v0.9.50-alpha at `auctions.<domain>`. Fake sats only. This document defines what must hold before real sats are used, and what an auditor should test.
 
@@ -58,11 +58,15 @@ Severity is for real sats; with fake sats nothing is at financial risk.
 
 ### F1 Critical: unauthenticated validator stop/start on the public gateway
 
+v0.3.0: off unless the gateway runs with `-demo-controls`; the team demo still enables it. Must be off before real sats.
+
 `POST /api/admin/validator/{1-4}/{stop|start}` (`chain/main.go`) has no authentication and nginx forwards all `/api/` POSTs. Anyone with the address can stop two validators and halt the chain, so no bids, refunds or payouts until restarted. Confirmed reachable on the live site (GET answers `405 POST only` from the gateway); not exercised.
 
 Fix: disable the route unless the gateway is started with an explicit test flag, and deny `/api/admin/` in the Suite vhost. Tests that stop validators use the flag on loopback only.
 
 ### F2 High: winning bid can be reclaimed by the bidder after locktime
+
+v0.3.0: lock margin defaults to 24 h (audit A3). Still open: payout that does not need the seller online.
 
 Locktime only has to be at least hard end + 30 s (`LockMarginSec`). Payout is triggered by the seller's own browser (`settleLoop`). If the seller is offline past locktime, the winner can take the escrow back with the refund key, breaking goal 3.
 
@@ -99,6 +103,8 @@ Nostr and wallet keys are generated and stored in the browser. Losing browser da
 Fix: NIP-07 signer for identity; tested seed backup and restore for the Coco wallet; keep the strict CSP.
 
 ### F8 Low: resource exhaustion
+
+v0.3.0: HTTP timeouts on every server, at most 4 open signing sessions per escrow.
 
 - Each validator holds at most 256 open signing sessions for one minute. Only authorised requests create them, but one bidder repeating valid release requests can fill them and delay others' releases.
 - Chat accepts any validly signed event (300-message ring, 280 chars), so it can be flooded.

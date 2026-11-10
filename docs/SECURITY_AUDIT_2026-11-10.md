@@ -8,17 +8,17 @@ Method: dependency scans (govulncheck, cargo audit, npm audit, pip-audit), stati
 
 | ID | Severity | Finding | Status |
 |---|---|---|---|
-| A1 | **Critical** | Validators and mint read bid locks differently: escrow bypass | Open |
-| A2 | High | CometBFT v1.0.0 and Go deps: 11 reachable known vulnerabilities, incl. p2p stall | Open |
-| A3 | High | Winning bid reclaimable after locktime if the seller is unpaid (threat model F2) | Open |
-| A4 | Medium | Nostr hex case not canonical: self-bid check bypass, listing replay | Open |
-| A5 | Medium | Listing image URL inserted unescaped into HTML | Open |
-| A6 | Medium | SIG_ALL message (Nutshell 0.20.2) omits output amounts | Open |
-| A7 | Medium | Mint Python deps: 34 known advisories in 6 packages | Open |
-| A8 | Low | crypto-bigint timing advisory under the FROST library | Upstream |
-| A9 | Low | HTTP servers without header/read timeouts | Open |
-| A10 | Low | Unchecked integer sums; validator logs 0644 | Open |
-| A11 | Info | Demo stop/start route in the build | By design (demo only) |
+| A1 | **Critical** | Validators and mint read bid locks differently: escrow bypass | Fixed v0.3.0 |
+| A2 | High | CometBFT v1.0.0 and Go deps: 11 reachable known vulnerabilities, incl. p2p stall | Fixed v0.3.0 |
+| A3 | High | Winning bid reclaimable after locktime if the seller is unpaid (threat model F2) | Mitigated v0.3.0 (24 h margin) |
+| A4 | Medium | Nostr hex case not canonical: self-bid check bypass, listing replay | Fixed v0.3.0 |
+| A5 | Medium | Listing image URL inserted unescaped into HTML | Fixed v0.3.0 |
+| A6 | Medium | SIG_ALL message (Nutshell 0.20.2) omits output amounts | Fixed v0.3.0 |
+| A7 | Medium | Mint Python deps: 34 known advisories in 6 packages | Fixed v0.3.0 (ecdsa: no fix upstream) |
+| A8 | Low | crypto-bigint timing advisory under the FROST library | Upstream (no fixed release yet) |
+| A9 | Low | HTTP servers without header/read timeouts | Fixed v0.3.0 |
+| A10 | Low | Unchecked integer sums; validator logs 0644 | Fixed v0.3.0 |
+| A11 | Info | Demo stop/start route in the build | Off by default from v0.3.0 (`-demo-controls`) |
 
 ## A1 Critical: lock-parser differential (escrow bypass)
 
@@ -93,6 +93,21 @@ gosec G112: the gateway and validator `http.Server`s set no `ReadHeaderTimeout`/
 ## A11 Info: demo stop/start route
 
 `/api/admin/validator/N/stop|start` is for the demo only and will not be in the live build. Until then it is reachable on `auctions.chiefmonkey.art`. Recommend a build flag so it cannot ship by accident.
+
+## Fixes in v0.3.0
+
+- A1: `parseP2PK` walks the secret with a token decoder. It refuses duplicate or unknown keys (only `nonce`, `data`, `tags`, exact case), escapes, invalid UTF-8, trailing data, repeated tags, multi-value `locktime`/`sigflag`/`n_sigs`, non-canonical integers and upper-case keys. `checkLock` still needs exactly the group key, one refund key, `SIG_ALL` and the margin. All four PoC secrets and eleven more variants are regression tests (`chain/audit_test.go`).
+- A2: CometBFT v1.0.1, x/net, grpc v1.85.0, klauspost/compress and protobuf upgraded; govulncheck reports nothing reachable.
+- A3: `arena init -lock-margin` defaults to 86400 s (24 h). The seller has a day after the hard end to collect; only then can a winning bidder reclaim. A payout that does not need the seller online is still open (threat model F2).
+- A4: `Event.Verify` requires lowercase hex `id`, `pubkey` and `sig`.
+- A5: the chain accepts only an empty image or a same-site path of plain path characters; the client escapes every `src` and falls back to a placeholder for anything else.
+- A6: Nutshell 0.21.0. The validators, the client and the e2e test sign `secret||C` per input and `amount||B_` per output; outputs must be lowercase hex, 1–64 of them, with checked sums.
+- A7: mint re-pinned on Nutshell 0.21.0 with overrides (starlette 1.3.1+, fastapi 0.120+, cryptography 48.0.1+, h11 0.16+, setuptools 84.1+, wheel 0.46.2+). pip-audit leaves only ecdsa 0.19.2 (PYSEC-2026-1325, no fixed release; Nutshell uses it for nothing we expose). The unused Breez Spark backend is replaced by a stub module so no Rust SDK ships.
+- A9: read-header, read, write and idle timeouts on the gateway and validator servers.
+- A10: checked int64 sums for proofs and outputs; validator logs 0600.
+- A11: the stop/start route returns 404 unless the gateway runs with `-demo-controls`.
+- F8: at most 4 open FROST signing sessions per escrow, 256 per validator.
+- Chain format marker: `arena init -if-needed` keeps a chain only if `FORMAT` matches (now `3`), so the Suite re-initialises v0.2.0 chains whose state was accepted under the old rules.
 
 ## Checked and fine
 

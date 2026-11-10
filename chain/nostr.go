@@ -83,15 +83,30 @@ func (e *Event) Serialize() string {
 }
 
 func (e *Event) Verify() error {
-	if len(e.Pubkey) != 64 || len(e.ID) != 64 || len(e.Sig) != 128 {
-		return errors.New("malformed event")
+	// NIP-01: lowercase hex only. Accepting upper case would give one key
+	// several pubkey strings and one event several ids (internal audit A4).
+	if !lowerHex(e.Pubkey, 64) || !lowerHex(e.ID, 64) || !lowerHex(e.Sig, 128) {
+		return errors.New("malformed event: id, pubkey and sig must be lowercase hex")
 	}
 	h := sha256.Sum256([]byte(e.Serialize()))
-	if hex.EncodeToString(h[:]) != strings.ToLower(e.ID) {
+	if hex.EncodeToString(h[:]) != e.ID {
 		return errors.New("event id mismatch")
 	}
 	if !schnorrVerifyHash(h[:], e.Pubkey, e.Sig) {
 		return errors.New("bad event signature")
 	}
 	return nil
+}
+
+func lowerHex(s string, n int) bool {
+	if len(s) != n {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }

@@ -45,6 +45,7 @@ step(2, 'Fund wallets from the fake-sats faucet and place the first bid');
 for (const u of [alice, bob, carol]) await c.faucet(u, 1000);
 ok(await bal(alice) === 1000 && await bal(bob) === 1000 && await bal(carol) === 1000, 'each bidder holds 1000 fake sats in a Coco wallet');
 await expectReject(c.createAuction(seller, { title: '', startPrice: 0, minIncrement: 1, durationSec: 30 }), /title|range/, 'invalid lot rejected');
+await expectReject(c.createAuction(seller, { title: 'x', description: '', image: 'x" onerror="alert(1)', category: '', startPrice: 100, minIncrement: 10, durationSec: 30 }), /image/, 'lot with an unsafe image path rejected (audit A5)');
 const b1 = await placeBid(alice, A, 100);
 ok(b1.state.auctions[A].highBid === b1.id, 'Alice leads at 100');
 const lock0 = JSON.parse(b1.state.bids[b1.id].proofs[0].secret)[1];
@@ -120,7 +121,16 @@ ok(new Set(caught.filter((v) => v.height === caught[0].height).map((v) => v.appH
 
 step('R', 'Rejected bid: bidder reclaims locked sats alone after locktime');
 const st0 = await c.state();
-for (const { u, locked } of stranded) {
+// Production chains use a long lock margin (24 h by default, audit A3); the
+// reclaim wait is only exercised when the chain was initialised with a short one.
+const longMargin = st0.params.lockMarginSec > 120;
+let pendingReclaim = 0;
+if (longMargin) {
+  for (const { locked } of stranded) pendingReclaim += totalSats(locked);
+  await expectReject(c.reclaimExpired(stranded[0].u, stranded[0].locked, st0.params), /.+/, 'reclaim before locktime refused by mint');
+  console.log(`  lock margin ${st0.params.lockMarginSec}s: skipping the locktime wait (${pendingReclaim} sats stay locked until then)`);
+}
+for (const { u, locked } of longMargin ? [] : stranded) {
   const lt = JSON.parse(locked[0].secret)[1].tags.find((t) => t[0] === 'locktime')[1];
   await expectReject(c.reclaimExpired(u, locked, st0.params), /.+/, 'reclaim before locktime refused by mint');
   const wait = Number(lt) * 1000 - Date.now() + 2000;
@@ -132,8 +142,8 @@ for (const { u, locked } of stranded) {
 
 step('C', 'Conservation of fake sats');
 const [bs, ba, bb, bc] = await Promise.all([seller, alice, bob, carol].map(bal));
-const total = bs + ba + bb + bc;
-ok(total === 3000, `seller ${bs} + alice ${ba} + bob ${bb} + carol ${bc} = ${total} (3000 minted)`);
+const total = bs + ba + bb + bc + pendingReclaim;
+ok(total === 3000, `seller ${bs} + alice ${ba} + bob ${bb} + carol ${bc}${pendingReclaim ? ` + ${pendingReclaim} awaiting locktime` : ''} = ${total} (3000 minted)`);
 const st = await c.state();
 const escrows = st.auctions[A].bids.map((b) => st.bids[b]);
 const spent = await Promise.all(escrows.map((b) => c.spent(b.proofs).then((x) => x.every(Boolean))));
