@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"sort"
 	"strings"
@@ -113,6 +114,9 @@ type App struct {
 	committedH int64  // height of that snapshot
 	pending    []byte // snapshot made in FinalizeBlock, published at Commit
 	appHash    []byte
+	// hash of committed; Info reports it with committedH (ADR 0003 §2)
+	committedHash []byte
+	snap          *snapshotter // nil: no snapshots (tests)
 }
 
 func NewApp() *App { return &App{st: newState()} }
@@ -132,8 +136,10 @@ func (a *App) Read(f func(s *State)) {
 func (a *App) Info(context.Context, *abci.InfoRequest) (*abci.InfoResponse, error) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	// In-memory app: report height 0 so CometBFT replays the chain from genesis on restart.
-	return &abci.InfoResponse{Data: "arena-auctions", Version: "0.3.2", AppVersion: 1, LastBlockHeight: 0}, nil
+	// The committed height and hash: 0 on a fresh start (CometBFT replays
+	// from genesis), or a restored snapshot's (it replays only what follows).
+	return &abci.InfoResponse{Data: "arena-auctions", Version: "0.3.3", AppVersion: 1,
+		LastBlockHeight: a.committedH, LastBlockAppHash: a.committedHash}, nil
 }
 
 func (a *App) InitChain(_ context.Context, req *abci.InitChainRequest) (*abci.InitChainResponse, error) {
@@ -478,9 +484,20 @@ func (a *App) Commit(context.Context, *abci.CommitRequest) (*abci.CommitResponse
 	defer a.mu.Unlock()
 	if a.pending != nil {
 		a.committed, a.pending = a.pending, nil
+		a.committedHash = a.appHash
 	} else {
 		a.committed, _ = json.Marshal(a.st)
+		h := sha256.Sum256(a.committed)
+		a.committedHash = h[:]
 	}
 	a.committedH = a.st.Height
+	if a.snap != nil && a.snap.every > 0 && a.committedH%a.snap.every == 0 {
+		h, hash, raw := a.committedH, a.committedHash, a.committed
+		go func() {
+			if err := a.snap.write(h, hash, raw); err != nil {
+				log.Printf("snapshot %d: %v", h, err)
+			}
+		}()
+	}
 	return &abci.CommitResponse{}, nil
 }

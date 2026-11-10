@@ -22,4 +22,4 @@ After v0.3.1 the page still felt slow on the live demo. There were three causes:
 - A user's own actions show as soon as their block commits.
 - Coco gets pushed updates instead of failing retries in the console.
 - Long-lived sockets are a new resource surface (see the threat model).
-- The chain, app hash and `FORMAT` (3) are unchanged, so an upgrade keeps the chain. Restarts still replay from genesis until ADR 0003's snapshots land.
+- The chain, app hash and `FORMAT` (3) are unchanged, so an upgrade keeps the chain. Restarts still replay from genesis until ADR 0003's snapshots land (they did, in v0.3.3).

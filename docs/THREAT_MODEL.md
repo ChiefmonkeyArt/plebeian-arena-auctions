@@ -1,4 +1,4 @@
-# Threat model: Plebeian Auctions arena (v0.2.0, status updated for v0.3.2)
+# Threat model: Plebeian Auctions arena (v0.2.0, status updated for v0.3.3)
 
 Status: draft, 2026-11-10. Covers `ChiefmonkeyArt/plebeian-arena-auctions` v0.2.0 as installed by Torii Suite v0.9.50-alpha at `auctions.<domain>`. Fake sats only. This document defines what must hold before real sats are used, and what an auditor should test.
 
@@ -123,6 +123,8 @@ Fix: reproducible builds checked by a second builder, and signed release checksu
 All auctions, bids, amounts, bidder wallet keys and Nostr keys are public through `/api/state`. v0.3.1 adds `/api/state?view=client` and `/api/bid?id=` (ADR 0004). They expose nothing the full state did not already, and the `bidders` parameter only tells the gateway which public keys a browser holds, which it already learns when they sign events. Gzip is safe here: these responses carry no secrets, so compression side channels (BREACH) do not apply. Intended for an auction, but bidders are linkable across lots.
 
 v0.3.2 (ADR 0005) lets one path, `/mint/v1/ws`, upgrade to a WebSocket that is passed straight to the mint. Every other upgrade attempt gets a 400. A held socket costs a goroutine and two file descriptors and is cut after 10 minutes. Nginx rate-limits new upgrades like any other request, but this is not a cap on open sockets per client: on real sats, add a per-IP connection limit (`limit_conn`) in front.
+
+v0.3.3 (ADR 0003 §2) writes state snapshots to `vN/data/app-state/<height>.json` (0600, directory 0700). Anyone who can write there can already rewrite the block store, so this adds no new attacker, but a snapshot must never become a quiet way to change state. On start a validator loads only the newest file and refuses to run unless it is a regular file under 256 MiB, hashes to its stored app hash, re-encodes to the same bytes, and matches the chain's own record (the next block header's app hash, or the saved CometBFT state at the tip). A refusal never falls back to an older snapshot or to genesis on its own; the operator deletes the file. Snapshots contain only public state (the same data as `/api/state`), no keys.
 
 ## Already in place
 

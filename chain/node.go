@@ -156,13 +156,16 @@ func cmdNode(args []string) {
 	fs := flag.NewFlagSet("node", flag.ExitOnError)
 	root := fs.String("root", "run/chain", "chain root dir")
 	idx := fs.Int("i", 1, "validator number 1-4")
+	every := fs.Int64("snapshot-every", 1000, "write a state snapshot every N blocks (0: only on clean shutdown)")
 	fs.Parse(args)
+	if *every < 0 {
+		log.Fatal("-snapshot-every must be >= 0")
+	}
 	i := *idx - 1
 	home := homeOf(*root, i)
 	peers, err := os.ReadFile(filepath.Join(home, "peers.txt"))
 	check(err)
 	c := nodeConfig(home, i, string(peers))
-	// in-memory app replays from genesis, so start the block store fresh-compatible:
 	pv := privval.LoadFilePV(c.PrivValidatorKeyFile(), c.PrivValidatorStateFile())
 	nk, err := p2p.LoadOrGenNodeKey(c.NodeKeyFile())
 	check(err)
@@ -176,6 +179,17 @@ func cmdNode(args []string) {
 	sessions := &frostSessions{m: map[string]frostSession{}}
 
 	app := NewApp()
+	// ADR 0003 §2: start from the newest verified snapshot, if any.
+	app.snap = &snapshotter{dir: snapshotDir(home), every: *every}
+	snap, err := loadSnapshot(app.snap.dir, cometRecord(c))
+	if err != nil {
+		log.Fatalf("%s: %v (delete that file to start from the previous snapshot, or from genesis)", names[i], err)
+	}
+	if snap != nil {
+		app.restore(snap)
+		app.snap.last = snap.height
+		log.Printf("%s: restored state snapshot at height %d", names[i], snap.height)
+	}
 	logger := cmtlog.NewFilter(cmtlog.NewTMLogger(cmtlog.NewSyncWriter(os.Stdout)), cmtlog.AllowError())
 	n, err := node.NewNode(context.Background(), c, pv, nk, proxy.NewLocalClientCreator(app),
 		node.DefaultGenesisDocProviderFunc(c), cfg.DefaultDBProvider, node.DefaultMetricsProvider(c.Instrumentation), logger)
@@ -247,6 +261,15 @@ func cmdNode(args []string) {
 	srv.Close()
 	n.Stop()
 	n.Wait()
+	// clean shutdown: snapshot the last committed state so the next start
+	// replays nothing
+	if h, hash, raw := app.committedSnapshot(); h > 0 {
+		if err := app.snap.write(h, hash, raw); err != nil {
+			log.Printf("%s: shutdown snapshot %d: %v", names[i], h, err)
+		} else {
+			log.Printf("%s: wrote state snapshot at height %d", names[i], h)
+		}
+	}
 }
 
 // sigAllMessage is the NUT-11 SIG_ALL message as Nutshell 0.21 builds it:
