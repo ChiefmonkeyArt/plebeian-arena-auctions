@@ -1,4 +1,4 @@
-# Threat model: Plebeian Auctions arena (v0.2.0, status updated for v0.3.3)
+# Threat model: Plebeian Auctions arena (v0.2.0, status updated for v0.3.4)
 
 Status: draft, 2026-11-10. Covers `ChiefmonkeyArt/plebeian-arena-auctions` v0.2.0 as installed by Torii Suite v0.9.50-alpha at `auctions.<domain>`. Fake sats only. This document defines what must hold before real sats are used, and what an auditor should test.
 
@@ -125,6 +125,8 @@ All auctions, bids, amounts, bidder wallet keys and Nostr keys are public throug
 v0.3.2 (ADR 0005) lets one path, `/mint/v1/ws`, upgrade to a WebSocket that is passed straight to the mint. Every other upgrade attempt gets a 400. A held socket costs a goroutine and two file descriptors and is cut after 10 minutes. Nginx rate-limits new upgrades like any other request, but this is not a cap on open sockets per client: on real sats, add a per-IP connection limit (`limit_conn`) in front.
 
 v0.3.3 (ADR 0003 §2) writes state snapshots to `vN/data/app-state/<height>.json` (0600, directory 0700). Anyone who can write there can already rewrite the block store, so this adds no new attacker, but a snapshot must never become a quiet way to change state. On start a validator loads only the newest file and refuses to run unless it is a regular file under 256 MiB, hashes to its stored app hash, re-encodes to the same bytes, and matches the chain's own record (the next block header's app hash, or the saved CometBFT state at the tip). A refusal never falls back to an older snapshot or to genesis on its own; the operator deletes the file. Snapshots contain only public state (the same data as `/api/state`), no keys.
+
+v0.3.4 (ADR 0006) changes only the page. A one-tap bid (Next, Jump, Big move, the sticky Bid button, swipe) is priced against the view read just before the lock, so it can be up to two increments above the amount the button showed; anything higher is refused before any sats are locked, and the toast states the amount actually bid. A tap made while a bid is in flight is held (latest one wins) and dropped if you are leading when the first lands, so taps cannot stack bids. The demo bots in your own browser wait 5 s after your tap, which removes the most common cause of a stale-amount rejection (and its sats locked until locktime). Nothing changes on the chain or the gateway.
 
 ## Already in place
 

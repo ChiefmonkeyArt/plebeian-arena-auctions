@@ -163,17 +163,24 @@ function role(a, n = ui.me) {
 }
 
 // ---------- wallet ops ----------
-async function topup(n, amount, quiet) {
+const topping = {}; // in-flight faucet per user; a bid waits for it rather than racing the wallet
+function topup(n, amount, quiet) {
+  if (topping[n]) return topping[n];
+  topping[n] = topupNow(n, amount, quiet).finally(() => { delete topping[n]; });
+  return topping[n];
+}
+async function topupNow(n, amount, quiet) {
   BAL[n] = await api.faucet(ids[n], amount);
   ledger(n, 'topup', amount, 'Fake-sats faucet (test mint) · Coco wallet'); saveW();
   if (!quiet && n === ui.me) { pulse($('.wallet-chip'), 'got'); toast(`+${fmt(amount)} fake sats minted`, 'good'); }
 }
 
-async function placeBid(n, a, amount, { quiet = false, auto = false } = {}) {
+async function placeBid(n, a, amount, { quiet = false, auto = false, steps = null, maxAmount = Infinity, onAmount, onSent } = {}) {
   const key = 'bid:' + n;
   if (busy.has(key)) return { ok: false, reason: 'previous bid still settling' };
   busy.add(key);
   try {
+    if (topping[n]) await topping[n];
     const id = ids[n];
     if (a.seller === idPub(id)) throw new Error("You're the seller of this lot");
     if (bal(n) < amount) {
@@ -185,17 +192,30 @@ async function placeBid(n, a, amount, { quiet = false, auto = false } = {}) {
     const fresh = (await api.view([idPub(id)])).state;
     const fa = fresh.auctions[a.id];
     if (!fa) throw new Error('auction closed');
+    // one-tap buttons mean "N steps above the current bid", so price them
+    // against the view we just read, not the one on screen (ADR 0006)
+    if (steps !== null) {
+      amount = stepAmt(fa, steps);
+      // never more than two increments above what the button showed
+      if (amount > maxAmount) throw new Error(`Price moved to ${fmt(fa.highAmount)} · tap again to bid ${fmt(amount)}`);
+      onAmount?.(amount);
+    }
+    if (bal(n) < amount) {
+      if (n !== ui.me || ui.autotopup) await topup(n, Math.max(amount - bal(n) + 1000, 5000), true);
+      else throw new Error('Not enough fake sats. Top up in the wallet.');
+    }
     const { locked } = await api.lockForBid(id, amount, fresh.params, fa, { state: fresh });
-    await refreshBal(n);
-    ledger(n, 'hold', amount, `Locked to the validators' FROST key · ${short(fa.title, 30)}`);
-    saveW();
     try {
       const r = await api.bid(id, fa, amount, locked);
+      onSent?.(amount);
+      ledger(n, 'hold', amount, `Locked to the validators' FROST key · ${short(fa.title, 30)}`);
+      saveW(); refreshBal(n).catch(() => {});
       if (!quiet || n === ui.me) burst();
       if (n === ui.me && !quiet) toast(`${auto ? 'Max bid raised you to' : 'Bid'} <b>${fmt(amount)}</b> sent · checked by ${esc(r.via)}`, 'good');
       return { ok: true };
     } catch (e) {
       W[n].stranded.push({ locked, auction: a.id, at: Date.now() / 1000 });
+      refreshBal(n).catch(() => {});
       ledger(n, 'hold', amount, 'Rejected by validators · reclaimable after locktime');
       saveW();
       throw e;
@@ -207,9 +227,69 @@ async function placeBid(n, a, amount, { quiet = false, auto = false } = {}) {
   } finally { busy.delete(key); }
 }
 
+// ---------- your bids: instant feedback (ADR 0006) ----------
+// `pending` is what the page shows between your tap and the block that
+// records it; `queued` is the latest tap made while a bid was in flight.
+let pending = null; // { lot, amount, state: 'sending' | 'sent', at }
+let queued = null;  // { lot, steps } or { lot, amount }
+let humanAt = 0;    // the demo bots in this browser hold off while you bid
+const BOT_HOLD_MS = 5000;
+const pendingFor = (a) => (pending && a && pending.lot === a.id ? pending : null);
+function tapBid(intent, el) {
+  const a = currentLot();
+  if (!a || a.status !== 'open') return;
+  humanAt = Date.now();
+  navigator.vibrate?.(10);
+  pulse(el, 'hit');
+  if (role(a) === 'seller') return toast("You're the seller of this lot", 'danger');
+  if (pending || busy.has('bid:' + ui.me)) {
+    queued = { ...intent, lot: a.id };
+    toast('Got it · your next bid goes in as soon as this one lands', 'info');
+    return;
+  }
+  humanBid({ ...intent, lot: a.id }, el);
+}
+async function humanBid(intent, el) {
+  const a = S && S.auctions[intent.lot];
+  if (!a) return;
+  const shown = intent.amount ?? stepAmt(a, intent.steps);
+  pending = { lot: a.id, amount: shown, state: 'sending', at: Date.now() };
+  el?.classList.add('sending');
+  renderFeeds(currentLot());
+  const r = await placeBid(ui.me, a, intent.amount ?? 0, {
+    steps: intent.amount == null ? intent.steps : null,
+    maxAmount: shown + 2 * a.minIncrement,
+    onAmount: (amt) => { if (pending) pending.amount = amt; },
+    onSent: (amt) => { if (pending) Object.assign(pending, { amount: amt, state: 'sent', at: Date.now() }); renderFeeds(currentLot()); },
+  });
+  el?.classList.remove('sending');
+  humanAt = Date.now();
+  if (r.ok) pulse(el, 'done');
+  else { pending = null; pulse(el, 'shake'); renderFeeds(currentLot()); reconcilePending(); }
+}
+// Called on every new state: drop the pending bid once its block shows it
+// (or it plainly will not), then send a queued tap if you are not leading.
+function reconcilePending() {
+  if (pending) {
+    const a = S.auctions[pending.lot];
+    const landed = a && bidsOf(a).some((b) => b.bidder === mePub() && b.amount === pending.amount);
+    if (landed || !a || a.status !== 'open' || (pending.state === 'sent' && Date.now() - pending.at > 10000)) pending = null;
+  }
+  if (pending || !queued || busy.has('bid:' + ui.me)) return;
+  const q = queued; queued = null;
+  const a = S.auctions[q.lot];
+  if (!a || a.status !== 'open') return;
+  if (role(a) === 'winning') return toast("You're leading · extra tap skipped", 'info');
+  humanBid(q, null);
+}
+
 // refunds, payouts and expired-lock reclaims for every local user
 async function settleLoop() {
   if (!S) return;
+  const cur = currentLot();
+  if (ui.autotopup && cur && cur.status === 'open' && !topping[ui.me] && !busy.has('bid:' + ui.me) && role(cur) !== 'seller' && bal(ui.me) < 2 * stepAmt(cur, 5)) {
+    topup(ui.me, Math.max(5000, 3 * stepAmt(cur, 5)), true).catch(() => {});
+  }
   for (const n of USERS) {
     const pk = idPub(ids[n]);
     for (const b of Object.values(S.bids)) {
@@ -265,6 +345,7 @@ async function botLoop() {
   const mx = ui.max[a.id];
   if (mx && role(a) === 'outbid' && minNext(a) <= mx && !busy.has('bid:' + ui.me)) placeBid(ui.me, a, minNext(a), { auto: true });
   if (ui.bots === 'off' || Date.now() < botAt) return;
+  if (pending || busy.has('bid:' + ui.me) || Date.now() - humanAt < BOT_HOLD_MS) return;
   const gap = { chill: [6000, 12000], busy: [3000, 6000], frenzy: [1200, 2600] }[ui.bots];
   botAt = Date.now() + gap[0] + Math.random() * (gap[1] - gap[0]);
   const rivals = USERS.filter((n) => n !== ui.me && idPub(ids[n]) !== a.seller && !(a.highBid && S.bids[a.highBid].bidder === idPub(ids[n])));
@@ -336,10 +417,12 @@ function renderFrame() {
     const total = Math.max(1, (a.endAt - a.createdAt));
     setV('ring', String(553 * (1 - Math.min(1, remaining(a) / Math.min(total, 120)))));
     setV('ringlabel', a.extensions ? `+${a.extensions} ext` : a.status === 'open' ? 'soft close' : 'ended');
-    setV('pricelabel', live ? (a.highBid ? 'Current bid' : 'Starting bid') : a.winner ? 'Sold for' : 'Final');
-    setV('price', fmt(a.highBid ? a.highAmount : a.startPrice));
+    const pend = live && pendingFor(a) && (!a.highBid || pendingFor(a).amount > a.highAmount) ? pendingFor(a) : null;
+    document.body.classList.toggle('is-pending', !!pend);
+    setV('pricelabel', pend ? (pend.state === 'sending' ? 'Your bid · sending' : 'Your bid · sent, next block') : live ? (a.highBid ? 'Current bid' : 'Starting bid') : a.winner ? 'Sold for' : 'Final');
+    setV('price', fmt(pend ? pend.amount : a.highBid ? a.highAmount : a.startPrice));
     const lead = a.highBid ? S.bids[a.highBid] : null;
-    setV('leaderline', !lead ? `No bids yet · starts at ${fmt(a.startPrice)}` : a.status === 'closed' ? `${avatar(nameOfBid(lead), 18)} <b>${esc(nameOfBid(lead))}</b> won` : `${avatar(nameOfBid(lead), 18)} <b>${esc(nameOfBid(lead))}</b> ${lead.bidder === mePub() ? 'are' : 'is'} winning <span class="crown">♛</span>`, true);
+    setV('leaderline', pend ? `${avatar(ui.me, 18)} <b>You</b> · ${pend.state === 'sending' ? 'locking sats to the FROST key…' : 'checked by a validator, waiting for the block…'}` : !lead ? `No bids yet · starts at ${fmt(a.startPrice)}` : a.status === 'closed' ? `${avatar(nameOfBid(lead), 18)} <b>${esc(nameOfBid(lead))}</b> won` : `${avatar(nameOfBid(lead), 18)} <b>${esc(nameOfBid(lead))}</b> ${lead.bidder === mePub() ? 'are' : 'is'} winning <span class="crown">♛</span>`, true);
     setV('mystatus', myStatusHTML(a), true);
     setV('step0', fmt(stepAmt(a, 0))); setV('step0b', fmt(stepAmt(a, 0))); setV('step2', fmt(stepAmt(a, 2))); setV('step5', fmt(stepAmt(a, 5)));
     setV('bidcta', ui.mode === 'max' ? 'Set max bid' : 'Place bid');
@@ -382,10 +465,12 @@ function renderMedia(a) {
 function renderFeeds(a) {
   const ol = $('[data-feed=bids]');
   const bs = bidsOf(a).slice().reverse();
-  const key = (a ? a.id : '') + bs.map((b) => b.id + b.status).join();
+  const pend = pendingFor(a);
+  const key = (a ? a.id : '') + bs.map((b) => b.id + b.status).join() + (pend ? pend.state + pend.amount : '');
   if (ol._k !== key) {
     const fresh = ol._lot === (a && a.id);
-    ol.innerHTML = bs.length ? bs.map((b, i) => `<li class="bid-item ${i === 0 ? 'top' : ''} ${b.bidder === mePub() ? 'mine' : ''} ${fresh && !ol._seen?.has(b.id) ? 'enter' : ''}">${avatar(nameOfBid(b))}<span class="bi-name">${esc(nameOfBid(b))}${b.extended ? '<em class="tag-jump">+time</em>' : ''}${b.status === 'outbid' || b.status === 'lost' ? `<em class="tag-auto">${claimed.has(b.id) ? 'refunded' : 'refunding'}</em>` : ''}</span><span class="bi-amt">${fmt(b.amount)}</span><time>${clock(b.time)}</time></li>`).join('') : '<li class="empty">The arena is quiet…</li>';
+    const prow = pend ? `<li class="bid-item top mine pending">${avatar(ui.me)}<span class="bi-name">You<em class="tag-auto">${pend.state === 'sending' ? 'sending' : 'next block'}</em></span><span class="bi-amt">${fmt(pend.amount)}</span><time>now</time></li>` : '';
+    ol.innerHTML = prow + (bs.length || pend ? '' : '<li class="empty">The arena is quiet…</li>') + (!bs.length ? '' : bs.map((b, i) => `<li class="bid-item ${i === 0 && !pend ? 'top' : ''} ${b.bidder === mePub() ? 'mine' : ''} ${fresh && !ol._seen?.has(b.id) ? 'enter' : ''}">${avatar(nameOfBid(b))}<span class="bi-name">${esc(nameOfBid(b))}${b.extended ? '<em class="tag-jump">+time</em>' : ''}${b.status === 'outbid' || b.status === 'lost' ? `<em class="tag-auto">${claimed.has(b.id) ? 'refunded' : 'refunding'}</em>` : ''}</span><span class="bi-amt">${fmt(b.amount)}</span><time>${clock(b.time)}</time></li>`).join(''));
     ol._k = key; ol._lot = a && a.id; ol._seen = new Set(bs.map((b) => b.id));
   }
   // leaderboard
@@ -548,6 +633,7 @@ async function pollState() {
     if (NET.length) S.height = Math.max(S.height, ...NET.map((v) => v.height || 0));
     offsetMs = S.time * 1000 + 500 - Date.now();
     onNewState(prev);
+    reconcilePending();
     const a = currentLot();
     document.body.classList.toggle('arena-loading', !a);
     renderMedia(a); renderFeeds(a); renderChat(a); renderQueue(a); renderWallet();
@@ -584,7 +670,7 @@ document.addEventListener('click', async (e) => {
     case 'close-modal': $$('.modal').forEach((d) => { d.hidden = true; }); break;
     case 'seller-sheet': if (a) { $('[data-slot=seller-full]').innerHTML = `<div class="sc-top"><img class="sc-av" src="./assets/live-frame.jpg" alt=""><div><b>${esc(a.sellerName || 'Seller')}</b><small>npub hex ${esc(a.seller.slice(0, 24))}…</small></div></div><p class="sc-foot">Listing is a signed Nostr event (kind 1440). Payouts go only to the wallet key declared in it: ${esc(a.sellerWallet.slice(0, 20))}…</p>`; $('[data-modal=seller]').hidden = false; } break;
     case 'topup': el.classList.add('disabled'); try { await topup(ui.me, +el.dataset.amt); } catch (err) { toast(esc(err.message), 'danger'); } el.classList.remove('disabled'); renderWallet(); break;
-    case 'bid-step': case 'bid-next': if (a) { const r = await placeBid(ui.me, a, stepAmt(a, +(el.dataset.steps || 0))); if (r.ok) pulse(el, 'done'); } break;
+    case 'bid-step': case 'bid-next': tapBid({ steps: +(el.dataset.steps || 0) }, act === 'bid-step' ? el : null); break;
     case 'bid-custom': {
       if (!a) break;
       const inp = $('[data-in=bid]'); const amt = parseInt(inp.value.replace(/\D/g, ''), 10) || 0;
@@ -592,7 +678,8 @@ document.addEventListener('click', async (e) => {
         if (amt < minNext(a)) { toast(`Max must be at least ${fmt(minNext(a))}`, 'danger'); break; }
         ui.max[a.id] = amt; save('max', ui.max); toast(`Max bid set to <b>${fmt(amt)}</b>. This browser bids for you one step at a time.`, 'good');
         if (role(a) !== 'winning') placeBid(ui.me, a, minNext(a), { auto: true });
-      } else { const r = await placeBid(ui.me, a, amt); if (!r.ok) pulse(inp.parentElement, 'shake'); }
+      } else if (amt < minNext(a)) { toast(`Bid must be at least ${fmt(minNext(a))}`, 'danger'); pulse(inp.parentElement, 'shake'); }
+      else tapBid({ amount: amt }, el);
       break;
     }
     case 'mode': ui.mode = el.dataset.mode; $$('[data-act=mode]').forEach((b) => b.classList.toggle('on', b === el)); break;
@@ -639,9 +726,9 @@ document.addEventListener('submit', async (e) => {
   const set = (dx) => { knob.style.transform = `translateX(${dx}px)`; fill.style.width = 48 + dx + 'px'; };
   knob.addEventListener('pointerdown', (e) => { sx = e.clientX; knob.setPointerCapture(e.pointerId); });
   knob.addEventListener('pointermove', (e) => { if (sx === null) return; set(Math.max(0, Math.min(max(), e.clientX - sx))); });
-  knob.addEventListener('pointerup', async (e) => {
+  knob.addEventListener('pointerup', (e) => {
     const dx = e.clientX - sx; sx = null;
-    if (dx > max() * 0.82) { set(max()); const a = currentLot(); if (a) { const r = await placeBid(ui.me, a, minNext(a)); if (r.ok) pulse(sw, 'done'); } }
+    if (dx > max() * 0.82) { set(max()); tapBid({ steps: 0 }, sw); }
     setTimeout(() => set(0), 380);
   });
 })();
