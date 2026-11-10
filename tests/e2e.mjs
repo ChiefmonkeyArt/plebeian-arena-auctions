@@ -29,6 +29,8 @@ async function placeBid(u, au, amount, force = false) {
   let r;
   try { r = await c.bid(u, a, amount, locked); } catch (e) { stranded.push({ u, locked }); throw e; }
   const bid = await until(async () => { const st = await c.state(); return st.bids[r.id] && st; }, 15000, 'bid commit');
+  // every running validator must have the block too before a release is asked for
+  await until(async () => (await c.network()).filter((v) => v.up).every((v) => v.height >= bid.height), 15000, 'all validators at the bid block');
   return { id: r.id, via: r.via, state: bid };
 }
 
@@ -88,15 +90,32 @@ ok(!r3.cosigners.includes('Validator 4') && r3.cosigners.length === 3, 'Carol re
 step(6, 'Auction auto-closes; validators agree on the winner');
 s = await until(async () => { const st = await c.state(); return st.auctions[A].status === 'closed' && st; }, 200000, 'close');
 ok(s.auctions[A].winner === b4.id && s.bids[b4.id].status === 'won', 'Alice wins at 250');
-const net2 = await c.network();
-const hashes = new Set(net2.filter((v) => v.up).map((v) => v.appHash));
-ok(hashes.size === 1, 'running validators report the same app hash');
+// compare app hashes at one height (validators can be a block apart for a moment)
+const net2 = await until(async () => { const n = (await c.network()).filter((v) => v.up); return n.every((v) => v.height === n[0].height) && n; }, 20000, 'validators at one height');
+const hashes = new Set(net2.map((v) => v.appHash));
+ok(hashes.size === 1, `running validators report the same app hash at height ${net2[0].height}`);
 
 step(7, 'Seller payout (needs 3 of 4, seller-authorised)');
 await expectReject(c.claim(alice, s.bids[b4.id], 'payout', s.params), /validators agreed/, 'winner cannot redirect the payout');
 await expectReject(c.claim(seller, s.bids[b2.id], 'payout', s.params), /validators agreed/, 'losing bid cannot be paid to seller');
 const pay = await c.claim(seller, s.bids[b4.id], 'payout', s.params);
 ok(await bal(seller) === 250 && pay.amount === 250, 'seller received 250 in Coco');
+
+step('V', 'Slim client view (v0.3.1): no proofs, 304 when unchanged, gzip, proofs on demand');
+const v1 = await c.view([idPub(bob)]);
+const vb = Object.values(v1.state.bids);
+ok(v1.state.view === 'client' && !('usedY' in v1.state) && typeof v1.state.usedCount === 'number', 'view drops the used-token list (count only)');
+ok(vb.length > 0 && vb.every((b) => !('proofs' in b) && b.proofCount > 0), 'bids carry proofCount, not proofs');
+ok(v1.state.bids[b2.id] && v1.state.bids[b2.id].status === 'lost', "Bob's unsettled losing bid is in his view");
+ok(JSON.stringify(v1.state).length < JSON.stringify(await c.state()).length, 'view is smaller than the full state');
+ok(/^"[0-9a-f]{24}"$/.test(v1.etag), 'view has an ETag');
+ok((await c.view([idPub(bob)], v1.etag)) === null, 'unchanged view answers 304 Not Modified');
+const gzr = await fetch(BASE + '/api/state?view=client', { headers: { 'accept-encoding': 'gzip' } });
+ok(gzr.headers.get('content-encoding') === 'gzip', 'state view is gzip-compressed');
+const fullB2 = await c.bidWithProofs(b2.id);
+ok(JSON.stringify(fullB2.proofs) === JSON.stringify(s.bids[b2.id].proofs), '/api/bid returns the committed proofs for one bid');
+await expectReject(c.bidWithProofs('ZZ'), /64 lowercase hex/, '/api/bid rejects a malformed id');
+await expectReject(c.bidWithProofs('0'.repeat(64)), /no such bid/, '/api/bid 404 for an unknown bid');
 
 step(8, 'Loser refunds; two validators cannot release, forged signatures fail');
 await c.j('/api/admin/validator/3/stop', { method: 'POST' });
@@ -107,7 +126,7 @@ await until(async () => (await c.network())[2].up, 30000, 'V3 back');
 const forged = bytesToHex(schnorr.sign(new Uint8Array(32).fill(1), hexToBytes(bob.walletSk)));
 const fx = await c.rawRelease(s.bids[b2.id], [forged], s.params);
 ok(!fx.body.signatures, `mint rejects a signature not made by the group key -> "${String(fx.body.detail).slice(0, 60)}"`);
-const r2 = await c.claim(bob, s.bids[b2.id], 'refund', s.params);
+const r2 = await c.claim(bob, v1.state.bids[b2.id], 'refund', s.params); // lite bid: claim fetches its proofs
 ok(await bal(bob) === 1000 && r2.cosigners.length === 3, `Bob refunded 110 by ${r2.cosigners.join(', ')}`);
 await expectReject(c.claim(alice, s.bids[b4.id], 'refund', s.params), /validators agreed/, 'winning escrow cannot be refunded');
 

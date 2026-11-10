@@ -107,10 +107,12 @@ func (s *State) hash() []byte {
 
 type App struct {
 	abci.BaseApplication
-	mu        sync.RWMutex
-	st        *State
-	committed []byte // JSON snapshot of last committed state
-	appHash   []byte
+	mu         sync.RWMutex
+	st         *State
+	committed  []byte // JSON snapshot of last committed state
+	committedH int64  // height of that snapshot
+	pending    []byte // snapshot made in FinalizeBlock, published at Commit
+	appHash    []byte
 }
 
 func NewApp() *App { return &App{st: newState()} }
@@ -131,7 +133,7 @@ func (a *App) Info(context.Context, *abci.InfoRequest) (*abci.InfoResponse, erro
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	// In-memory app: report height 0 so CometBFT replays the chain from genesis on restart.
-	return &abci.InfoResponse{Data: "arena-auctions", Version: "0.3.0", AppVersion: 1, LastBlockHeight: 0}, nil
+	return &abci.InfoResponse{Data: "arena-auctions", Version: "0.3.1", AppVersion: 1, LastBlockHeight: 0}, nil
 }
 
 func (a *App) InitChain(_ context.Context, req *abci.InitChainRequest) (*abci.InitChainResponse, error) {
@@ -463,13 +465,22 @@ func (a *App) FinalizeBlock(_ context.Context, req *abci.FinalizeBlockRequest) (
 		s.TxCount++
 		res[i] = &abci.ExecTxResult{Code: 0}
 	}
-	a.appHash = s.hash()
+	// One serialisation per block: the app hash is the SHA-256 of the same
+	// canonical JSON that Commit publishes (identical to s.hash()).
+	b, _ := json.Marshal(s)
+	h := sha256.Sum256(b)
+	a.appHash, a.pending = h[:], b
 	return &abci.FinalizeBlockResponse{TxResults: res, AppHash: a.appHash}, nil
 }
 
 func (a *App) Commit(context.Context, *abci.CommitRequest) (*abci.CommitResponse, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.committed, _ = json.Marshal(a.st)
+	if a.pending != nil {
+		a.committed, a.pending = a.pending, nil
+	} else {
+		a.committed, _ = json.Marshal(a.st)
+	}
+	a.committedH = a.st.Height
 	return &abci.CommitResponse{}, nil
 }

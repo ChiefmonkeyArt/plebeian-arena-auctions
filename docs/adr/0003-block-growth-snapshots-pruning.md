@@ -84,3 +84,7 @@ As of v0.3.0 (`chain/node.go`, `chain/app.go`):
 - **The ledger archive is now a record users care about.** It goes in the Suite's backups next to the mint database.
 - **Disk and memory use become roughly flat** for a node with steady traffic. Suite `MemoryMax=768M` should stay comfortable. Measure real block sizes on the VPS after the change instead of estimating.
 - **Separate servers come first.** This ADR does not block moving the validators to separate servers on Wednesday. State sync (step 3) is what makes adding the next validator fast.
+
+## Related
+
+- ADR 0004 (v0.3.1) already shrinks what browsers download each poll, using a slim view and 304 replies. This ADR still governs what validators store.

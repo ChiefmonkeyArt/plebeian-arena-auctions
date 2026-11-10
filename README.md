@@ -21,6 +21,7 @@ gateway :8080 ── static UI, /api/* (incl. /api/release), /mint/* proxy, supe
 - Soft close: late bids add 20 s, capped by a hard end.
 - Keys: `arena init` runs a FROST (secp256k1, Taproot/BIP-340) key ceremony between the four validators; each keeps only its own share in `vN/config/frost_key.json`. Genesis carries the group key.
 - Settlement: `/api/release` asks every validator for a nonce commitment; each one only commits to a refund for an outbid/lost bid (authorised by the bidder) or a payout of the winning bid to the seller. Three that agree on the same message sign their share, and the shares combine into one ordinary Schnorr signature the mint accepts. Fewer than three: no signature. If validators vanish, the bidder reclaims alone after locktime. The seller must open the site within the lock margin after the close to collect.
+- Polling (v0.3.1, ADR 0004): the page reads `/api/state?view=client`, a slim view without proofs that answers `304` when nothing changed; `/api/bid?id=` returns one bid's proofs when it is released. API JSON and text assets are gzipped.
 - Wallet: the browser holds ecash in Coco (`@cashu/coco-core`, IndexedDB per identity); bids are Coco P2PK sends.
 
 ## Run
@@ -56,7 +57,7 @@ The Torii Suite installs a pinned release with `installers/install-auctions.sh` 
 Build a tarball locally:
 
 ```bash
-scripts/package.sh v0.3.0 dist-release
+scripts/package.sh v0.3.1 dist-release
 ```
 
 Design decisions: [ADR 0001](docs/adr/0001-frost-escrow-coco-wallet.md), [ADR 0002](docs/adr/0002-strict-locks-nutshell-021.md), [ADR 0003 (proposed)](docs/adr/0003-block-growth-snapshots-pruning.md). Threat model: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).

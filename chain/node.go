@@ -184,9 +184,37 @@ func cmdNode(args []string) {
 	log.Printf("%s up: p2p %d rpc %d http %d", names[i], p2pPort(i), rpcPort(i), httpPort(i))
 
 	mux := http.NewServeMux()
+	cache := &committedCache{}
 	mux.HandleFunc("/state", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if q.Get("view") != "client" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(app.Snapshot())
+			return
+		}
+		body, tag := encodeView(clientView(cache.get(app), parseBidders(q.Get("bidders")), parseClosed(q.Get("closed"))))
+		w.Header().Set("ETag", tag)
+		w.Header().Set("Cache-Control", "no-cache")
+		if etagMatch(r.Header.Get("If-None-Match"), tag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(app.Snapshot())
+		w.Write(body)
+	})
+	// one committed bid with its proofs (the browser needs them to release it)
+	mux.HandleFunc("/bid", func(w http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("id")
+		if !lowerHex(id, 64) {
+			writeJSON(w, 400, map[string]string{"error": "id must be 64 lowercase hex"})
+			return
+		}
+		b := cache.get(app).Bids[id]
+		if b == nil {
+			writeJSON(w, 404, map[string]string{"error": "no such bid"})
+			return
+		}
+		writeJSON(w, 200, b)
 	})
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		bs := n.BlockStore()

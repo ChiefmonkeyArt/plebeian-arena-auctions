@@ -139,21 +139,67 @@ func cmdGateway(args []string) {
 	mp := httputil.NewSingleHostReverseProxy(mintURL)
 	mu.Handle("/mint/", http.StripPrefix("/mint", mp))
 
-	// state from the first healthy validator
+	// state from the first healthy validator. ?view=client is the slim view
+	// the page polls (see view.go); it answers 304 when nothing changed.
 	mu.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
+		q := url.Values{}
+		for _, k := range []string{"view", "bidders", "closed"} {
+			if v := r.URL.Query().Get(k); v != "" && len(v) <= 2048 {
+				q.Set(k, v)
+			}
+		}
 		for i := 0; i < 4; i++ {
 			if !sup.running(i) {
 				continue
 			}
-			resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/state", httpPort(i)))
+			req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/state?%s", httpPort(i), q.Encode()), nil)
+			if inm := r.Header.Get("If-None-Match"); inm != "" && len(inm) <= 256 {
+				req.Header.Set("If-None-Match", inm)
+			}
+			resp, err := client.Do(req)
 			if err != nil {
 				continue
 			}
 			b, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			if tag := resp.Header.Get("ETag"); tag != "" {
+				w.Header().Set("ETag", tag)
+				w.Header().Set("Cache-Control", "no-cache")
+			}
+			w.Header().Set("X-Served-By", names[i])
+			if resp.StatusCode == http.StatusNotModified {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
 			if resp.StatusCode == 200 && len(b) > 2 {
 				w.Header().Set("Content-Type", "application/json")
-				w.Header().Set("X-Served-By", names[i])
+				w.Write(b)
+				return
+			}
+		}
+		writeJSON(w, 503, map[string]string{"error": "no validator reachable"})
+	})
+
+	// one bid with its proofs, for releasing it
+	mu.HandleFunc("/api/bid", func(w http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("id")
+		if !lowerHex(id, 64) {
+			writeJSON(w, 400, map[string]string{"error": "id must be 64 lowercase hex"})
+			return
+		}
+		for i := 0; i < 4; i++ {
+			if !sup.running(i) {
+				continue
+			}
+			resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/bid?id=%s", httpPort(i), id))
+			if err != nil {
+				continue
+			}
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			if resp.StatusCode == 200 || resp.StatusCode == 404 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(resp.StatusCode)
 				w.Write(b)
 				return
 			}
@@ -339,7 +385,7 @@ func cmdGateway(args []string) {
 		fsrv.ServeHTTP(w, r)
 	})
 
-	srv := &http.Server{Addr: *addr, Handler: mu,
+	srv := &http.Server{Addr: *addr, Handler: gzipMiddleware(mu),
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 120 * time.Second}
 	log.Printf("gateway on %s", *addr)
 	go func() {
