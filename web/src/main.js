@@ -141,6 +141,7 @@ function currentLot() {
   ui.lot = a && a.id; ui.pinned = false;
   return a;
 }
+const proofsOf = (b) => b.proofCount ?? b.proofs?.length ?? 0;
 const bidsOf = (a) => (a ? a.bids.map((id) => S.bids[id]) : []);
 const minNext = (a) => (a.highBid ? a.highAmount + a.minIncrement : a.startPrice);
 const stepAmt = (a, steps) => minNext(a) + steps * a.minIncrement;
@@ -402,7 +403,7 @@ function renderFeeds(a) {
   // chain feed
   const cf = $('[data-feed=chain]');
   const rej = S.rejections.slice().reverse().slice(0, 6).map((r) => `<li class="chain-item bad"><b>Rejected</b> ${esc(r.reason)}<time>block ${r.height}</time></li>`);
-  const evs = Object.values(S.bids).filter((b) => b.auction === (a && a.id)).sort((x, y) => y.height - x.height).slice(0, 10).map((b) => `<li class="chain-item"><b>${esc(nameOfBid(b))} ${fmt(b.amount)}</b> · ${b.proofs.length} proofs locked to FROST key · DLEQ ok<time>block ${b.height} · ${b.id.slice(0, 10)}…</time></li>`);
+  const evs = Object.values(S.bids).filter((b) => b.auction === (a && a.id)).sort((x, y) => y.height - x.height).slice(0, 10).map((b) => `<li class="chain-item"><b>${esc(nameOfBid(b))} ${fmt(b.amount)}</b> · ${proofsOf(b)} proofs locked to FROST key · DLEQ ok<time>block ${b.height} · ${b.id.slice(0, 10)}…</time></li>`);
   const ch = [`<li class="chain-item head">Height <b>${S.height}</b> · ${S.txCount} txs accepted · app hash agreed by ${new Set(NET.filter((v) => v.up && v.height === S.height).map((v) => v.appHash)).size === 1 ? NET.filter((v) => v.up && v.height === S.height).length : '–'} nodes</li>`, ...evs, ...rej].join('');
   if (cf._h !== ch) { cf.innerHTML = ch; cf._h = ch; }
 }
@@ -442,7 +443,7 @@ function renderWallet() {
   const lh = W[n].ledger.slice(0, 30).map((l) => `<li class="lg ${l.type}"><span class="lg-type">${label[l.type]}</span><span class="lg-note">${esc(l.note)}<time>${clock(l.ts)}</time></span><b>${l.type === 'hold' ? '−' : '+'}${fmt(l.amount)}</b></li>`).join('') || '<li class="empty">No activity yet.</li>';
   const lb = $('[data-slot=ledger]'); if (lb._h !== lh) { lb.innerHTML = lh; lb._h = lh; }
   const es = S ? Object.values(S.bids).filter((b) => b.bidder === pk).sort((x, y) => y.height - x.height).slice(0, 12) : [];
-  const eh = es.map((b) => { const st = claimed.has(b.id) ? 'released' : b.status; return `<li class="lg ${st === 'leading' ? 'hold' : st === 'won' ? 'pay' : 'refund'}"><span class="lg-type">${{ leading: 'Leading', outbid: 'Refunding', lost: 'Refunding', won: 'Won', released: b.status === 'won' ? 'Paid' : 'Refunded' }[st]}</span><span class="lg-note">${esc(S.auctions[b.auction].title.slice(0, 30))}<time>block ${b.height} · ${b.proofs.length} proofs · FROST 3-of-4</time></span><b>${fmt(b.amount)}</b></li>`; }).join('')
+  const eh = es.map((b) => { const st = claimed.has(b.id) ? 'released' : b.status; return `<li class="lg ${st === 'leading' ? 'hold' : st === 'won' ? 'pay' : 'refund'}"><span class="lg-type">${{ leading: 'Leading', outbid: 'Refunding', lost: 'Refunding', won: 'Won', released: b.status === 'won' ? 'Paid' : 'Refunded' }[st]}</span><span class="lg-note">${esc(S.auctions[b.auction].title.slice(0, 30))}<time>block ${b.height} · ${proofsOf(b)} proofs · FROST 3-of-4</time></span><b>${fmt(b.amount)}</b></li>`; }).join('')
     + W[n].stranded.map((s) => `<li class="lg hold"><span class="lg-type">Stranded</span><span class="lg-note">Rejected bid · reclaim after<time>${clock(lockOf(s.locked[0])?.locktime || 0)}</time></span><b>${fmt(totalSats(s.locked))}</b></li>`).join('');
   const eb = $('[data-slot=escrows]'); const ehh = eh || '<li class="empty">No escrows.</li>'; if (eb._h !== ehh) { eb.innerHTML = ehh; eb._h = ehh; }
   setV('keys', `Nostr ${idPub(meId()).slice(0, 16)}… · wallet ${walletPub(meId()).slice(0, 18)}…`);
@@ -522,10 +523,14 @@ function onNewState(prev) {
 }
 
 // ---------- polling ----------
+let stateTag = '';
 async function pollState() {
   try {
     const prev = S;
-    S = await api.state();
+    const r = await api.view(USERS.map((n) => idPub(ids[n])), stateTag);
+    if (!r) { renderFeeds(currentLot()); return; } // unchanged: the frame loop keeps the clocks moving
+    S = r.state; stateTag = r.etag;
+    if (NET.length) S.height = Math.max(S.height, ...NET.map((v) => v.height || 0));
     offsetMs = S.time * 1000 + 500 - Date.now();
     onNewState(prev);
     const a = currentLot();
@@ -534,7 +539,7 @@ async function pollState() {
     if (!$('[data-modal=outcome]').hidden) $('[data-slot=outcome]').innerHTML = outcomeHTML(a, ui.otab);
   } catch (e) { /* gateway down */ }
 }
-async function pollNet() { try { NET = await api.network(); renderNetwork(); } catch {} }
+async function pollNet() { try { NET = await api.network(); if (S) S.height = Math.max(S.height, ...NET.map((v) => v.height || 0)); renderNetwork(); } catch {} }
 async function pollChat() { try { CHAT = await api.chat(); renderChat(currentLot()); } catch {} }
 
 // ---------- seeding ----------

@@ -1,4 +1,4 @@
-# Threat model: Plebeian Auctions arena (v0.2.0, status updated for v0.3.0)
+# Threat model: Plebeian Auctions arena (v0.2.0, status updated for v0.3.1)
 
 Status: draft, 2026-11-10. Covers `ChiefmonkeyArt/plebeian-arena-auctions` v0.2.0 as installed by Torii Suite v0.9.50-alpha at `auctions.<domain>`. Fake sats only. This document defines what must hold before real sats are used, and what an auditor should test.
 
@@ -27,7 +27,7 @@ Status: draft, 2026-11-10. Covers `ChiefmonkeyArt/plebeian-arena-auctions` v0.2.
 internet ──HTTPS──► nginx (rate limit, CSP, GET/HEAD + POST /api only)
                       │ loopback
                       ▼
-                    gateway :8795/8796 ── /api/state /api/network /api/tx /api/release /api/chat /api/admin/* /mint/*
+                    gateway :8795/8796 ── /api/state /api/bid /api/network /api/tx /api/release /api/chat /api/admin/* /mint/*
                       │ loopback                 │
                       ▼                          ▼
               V1..V4 (CometBFT + ABCI + /frost/*)   Nutshell mint :13338 (FakeWallet)
@@ -120,7 +120,7 @@ Fix: reproducible builds checked by a second builder, and signed release checksu
 
 ### F10 Info: privacy
 
-All auctions, bids, amounts, bidder wallet keys and Nostr keys are public through `/api/state`. Intended for an auction, but bidders are linkable across lots.
+All auctions, bids, amounts, bidder wallet keys and Nostr keys are public through `/api/state`. v0.3.1 adds `/api/state?view=client` and `/api/bid?id=` (ADR 0004). They expose nothing the full state did not already, and the `bidders` parameter only tells the gateway which public keys a browser holds, which it already learns when they sign events. Gzip is safe here: these responses carry no secrets, so compression side channels (BREACH) do not apply. Intended for an auction, but bidders are linkable across lots.
 
 ## Already in place
 

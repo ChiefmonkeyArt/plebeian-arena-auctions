@@ -55,6 +55,19 @@ export class ArenaClient {
   }
 
   state() { return this.j('/api/state'); }
+  // Slim view the page polls (v0.3.1): open lots, recent results and the
+  // caller's unsettled ones, bids without proofs. Resolves to null when the
+  // view is unchanged since etag (HTTP 304).
+  async view(bidders = [], etag = '', closed = 12) {
+    const q = new URLSearchParams({ view: 'client', closed: String(closed) });
+    if (bidders.length) q.set('bidders', bidders.join(','));
+    const r = await fetch(this.base + '/api/state?' + q, { cache: 'no-store', headers: etag ? { 'if-none-match': etag } : {} });
+    if (r.status === 304) return null;
+    if (!r.ok) throw new Error('state ' + r.status);
+    return { state: await r.json(), etag: r.headers.get('etag') || '' };
+  }
+  // One committed bid with its proofs.
+  bidWithProofs(id) { return this.j('/api/bid?id=' + encodeURIComponent(id)); }
   network() { return this.j('/api/network'); }
   chat() { return this.j('/api/chat'); }
 
@@ -159,6 +172,7 @@ export class ArenaClient {
   // one FROST round and returns a single aggregated BIP-340 signature, which
   // the mint checks against the group key like any one-key P2PK lock.
   async claim(id, bid, purpose, params) {
+    if (!Array.isArray(bid.proofs)) bid = await this.bidWithProofs(bid.id);
     const { outs, outputs } = blank(bid.amount, params);
     const auth = bytesToHex(schnorr.sign(sigAllHash(bid.proofs, outputs), hexToBytes(id.walletSk)));
     let rel;
