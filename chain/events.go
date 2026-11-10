@@ -75,6 +75,11 @@ func (h *eventHub) subscribe() (chan int64, int64, bool) {
 	if len(h.subs) >= sseMaxSubs {
 		return nil, 0, false
 	}
+	if len(h.subs) == 0 {
+		// The hub stops polling while nobody listens, so the height it kept is
+		// stale: the first listener waits for the next poll (100 ms) instead.
+		h.height = 0
+	}
 	c := make(chan int64, 1)
 	h.subs[c] = struct{}{}
 	select {

@@ -176,7 +176,7 @@ func (a *App) Info(context.Context, *abci.InfoRequest) (*abci.InfoResponse, erro
 	defer a.mu.RUnlock()
 	// The committed height and hash: 0 on a fresh start (CometBFT replays
 	// from genesis), or a restored snapshot's (it replays only what follows).
-	return &abci.InfoResponse{Data: "arena-auctions", Version: "0.4.0", AppVersion: 1,
+	return &abci.InfoResponse{Data: "arena-auctions", Version: "0.4.1", AppVersion: 1,
 		LastBlockHeight: a.committedH, LastBlockAppHash: a.committedHash}, nil
 }
 
