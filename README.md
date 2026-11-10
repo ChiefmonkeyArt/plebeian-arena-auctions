@@ -13,14 +13,14 @@ gateway :8080 ── static UI, /api/* (incl. /api/release), /mint/* proxy, supe
    ├─ V1..V4  CometBFT v1 (in-process) + ABCI auction app + FROST share
    │          (/frost/commit · /frost/sign via bin/arena-frost, Rust)
    │          p2p 26656+10i · rpc 26657+10i · http 7101+i
-   └─ Nutshell mint :3338 (FakeWallet, NUT-11 P2PK, NUT-12 DLEQ)
+   └─ Nutshell 0.21 mint :3338 (FakeWallet, NUT-11 P2PK, NUT-12 DLEQ)
 ```
 
 - Consensus: blocks need ≥3 of 4 validator signatures; the chain keeps running with one validator down.
-- Bid validity (deterministic, on every validator): signed by bidder, ≥ high + step, not the seller, DLEQ-verified proofs from the pinned keyset, unspent-on-chain, sum = amount, lock = P2PK to the FROST group key only (no extra pubkeys, one signature), `SIG_ALL`, refund key = bidder, locktime ≥ hard end + margin.
+- Bid validity (deterministic, on every validator): signed by bidder, ≥ high + step, not the seller, DLEQ-verified proofs from the pinned keyset, unspent-on-chain, sum = amount, lock = P2PK to the FROST group key only (no extra pubkeys, one signature), `SIG_ALL`, refund key = bidder, locktime ≥ hard end + margin (24 h by default). Lock secrets are parsed strictly (no duplicate, unknown or case-variant keys, no repeated tags) so the validators and the mint always read the same lock.
 - Soft close: late bids add 20 s, capped by a hard end.
 - Keys: `arena init` runs a FROST (secp256k1, Taproot/BIP-340) key ceremony between the four validators; each keeps only its own share in `vN/config/frost_key.json`. Genesis carries the group key.
-- Settlement: `/api/release` asks every validator for a nonce commitment; each one only commits to a refund for an outbid/lost bid (authorised by the bidder) or a payout of the winning bid to the seller. Three that agree on the same message sign their share, and the shares combine into one ordinary Schnorr signature the mint accepts. Fewer than three: no signature. If validators vanish, the bidder reclaims alone after locktime.
+- Settlement: `/api/release` asks every validator for a nonce commitment; each one only commits to a refund for an outbid/lost bid (authorised by the bidder) or a payout of the winning bid to the seller. Three that agree on the same message sign their share, and the shares combine into one ordinary Schnorr signature the mint accepts. Fewer than three: no signature. If validators vanish, the bidder reclaims alone after locktime. The seller must open the site within the lock margin after the close to collect.
 - Wallet: the browser holds ecash in Coco (`@cashu/coco-core`, IndexedDB per identity); bids are Coco P2PK sends.
 
 ## Run
@@ -32,14 +32,16 @@ gateway :8080 ── static UI, /api/* (incl. /api/release), /mint/* proxy, supe
 Open http://127.0.0.1:8080. Other commands:
 
 ```bash
-./scripts.sh reset && ./scripts.sh start && ./scripts.sh test
+LOCK_MARGIN=30 ./scripts.sh reset && DEMO_CONTROLS=1 ./scripts.sh start && ./scripts.sh test
 ```
 
-`test` runs `tests/e2e.mjs`: 34 acceptance checks (bids, instant refunds, payout, group-key lock, single 64-byte signature, release refused with 2 of 4 validators, forged signature rejected by the mint, validator stop/catch-up, reclaim after locktime, conservation of sats). `node web/test/frost-roundtrip.mjs frost/target/release/arena-frost` checks the key ceremony and signing (10 checks).
+`LOCK_MARGIN=30` lets the test exercise the reclaim-after-locktime path; with the 24 h default it is skipped. `DEMO_CONTROLS=1` turns on the validator stop/start route (`-demo-controls`), which the test needs and a real deployment must not have.
+
+`test` runs `tests/e2e.mjs`: 35 acceptance checks (bids, instant refunds, payout, group-key lock, single 64-byte signature, release refused with 2 of 4 validators, forged signature rejected by the mint, validator stop/catch-up, reclaim after locktime, conservation of sats, unsafe image path refused). `go test ./chain/` runs the audit regression tests and fuzz seeds. `node web/test/frost-roundtrip.mjs frost/target/release/arena-frost` checks the key ceremony and signing (10 checks).
 
 ## Limits (MVP)
 
-- Fake sats, unaudited, one operator runs all four validators on localhost.
+- Fake sats, internally reviewed only ([audit](docs/SECURITY_AUDIT_2026-11-10.md)), one operator runs all four validators on localhost.
 - All four FROST shares sit on one host, so that operator could sign alone; real security needs the validators on separate machines run by different people.
 - CometBFT p2p instead of FIPS.
 - Per-browser generated Nostr keys (no NIP-07 yet); chat is signed but held in gateway memory, not on chain.
@@ -54,7 +56,7 @@ The Torii Suite installs a pinned release with `installers/install-auctions.sh` 
 Build a tarball locally:
 
 ```bash
-scripts/package.sh v0.2.0 dist-release
+scripts/package.sh v0.3.0 dist-release
 ```
 
-Design decision: [ADR 0001](docs/adr/0001-frost-escrow-coco-wallet.md). Threat model: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
+Design decisions: [ADR 0001](docs/adr/0001-frost-escrow-coco-wallet.md), [ADR 0002](docs/adr/0002-strict-locks-nutshell-021.md). Threat model: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).

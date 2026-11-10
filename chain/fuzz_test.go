@@ -27,8 +27,16 @@ func FuzzApplyContent(f *testing.F) {
 		_ = s.applyCreate(&Event{ID: "a", Pubkey: "p", Kind: KindCreate, Content: c}, 100, 1, true)
 		_ = s.applyBid(&Event{ID: "b", Pubkey: "q", Kind: KindBid, Content: c}, 101, 2, true, true)
 		var p Proof
-		if json.Unmarshal([]byte(c), &p) == nil { _ = verifyDLEQ(p, nil) }
+		if json.Unmarshal([]byte(c), &p) == nil {
+			_ = verifyDLEQ(p, nil)
+		}
 	})
 }
 
-func repeat(s string, n int) string { o := ""; for i := 0; i < n; i++ { o += s }; return o }
+func repeat(s string, n int) string {
+	o := ""
+	for i := 0; i < n; i++ {
+		o += s
+	}
+	return o
+}

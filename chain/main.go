@@ -52,7 +52,7 @@ func (s *supervisor) start(i int) error {
 	if s.procs[i] != nil {
 		return nil
 	}
-	lf, err := os.OpenFile(filepath.Join(s.logs, fmt.Sprintf("v%d.log", i+1)), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	lf, err := os.OpenFile(filepath.Join(s.logs, fmt.Sprintf("v%d.log", i+1)), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -123,6 +123,7 @@ func cmdGateway(args []string) {
 	static := fs.String("static", "web/dist", "front end dir")
 	addr := fs.String("addr", "127.0.0.1:8080", "listen addr")
 	mint := fs.String("mint", "http://127.0.0.1:3338", "mint")
+	demo := fs.Bool("demo-controls", false, "expose the unauthenticated validator stop/start route (demo only, never on a real-sats deployment)")
 	fs.Parse(args)
 	bin, _ := os.Executable()
 	sup := &supervisor{root: *root, bin: bin, logs: filepath.Dir(*root)}
@@ -271,6 +272,10 @@ func cmdGateway(args []string) {
 	})
 
 	mu.HandleFunc("/api/admin/validator/", func(w http.ResponseWriter, r *http.Request) {
+		if !*demo {
+			writeJSON(w, 404, map[string]string{"error": "demo controls are off on this deployment"})
+			return
+		}
 		if r.Method != http.MethodPost {
 			writeJSON(w, 405, map[string]string{"error": "POST only"})
 			return
@@ -334,7 +339,8 @@ func cmdGateway(args []string) {
 		fsrv.ServeHTTP(w, r)
 	})
 
-	srv := &http.Server{Addr: *addr, Handler: mu}
+	srv := &http.Server{Addr: *addr, Handler: mu,
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 120 * time.Second}
 	log.Printf("gateway on %s", *addr)
 	go func() {
 		sigc := make(chan os.Signal, 1)

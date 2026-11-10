@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -55,11 +57,27 @@ func nodeConfig(home string, i int, peers string) *cfg.Config {
 	return c
 }
 
+// chainFormat changes whenever stored state from an older release can no
+// longer be trusted by this one (v0.3.0: strict lock parser, SIG_ALL with
+// amounts, Nutshell 0.21 keysets). "arena init -if-needed" wipes on mismatch.
+const chainFormat = "3"
+
 func cmdInit(args []string) {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
 	root := fs.String("root", "run/chain", "chain root dir")
 	mint := fs.String("mint", "http://127.0.0.1:3338", "mint url")
+	margin := fs.Int64("lock-margin", 86400, "seconds between hard close and the bid refund locktime; the seller must collect within this window")
+	ifNeeded := fs.Bool("if-needed", false, "keep an existing chain whose format marker matches; otherwise wipe and re-initialise")
 	fs.Parse(args)
+	if *margin < 10 {
+		log.Fatal("-lock-margin must be at least 10 seconds")
+	}
+	if *ifNeeded {
+		if b, err := os.ReadFile(filepath.Join(*root, "FORMAT")); err == nil && strings.TrimSpace(string(b)) == chainFormat {
+			fmt.Printf("chain in %s is format %s, keeping it\n", *root, chainFormat)
+			return
+		}
+	}
 
 	// pin the mint's active sat keyset
 	var ks struct {
@@ -113,7 +131,7 @@ func cmdInit(args []string) {
 		check(os.WriteFile(filepath.Join(homeOf(*root, i), "config", "frost_key.json"), kb, 0o600))
 	}
 	params := Params{MintURL: *mint, KeysetID: kid, Keys: keys.Keysets[0].Keys, GroupKey: groupKey, FrostPublic: pkp, ValidatorNames: names,
-		SoftCloseSec: 20, ExtendSec: 20, MaxExtendSec: 60, LockMarginSec: 30, MinDurationSec: 20, MaxDurationSec: 7200,
+		SoftCloseSec: 20, ExtendSec: 20, MaxExtendSec: 60, LockMarginSec: *margin, MinDurationSec: 20, MaxDurationSec: 7200,
 		MaxProofs: 64, Threshold: 3}
 	ab, _ := json.Marshal(params)
 	gen := &types.GenesisDoc{ChainID: "arena-auctions-fake-sats", GenesisTime: time.Now().UTC(), ConsensusParams: types.DefaultConsensusParams(),
@@ -130,7 +148,8 @@ func cmdInit(args []string) {
 		}
 		check(os.WriteFile(filepath.Join(home, "peers.txt"), []byte(strings.Join(peers, ",")), 0o600))
 	}
-	fmt.Printf("initialised 4 validators in %s, keyset %s, FROST group key %s\n", *root, kid, groupKey)
+	check(os.WriteFile(filepath.Join(*root, "FORMAT"), []byte(chainFormat+"\n"), 0o600))
+	fmt.Printf("initialised 4 validators in %s, keyset %s, FROST group key %s, lock margin %ds\n", *root, kid, groupKey, *margin)
 }
 
 func cmdNode(args []string) {
@@ -190,7 +209,8 @@ func cmdNode(args []string) {
 	})
 	mux.HandleFunc("/frost/commit", func(w http.ResponseWriter, r *http.Request) { handleCommit(w, r, app, fk, sessions, i) })
 	mux.HandleFunc("/frost/sign", func(w http.ResponseWriter, r *http.Request) { handleShare(w, r, fk, sessions, i) })
-	srv := &http.Server{Addr: fmt.Sprintf("127.0.0.1:%d", httpPort(i)), Handler: mux}
+	srv := &http.Server{Addr: fmt.Sprintf("127.0.0.1:%d", httpPort(i)), Handler: mux,
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() { log.Println(srv.ListenAndServe()) }()
 
 	sig := make(chan os.Signal, 1)
@@ -199,6 +219,22 @@ func cmdNode(args []string) {
 	srv.Close()
 	n.Stop()
 	n.Wait()
+}
+
+// sigAllMessage is the NUT-11 SIG_ALL message as Nutshell 0.21 builds it:
+// each input's secret and C, then each output's amount and B_. Covering the
+// amounts stops a relay from re-denominating the outputs (internal audit A6).
+func sigAllMessage(proofs []Proof, outs []SignOutput) string {
+	var sb strings.Builder
+	for _, p := range proofs {
+		sb.WriteString(p.Secret)
+		sb.WriteString(p.C)
+	}
+	for _, o := range outs {
+		sb.WriteString(strconv.FormatInt(o.Amount, 10))
+		sb.WriteString(o.B)
+	}
+	return sb.String()
 }
 
 type SignOutput struct {
@@ -243,13 +279,13 @@ func releasePolicy(app *App, req SignReq) (h [32]byte, code int, err error) {
 			err = errors.New("purpose must be refund or payout")
 			return
 		}
-		var sum int64
-		var sb strings.Builder
-		for _, p := range bid.Proofs {
-			sb.WriteString(p.Secret)
+		if len(req.Outputs) == 0 || len(req.Outputs) > 64 {
+			err = errors.New("bad output count")
+			return
 		}
+		var sum int64
 		for _, o := range req.Outputs {
-			if o.ID != s.Params.KeysetID || o.Amount <= 0 || len(o.B) != 66 {
+			if o.ID != s.Params.KeysetID || o.Amount <= 0 || !lowerHex(o.B, 66) {
 				err = errors.New("bad output")
 				return
 			}
@@ -257,14 +293,17 @@ func releasePolicy(app *App, req SignReq) (h [32]byte, code int, err error) {
 				err = errors.New("bad output amount")
 				return
 			}
+			if sum > math.MaxInt64-o.Amount {
+				err = errors.New("output total overflows")
+				return
+			}
 			sum += o.Amount
-			sb.WriteString(o.B)
 		}
 		if sum != bid.Amount {
 			err = fmt.Errorf("outputs total %d, escrow is %d", sum, bid.Amount)
 			return
 		}
-		msg = sb.String()
+		msg = sigAllMessage(bid.Proofs, req.Outputs)
 	})
 	if err != nil {
 		return h, 409, err
@@ -301,7 +340,7 @@ func handleCommit(w http.ResponseWriter, r *http.Request, app *App, fk frostKeyF
 		writeJSON(w, 500, map[string]string{"error": "commit failed", "validator": names[i]})
 		return
 	}
-	id, err := ss.put(out.Nonces, hex.EncodeToString(h[:]))
+	id, err := ss.put(out.Nonces, hex.EncodeToString(h[:]), req.Bid)
 	if err != nil {
 		writeJSON(w, 503, map[string]string{"error": err.Error(), "validator": names[i]})
 		return

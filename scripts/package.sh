@@ -37,6 +37,7 @@ P="$R/runtime/python"
 rm -f "$P"/lib/python3.*/EXTERNALLY-MANAGED
 "$P/bin/python3" -m pip install -q --disable-pip-version-check --no-warn-script-location \
   --require-hashes --only-binary=:all: --no-deps --no-compile -r mint/requirements.txt
+install -m 0644 mint/breez_sdk_spark.py "$(echo "$P"/lib/python3.*)/site-packages/breez_sdk_spark.py" # unused Spark backend
 "$P/bin/python3" -c 'import cashu.mint.main' # imports cleanly
 # Trim what a headless mint never uses.
 L="$(echo "$P"/lib/python3.*)"

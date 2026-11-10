@@ -135,15 +135,20 @@ func frostDKG() (keys []json.RawMessage, pkp json.RawMessage, groupKey string, e
 type frostSession struct {
 	nonces json.RawMessage
 	hash   string
+	bid    string
 	exp    time.Time
 }
+
+// maxSessionsPerRelease stops one escrow's owner filling the session table
+// and locking everyone else out (threat model F8).
+const maxSessionsPerRelease = 4
 
 type frostSessions struct {
 	mu sync.Mutex
 	m  map[string]frostSession
 }
 
-func (s *frostSessions) put(nonces json.RawMessage, hash string) (string, error) {
+func (s *frostSessions) put(nonces json.RawMessage, hash, bid string) (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err
@@ -160,7 +165,16 @@ func (s *frostSessions) put(nonces json.RawMessage, hash string) (string, error)
 	if len(s.m) >= 256 {
 		return "", errors.New("too many open signing sessions")
 	}
-	s.m[id] = frostSession{nonces: nonces, hash: hash, exp: now.Add(time.Minute)}
+	per := 0
+	for _, v := range s.m {
+		if v.bid == bid {
+			per++
+		}
+	}
+	if per >= maxSessionsPerRelease {
+		return "", errors.New("too many open signing sessions for this escrow")
+	}
+	s.m[id] = frostSession{nonces: nonces, hash: hash, bid: bid, exp: now.Add(time.Minute)}
 	return id, nil
 }
 

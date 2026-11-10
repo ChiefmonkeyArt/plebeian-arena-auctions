@@ -29,8 +29,9 @@ const sum = (ps) => ps.reduce((a, p) => a + num(p.amount), 0);
 const plain = (p) => ({ id: p.id, amount: num(p.amount), secret: p.secret, C: p.C, ...(p.dleq ? { dleq: { e: p.dleq.e, s: p.dleq.s, r: p.dleq.r } } : {}) });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const keysetOf = (params) => ({ id: params.keysetId, keys: params.keys });
-// NUT-11 SIG_ALL message, as Nutshell 0.20 checks it: input secrets then output B_ values.
-const sigAllHash = (inputs, outputs) => sha256(new TextEncoder().encode(inputs.map((p) => p.secret).join('') + outputs.map((o) => o.B_).join('')));
+// NUT-11 SIG_ALL message, as Nutshell 0.21 checks it: each input's secret and C,
+// then each output's amount and B_ (amounts covered: internal audit A6).
+const sigAllHash = (inputs, outputs) => sha256(new TextEncoder().encode(inputs.map((p) => p.secret + p.C).join('') + outputs.map((o) => String(o.amount) + o.B_).join('')));
 // Turn the mint's blind signatures into proofs (cashu-ts 5 wants Amount objects).
 const unblind = (outs, sigs, params) => outs.map((o, i) => plain(o.toProof({ ...sigs[i], amount: Amount.from(sigs[i].amount) }, keysetOf(params))));
 const blank = (amount, params) => {

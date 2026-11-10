@@ -5,15 +5,18 @@ package main
 // pinned in genesis, using the mint's DLEQ proof (NUT-12).
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
@@ -140,8 +143,8 @@ func verifyDLEQ(p Proof, A *btcec.PublicKey) error {
 	if err != nil {
 		return err
 	}
-	Cb := add(C, mul(r, A))           // C_ = C + r*A
-	Bb := add(Y, mulG(r))             // B_ = Y + r*G
+	Cb := add(C, mul(r, A))            // C_ = C + r*A
+	Bb := add(Y, mulG(r))              // B_ = Y + r*G
 	R1 := add(mulG(s), neg(mul(e, A))) // R1 = s*G - e*A
 	R2 := add(mul(s, Bb), neg(mul(e, Cb)))
 	got := hashE(R1, R2, A, Cb)
@@ -170,7 +173,55 @@ type p2pkLock struct {
 	TagsJSON string
 }
 
+// strictObject decodes one JSON object and refuses duplicate keys and any key
+// not in allowed (exact, case-sensitive). Go's decoder alone would match keys
+// case-insensitively and keep the last duplicate, while the mint (Python)
+// matches exactly; any such difference lets a lock mean one thing to the
+// validators and another to the mint (internal audit A1).
+func strictObject(raw json.RawMessage, allowed ...string) (map[string]json.RawMessage, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return nil, errors.New("not a JSON object")
+	}
+	out := map[string]json.RawMessage{}
+	for dec.More() {
+		kt, err := dec.Token()
+		k, ok := kt.(string)
+		if err != nil || !ok {
+			return nil, errors.New("bad object key")
+		}
+		known := false
+		for _, a := range allowed {
+			known = known || a == k
+		}
+		if !known {
+			return nil, fmt.Errorf("unexpected key %q", k)
+		}
+		if _, dup := out[k]; dup {
+			return nil, fmt.Errorf("duplicate key %q", k)
+		}
+		var v json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			return nil, errors.New("bad object value")
+		}
+		out[k] = v
+	}
+	if t, err := dec.Token(); err != nil || t != json.Delim('}') {
+		return nil, errors.New("bad object end")
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errors.New("trailing data")
+	}
+	return out, nil
+}
+
+// parseP2PK reads a NUT-11 P2PK secret strictly: one copy of each key and
+// tag, no escapes, valid UTF-8, so the validators and the mint can only ever
+// see the same lock.
 func parseP2PK(secret string) (*p2pkLock, error) {
+	if !utf8.ValidString(secret) || strings.ContainsRune(secret, '\\') {
+		return nil, errors.New("secret must be plain UTF-8 without escapes")
+	}
 	var arr []json.RawMessage
 	if err := json.Unmarshal([]byte(secret), &arr); err != nil || len(arr) != 2 {
 		return nil, errors.New("secret is not a NUT-10 secret")
@@ -179,20 +230,38 @@ func parseP2PK(secret string) (*p2pkLock, error) {
 	if err := json.Unmarshal(arr[0], &kind); err != nil || kind != "P2PK" {
 		return nil, errors.New("secret is not P2PK")
 	}
-	var body struct {
-		Nonce string     `json:"nonce"`
-		Data  string     `json:"data"`
-		Tags  [][]string `json:"tags"`
+	obj, err := strictObject(arr[1], "nonce", "data", "tags")
+	if err != nil {
+		return nil, fmt.Errorf("bad P2PK body: %v", err)
 	}
-	if err := json.Unmarshal(arr[1], &body); err != nil {
-		return nil, errors.New("bad P2PK body")
+	var nonce, data string
+	var tags [][]string
+	if json.Unmarshal(obj["nonce"], &nonce) != nil || json.Unmarshal(obj["data"], &data) != nil || nonce == "" || data == "" {
+		return nil, errors.New("P2PK body needs a nonce and data")
 	}
-	l := &p2pkLock{Data: strings.ToLower(body.Data), NSigs: 1}
-	tj, _ := json.Marshal(body.Tags)
+	if raw, ok := obj["tags"]; ok && json.Unmarshal(raw, &tags) != nil {
+		return nil, errors.New("bad P2PK tags")
+	}
+	if !lowerHex(data, 66) {
+		return nil, errors.New("P2PK data must be a lowercase compressed pubkey")
+	}
+	l := &p2pkLock{Data: data, NSigs: 1}
+	tj, _ := json.Marshal(tags)
 	l.TagsJSON = string(tj)
-	for _, t := range body.Tags {
+	seen := map[string]bool{}
+	for _, t := range tags {
 		if len(t) < 2 {
 			return nil, errors.New("bad tag")
+		}
+		if seen[t[0]] {
+			return nil, fmt.Errorf("duplicate tag %q", t[0])
+		}
+		seen[t[0]] = true
+		single := func() error {
+			if len(t) != 2 {
+				return fmt.Errorf("tag %q takes one value", t[0])
+			}
+			return nil
 		}
 		switch t[0] {
 		case "pubkeys":
@@ -200,24 +269,39 @@ func parseP2PK(secret string) (*p2pkLock, error) {
 				l.Pubkeys = append(l.Pubkeys, strings.ToLower(v))
 			}
 		case "n_sigs":
+			if err := single(); err != nil {
+				return nil, err
+			}
 			n, err := strconv.Atoi(t[1])
 			if err != nil {
 				return nil, errors.New("bad n_sigs")
 			}
 			l.NSigs = n
 		case "locktime":
+			if err := single(); err != nil {
+				return nil, err
+			}
 			n, err := strconv.ParseInt(t[1], 10, 64)
-			if err != nil {
+			if err != nil || strconv.FormatInt(n, 10) != t[1] {
 				return nil, errors.New("bad locktime")
 			}
 			l.Locktime = n
 		case "refund":
 			for _, v := range t[1:] {
-				l.Refund = append(l.Refund, strings.ToLower(v))
+				if !lowerHex(v, 66) {
+					return nil, errors.New("refund keys must be lowercase compressed pubkeys")
+				}
+				l.Refund = append(l.Refund, v)
 			}
 		case "sigflag":
+			if err := single(); err != nil {
+				return nil, err
+			}
 			l.SigFlag = t[1]
 		case "n_sigs_refund":
+			if err := single(); err != nil {
+				return nil, err
+			}
 			if t[1] != "1" {
 				return nil, errors.New("refund must need exactly 1 signature")
 			}

@@ -1,0 +1,10 @@
+# Nutshell 0.21.0 caps these below their security fixes (internal audit A7, 2026-11-10).
+# The mint and the arena's end-to-end suite are tested with these versions.
+fastapi>=0.120
+starlette>=1.3.1
+cryptography>=48.0.1
+h11>=0.16.0
+setuptools>=84.1.0
+wheel>=0.46.2
+# Spark Lightning backend only (unused with FakeWallet); no cp312 wheel of the pinned range exists.
+breez-sdk-spark ; python_version < '3'
