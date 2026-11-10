@@ -1,9 +1,11 @@
-// Arena client: Nostr identity, fake-sats Cashu wallet, escrow bids and 3-of-4 releases.
-// Works in the browser and in Node 20 (tests).
-import { Wallet, P2PKBuilder, OutputData } from '@cashu/cashu-ts';
+// Arena client: Nostr identity, a Coco Cashu wallet per identity (fake sats),
+// escrow bids locked to the validators' FROST group key, and 3-of-4 releases.
+// Works in the browser (IndexedDB) and in Node 20 (in-memory, for tests).
+import { initializeCoco, MemoryRepositories } from '@cashu/coco-core';
+import { Amount, OutputData, getEncodedToken, hashToCurve } from '@cashu/cashu-ts';
 import { schnorr, secp256k1 } from '@noble/curves/secp256k1.js';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
+import { bytesToHex, hexToBytes, randomBytes } from '@noble/hashes/utils.js';
 import { finalizeEvent, getPublicKey } from 'nostr-tools/pure';
 
 export const KIND_CREATE = 1440;
@@ -13,8 +15,11 @@ export const KIND_CHAT = 1442;
 export function newIdentity(name) {
   const nostrSk = bytesToHex(secp256k1.utils.randomSecretKey());
   const walletSk = bytesToHex(secp256k1.utils.randomSecretKey());
-  return { name, nostrSk, walletSk };
+  return { name, nostrSk, walletSk, seed: bytesToHex(randomBytes(64)) };
 }
+
+// Identities saved before v0.2 have no wallet seed; give them one.
+export function ensureSeed(id) { if (!id.seed) id.seed = bytesToHex(randomBytes(64)); return id; }
 
 export function idPub(id) { return getPublicKey(hexToBytes(id.nostrSk)); }
 export function walletPub(id) { return '02' + bytesToHex(schnorr.getPublicKey(hexToBytes(id.walletSk))); }
@@ -22,12 +27,22 @@ export function walletPub(id) { return '02' + bytesToHex(schnorr.getPublicKey(he
 const num = (a) => (a && typeof a.toNumber === 'function' ? a.toNumber() : Number(a));
 const sum = (ps) => ps.reduce((a, p) => a + num(p.amount), 0);
 const plain = (p) => ({ id: p.id, amount: num(p.amount), secret: p.secret, C: p.C, ...(p.dleq ? { dleq: { e: p.dleq.e, s: p.dleq.s, r: p.dleq.r } } : {}) });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const keysetOf = (params) => ({ id: params.keysetId, keys: params.keys });
+// NUT-11 SIG_ALL message, as Nutshell 0.20 checks it: input secrets then output B_ values.
+const sigAllHash = (inputs, outputs) => sha256(new TextEncoder().encode(inputs.map((p) => p.secret).join('') + outputs.map((o) => o.B_).join('')));
+// Turn the mint's blind signatures into proofs (cashu-ts 5 wants Amount objects).
+const unblind = (outs, sigs, params) => outs.map((o, i) => plain(o.toProof({ ...sigs[i], amount: Amount.from(sigs[i].amount) }, keysetOf(params))));
+const blank = (amount, params) => {
+  const outs = OutputData.createRandomData(amount, keysetOf(params));
+  return { outs, outputs: outs.map((o) => ({ amount: num(o.blindedMessage.amount), id: o.blindedMessage.id, B_: o.blindedMessage.B_ })) };
+};
 
 export class ArenaClient {
   constructor(base = '') {
     this.base = base;
     this.mintUrl = (base || (typeof location !== 'undefined' ? location.origin : '')) + '/mint';
-    this.wallet = null;
+    this.cocos = new Map();
   }
 
   async j(path, opts) {
@@ -42,22 +57,61 @@ export class ArenaClient {
   network() { return this.j('/api/network'); }
   chat() { return this.j('/api/chat'); }
 
-  async ensureWallet() {
-    if (!this.wallet) { this.wallet = new Wallet(this.mintUrl, { unit: 'sat' }); await this.wallet.loadMint(); }
-    return this.wallet;
+  // One Coco wallet per identity: IndexedDB in the browser, memory in Node.
+  coco(id) {
+    ensureSeed(id);
+    const key = walletPub(id);
+    if (!this.cocos.has(key)) {
+      this.cocos.set(key, (async () => {
+        let repo;
+        if (typeof indexedDB !== 'undefined') {
+          const { IndexedDbRepositories } = await import('@cashu/coco-indexeddb');
+          repo = new IndexedDbRepositories({ name: 'arena-coco-' + key.slice(2, 18) });
+          await repo.init();
+        } else repo = new MemoryRepositories();
+        const m = await initializeCoco({
+          repo, seedGetter: async () => hexToBytes(id.seed),
+          // Paid quotes are claimed explicitly by faucet(); see the note there.
+          processors: { mintOperationProcessor: { autoClaimMintQuotes: false } },
+        });
+        await m.mint.addMint(this.mintUrl, { trusted: true });
+        await m.keyring.addKeyPair(hexToBytes(id.walletSk)).catch(() => {});
+        return m;
+      })());
+    }
+    return this.cocos.get(key);
   }
 
-  // Fake sats: the test mint's FakeWallet pays invoices instantly.
-  async faucet(amount) {
-    const w = await this.ensureWallet();
-    const q = await w.createMintQuoteBolt11(amount);
-    for (let i = 0; i < 40; i++) {
-      const st = await w.checkMintQuoteBolt11(q.quote);
-      if (st.state === 'PAID') break;
-      await new Promise((r) => setTimeout(r, 250));
-    }
-    const proofs = await w.mintProofsBolt11(amount, q.quote);
-    return proofs.map(plain);
+  async balance(id) {
+    const m = await this.coco(id);
+    const b = await m.wallet.balances.byMint();
+    const k = Object.keys(b).find((u) => u.replace(/\/$/, '') === this.mintUrl.replace(/\/$/, ''));
+    return k ? num(b[k].spendable ?? b[k].total ?? 0) : 0;
+  }
+
+  // Bring plain proofs (a release or a reclaim) into the identity's Coco wallet.
+  async receive(id, proofs) {
+    const m = await this.coco(id);
+    await m.wallet.receive(getEncodedToken({ mint: this.mintUrl, unit: 'sat', proofs }));
+    return sum(proofs);
+  }
+
+  // Fake sats: the test mint's FakeWallet pays its own invoices. Nutshell 0.20
+  // does not move `updated_at` when that happens, which Coco 2 treats as a
+  // conflicting observation, so we wait for PAID ourselves and import the
+  // settled quote into Coco, then let Coco mint it.
+  async faucet(id, amount) {
+    const m = await this.coco(id);
+    const pj = (u, b) => fetch(this.mintUrl + u, b ? { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) } : {}).then((r) => r.json());
+    let q = await pj('/v1/mint/quote/bolt11', { amount, unit: 'sat' });
+    for (let i = 0; i < 40 && q.state !== 'PAID'; i++) { await sleep(250); q = await pj('/v1/mint/quote/bolt11/' + q.quote); }
+    if (q.state !== 'PAID') throw new Error('faucet invoice was not paid');
+    const quote = await m.quotes.mint.import({ mintUrl: this.mintUrl, method: 'bolt11', quote: q });
+    const op = await m.ops.mint.prepare({ quote, amount });
+    let done = await m.ops.mint.execute(op.id);
+    for (let i = 0; i < 20 && done.state !== 'finalized'; i++) { await sleep(250); done = await m.ops.mint.get(op.id); }
+    if (done.state !== 'finalized') throw new Error('faucet mint did not finish');
+    return this.balance(id);
   }
 
   sign(id, kind, content, tags = []) {
@@ -72,21 +126,25 @@ export class ArenaClient {
     return { ...res, id: ev.id };
   }
 
-  // Lock `amount` of the user's proofs to the validators (3-of-4, SIG_ALL), refundable to the bidder after locktime.
-  async lockForBid(id, proofs, amount, params, auction, { force = false, state } = {}) {
+  // Coco locks `amount` to the validators' FROST group key (one key; 3 of the 4
+  // validators must cooperate to sign for it), SIG_ALL, refundable to the
+  // bidder's own wallet key after locktime.
+  async lockForBid(id, amount, params, auction, { force = false, state } = {}) {
     if (!force) {
       const min = auction.highBid ? auction.highAmount + auction.minIncrement : auction.startPrice;
       if (auction.status !== 'open') throw new Error('auction closed');
       if (amount < min) throw new Error(`bid must be at least ${min} sats`);
       if (state && auction.highBid && state.bids[auction.highBid].bidder === idPub(id)) throw new Error('you are already the highest bidder');
-      if (sum(proofs) < amount) throw new Error('not enough sats in wallet');
+      if ((await this.balance(id)) < amount) throw new Error('not enough sats in wallet');
     }
-    const w = await this.ensureWallet();
+    const m = await this.coco(id);
     const locktime = auction.hardEnd + params.lockMarginSec + 15;
-    const opts = new P2PKBuilder().addLockPubkey(params.validators).requireLockSignatures(params.threshold)
-      .addRefundPubkey(walletPub(id)).lockUntil(locktime).sigAll().toOptions();
-    const { keep, send } = await w.ops.send(amount, proofs).asP2PK(opts).run();
-    return { keep: keep.map(plain), locked: send.map(plain) };
+    const prep = await m.ops.send.prepare({
+      mintUrl: this.mintUrl, amount,
+      target: { type: 'p2pk', options: { kind: 'P2PK', data: params.groupKey, locktime, refundKeys: [walletPub(id)], sigFlag: 'SIG_ALL' } },
+    });
+    const { token } = await m.ops.send.execute(prep);
+    return { locked: token.proofs.map(plain) };
   }
 
   async bid(id, auction, amount, locked) {
@@ -95,60 +153,56 @@ export class ArenaClient {
     return { ...res, id: ev.id };
   }
 
-  // Ask all four validators to co-sign a release; needs `threshold` signatures for the mint to accept.
-  async claim(id, bid, purpose, params, n = params.threshold) {
-    const w = await this.ensureWallet();
-    const ks = w.getKeyset();
-    const outs = OutputData.createRandomData(bid.amount, ks);
-    const outputs = outs.map((o) => ({ amount: num(o.blindedMessage.amount), id: o.blindedMessage.id, B_: o.blindedMessage.B_ }));
-    const msg = bid.proofs.map((p) => p.secret).join('') + outputs.map((o) => o.B_).join('');
-    const h = sha256(new TextEncoder().encode(msg));
-    const auth = bytesToHex(schnorr.sign(h, hexToBytes(id.walletSk)));
-    const replies = await this.j('/api/sign', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bid: bid.id, purpose, outputs, auth }) });
-    const sigs = replies.filter((r) => r.signature).map((r) => r.signature);
-    if (sigs.length < n) {
-      const e = new Error(`only ${sigs.length} of 4 validators agreed: ` + replies.map((r) => r.error).filter(Boolean).join('; '));
-      e.replies = replies; throw e;
-    }
-    const inputs = bid.proofs.map((p, i) => ({ id: p.id, amount: p.amount, secret: p.secret, C: p.C, ...(i === 0 ? { witness: JSON.stringify({ signatures: sigs.slice(0, n) }) } : {}) }));
-    const r = await fetch(this.mintUrl + '/v1/swap', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ inputs, outputs }) });
-    const jr = await r.json();
+  // Release an escrow (refund to the bidder, or payout to the seller). The
+  // wallet that may receive it authorises the exact outputs; the gateway runs
+  // one FROST round and returns a single aggregated BIP-340 signature, which
+  // the mint checks against the group key like any one-key P2PK lock.
+  async claim(id, bid, purpose, params) {
+    const { outs, outputs } = blank(bid.amount, params);
+    const auth = bytesToHex(schnorr.sign(sigAllHash(bid.proofs, outputs), hexToBytes(id.walletSk)));
+    let rel;
+    try { rel = await this.j('/api/release', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bid: bid.id, purpose, outputs, auth }) }); }
+    catch (e) { e.refusals = e.body?.refusals; throw e; }
+    const jr = await this.swap(bid.proofs, outputs, [rel.signature]);
     if (!jr.signatures) { const e = new Error(jr.detail || 'mint rejected release'); e.mint = jr; throw e; }
-    return { proofs: outs.map((o, i) => plain(o.toProof(jr.signatures[i], ks))), cosigners: replies.filter((r) => r.signature).map((r) => r.validator) };
+    const proofs = unblind(outs, jr.signatures, params);
+    await this.receive(id, proofs);
+    return { amount: sum(proofs), cosigners: rel.cosigners, refusals: rel.refusals, signature: rel.signature };
   }
 
-  // Refund path: after locktime the bidder alone can reclaim a lock the chain never recorded.
-  async reclaimExpired(id, locked) {
-    const w = await this.ensureWallet();
-    const ks = w.getKeyset();
-    const amount = sum(locked);
-    const outs = OutputData.createRandomData(amount, ks);
-    const outputs = outs.map((o) => ({ amount: num(o.blindedMessage.amount), id: o.blindedMessage.id, B_: o.blindedMessage.B_ }));
-    const msg = locked.map((p) => p.secret).join('') + outputs.map((o) => o.B_).join('');
-    const sig = bytesToHex(schnorr.sign(sha256(new TextEncoder().encode(msg)), hexToBytes(id.walletSk)));
-    const inputs = locked.map((p, i) => ({ id: p.id, amount: p.amount, secret: p.secret, C: p.C, ...(i === 0 ? { witness: JSON.stringify({ signatures: [sig] }) } : {}) }));
-    const r = await fetch(this.mintUrl + '/v1/swap', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ inputs, outputs }) });
-    const jr = await r.json();
+  async swap(inputs, outputs, signatures) {
+    const ins = inputs.map((p, i) => ({ id: p.id, amount: p.amount, secret: p.secret, C: p.C, ...(i === 0 ? { witness: JSON.stringify({ signatures }) } : {}) }));
+    const r = await fetch(this.mintUrl + '/v1/swap', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ inputs: ins, outputs }) });
+    return r.json();
+  }
+
+  // Refund path: after locktime the bidder alone can reclaim a lock (for
+  // example a bid the chain never recorded), with no validator involved.
+  async reclaimExpired(id, locked, params) {
+    const { outs, outputs } = blank(sum(locked), params);
+    const sig = bytesToHex(schnorr.sign(sigAllHash(locked, outputs), hexToBytes(id.walletSk)));
+    const jr = await this.swap(locked, outputs, [sig]);
     if (!jr.signatures) throw new Error(jr.detail || 'mint rejected reclaim');
-    return outs.map((o, i) => plain(o.toProof(jr.signatures[i], ks)));
+    const proofs = unblind(outs, jr.signatures, params);
+    await this.receive(id, proofs);
+    return sum(proofs);
   }
 
-  // Raw swap with a chosen signature set (used by the negative test).
-  async rawRelease(bid, sigs) {
-    const w = await this.ensureWallet();
-    const outs = OutputData.createRandomData(bid.amount, w.getKeyset());
-    const outputs = outs.map((o) => ({ amount: num(o.blindedMessage.amount), id: o.blindedMessage.id, B_: o.blindedMessage.B_ }));
-    const inputs = bid.proofs.map((p, i) => ({ id: p.id, amount: p.amount, secret: p.secret, C: p.C, ...(i === 0 ? { witness: JSON.stringify({ signatures: sigs }) } : {}) }));
-    const r = await fetch(this.mintUrl + '/v1/swap', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ inputs, outputs }) });
-    return { status: r.status, body: await r.json(), outputs };
+  // Raw swap with chosen witness signatures (negative tests).
+  async rawRelease(bid, sigs, params) {
+    const { outputs } = blank(bid.amount, params);
+    return { body: await this.swap(bid.proofs, outputs, sigs), outputs };
   }
 
   // Which escrowed proofs are already spent at the mint (NUT-07).
   async spent(proofs) {
-    const w = await this.ensureWallet();
-    const st = await w.checkProofsStates(proofs);
-    return st.map((s) => s.state === 'SPENT');
+    const Ys = proofs.map((p) => hashToCurve(new TextEncoder().encode(p.secret)).toHex(true));
+    const r = await fetch(this.mintUrl + '/v1/checkstate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ Ys }) });
+    const j = await r.json();
+    return (j.states || []).map((s) => s.state === 'SPENT');
   }
+
+  async close() { for (const p of this.cocos.values()) (await p).dispose(); this.cocos.clear(); }
 
   async postChat(id, auctionId, text) {
     const ev = finalizeEvent({ kind: KIND_CHAT, created_at: Math.floor(Date.now() / 1000), tags: [['e', auctionId], ['name', id.name]], content: text }, hexToBytes(id.nostrSk));

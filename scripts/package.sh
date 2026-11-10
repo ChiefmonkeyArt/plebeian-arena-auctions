@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the self-contained release tarball the Torii Suite installs:
 #   plebeian-auctions-<tag>.tar.gz (+ .sha256)
-# Layout (flat): MANIFEST.json, bin/arena, web/ (built front end),
+# Layout (flat): MANIFEST.json, bin/arena, bin/arena-frost, web/ (built front end),
 # runtime/python/ (CPython 3.12 + Nutshell, hash-pinned, prebuilt wheels only).
 # Nothing is built or downloaded on the VPS. Linux x86_64 only.
 #   scripts/package.sh <tag> [out dir]
@@ -17,6 +17,11 @@ R="$STAGE/root"; mkdir -p "$R/bin" "$R/runtime"
 
 # 1. Chain binary (static, reproducible flags).
 (cd chain && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$R/bin/arena" .)
+
+# 1b. FROST signer tool (Rust, static musl so it runs on any x86_64 Linux).
+rustup target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
+(cd frost && cargo build --release --locked --target x86_64-unknown-linux-musl)
+install -m 0755 frost/target/x86_64-unknown-linux-musl/release/arena-frost "$R/bin/arena-frost"
 
 # 2. Front end.
 (cd web && npm ci --no-audit --no-fund --silent && npm run build >/dev/null)
@@ -44,12 +49,16 @@ find "$P/bin" -mindepth 1 ! -name 'python3*' -delete
 find "$P" -name '*.so*' -type f -exec strip --strip-unneeded {} +
 "$P/bin/python3" -c 'import zstandard, asyncpg, grpc, cryptography.hazmat.bindings._rust, cashu.mint.main' # still loads
 
+# 3b. The FROST tool and the client agree: 3-of-4 key ceremony and signing.
+node web/test/frost-roundtrip.mjs "$R/bin/arena-frost" >/dev/null
+
 # 4. Manifest, then a deterministic tarball.
 COMMIT="$(git rev-parse HEAD)"
 NUT="$(sed -n 's/^cashu==\([0-9.]*\).*/\1/p' mint/requirements.txt | head -1)"
 PYV="$("$P/bin/python3" -c 'import platform; print(platform.python_version())')"
-printf '{"name":"plebeian-auctions","tag":"%s","commit":"%s","python":"%s","nutshell":"%s","arch":"x86_64"}\n' \
-  "$TAG" "$COMMIT" "$PYV" "$NUT" > "$R/MANIFEST.json"
+FROSTV="$(sed -n 's/^frost-secp256k1-tr = .*version = "=\{0,1\}\([0-9.]*\)".*/\1/p' frost/Cargo.toml | head -1)"
+printf '{"name":"plebeian-auctions","tag":"%s","commit":"%s","python":"%s","nutshell":"%s","frost":"frost-secp256k1-tr %s","escrow":"frost-3of4","arch":"x86_64"}\n' \
+  "$TAG" "$COMMIT" "$PYV" "$NUT" "$FROSTV" > "$R/MANIFEST.json"
 mkdir -p "$OUT"
 EPOCH="$(git log -1 --format=%ct)"
 tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@${EPOCH}" -C "$R" -cf - . | gzip -9 -n > "$OUT/${NAME}.tar.gz"

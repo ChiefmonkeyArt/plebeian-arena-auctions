@@ -20,7 +20,8 @@ type Params struct {
 	MintURL        string            `json:"mintUrl"`
 	KeysetID       string            `json:"keysetId"`
 	Keys           map[string]string `json:"keys"`
-	Validators     []string          `json:"validators"` // Cashu signer pubkeys, V1..V4 (compressed hex)
+	GroupKey       string            `json:"groupKey"`       // FROST 3-of-4 escrow key (compressed hex); no single validator holds it
+	FrostPublic    json.RawMessage   `json:"frostPublic"`    // FROST public key package: group key + each validator's verifying share
 	ValidatorNames []string          `json:"validatorNames"`
 	SoftCloseSec   int64             `json:"softCloseSec"`
 	ExtendSec      int64             `json:"extendSec"`
@@ -129,7 +130,7 @@ func (a *App) Info(context.Context, *abci.InfoRequest) (*abci.InfoResponse, erro
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	// In-memory app: report height 0 so CometBFT replays the chain from genesis on restart.
-	return &abci.InfoResponse{Data: "arena-auctions", Version: "0.1.0", AppVersion: 1, LastBlockHeight: 0}, nil
+	return &abci.InfoResponse{Data: "arena-auctions", Version: "0.2.0", AppVersion: 1, LastBlockHeight: 0}, nil
 }
 
 func (a *App) InitChain(_ context.Context, req *abci.InitChainRequest) (*abci.InitChainResponse, error) {
@@ -233,11 +234,8 @@ func (s *State) checkLock(proofs []Proof, wallet string, hardEnd int64) (int64, 
 		if err != nil {
 			return 0, err
 		}
-		if l.Data != strings.ToLower(p.Validators[0]) || !sameSet(l.Pubkeys, lower(p.Validators[1:])) {
-			return 0, errors.New("proofs not locked to the four validators")
-		}
-		if l.NSigs != p.Threshold {
-			return 0, fmt.Errorf("lock must require %d signatures", p.Threshold)
+		if l.Data != strings.ToLower(p.GroupKey) || len(l.Pubkeys) != 0 || l.NSigs != 1 {
+			return 0, errors.New("proofs not locked to the validators' FROST group key")
 		}
 		if l.SigFlag != "SIG_ALL" {
 			return 0, errors.New("lock must use SIG_ALL")

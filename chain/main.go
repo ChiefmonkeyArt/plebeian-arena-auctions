@@ -244,27 +244,30 @@ func cmdGateway(args []string) {
 	})
 
 	// relay a release request to every validator's signer; the browser assembles 3 of 4
-	mu.HandleFunc("/api/sign", func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-		res := make([]map[string]any, 4)
-		var wg sync.WaitGroup
-		for i := 0; i < 4; i++ {
-			wg.Add(1)
-			go func(i int) {
-				defer wg.Done()
-				m := map[string]any{"validator": names[i]}
-				resp, err := client.Post(fmt.Sprintf("http://127.0.0.1:%d/sign", httpPort(i)), "application/json", bytes.NewReader(body))
-				if err != nil {
-					m["error"] = "offline"
-				} else {
-					json.NewDecoder(resp.Body).Decode(&m)
-					resp.Body.Close()
-				}
-				res[i] = m
-			}(i)
+	// escrow release: one FROST signing round across the validators
+	rc, err := loadCoordinator(*root, func(i int, path string, body any, out any) (int, error) {
+		b, _ := json.Marshal(body)
+		resp, err := client.Post(fmt.Sprintf("http://127.0.0.1:%d%s", httpPort(i), path), "application/json", bytes.NewReader(b))
+		if err != nil {
+			return 0, err
 		}
-		wg.Wait()
-		writeJSON(w, 200, res)
+		defer resp.Body.Close()
+		json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out)
+		return resp.StatusCode, nil
+	})
+	check(err)
+	mu.HandleFunc("/api/release", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, 405, map[string]string{"error": "POST only"})
+			return
+		}
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if !json.Valid(body) {
+			writeJSON(w, 400, map[string]string{"error": "bad request"})
+			return
+		}
+		code, res := rc.release(body)
+		writeJSON(w, code, res)
 	})
 
 	mu.HandleFunc("/api/admin/validator/", func(w http.ResponseWriter, r *http.Request) {
