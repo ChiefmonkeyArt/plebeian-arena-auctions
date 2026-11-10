@@ -180,14 +180,18 @@ async function placeBid(n, a, amount, { quiet = false, auto = false } = {}) {
       if (n !== ui.me || ui.autotopup) await topup(n, Math.max(amount - bal(n) + 1000, 5000), true);
       else throw new Error('Not enough fake sats. Top up in the wallet.');
     }
-    const fresh = await api.state();
+    // slim view (no proofs): a few KB instead of the full state, so the
+    // check-then-lock window is short and bots don't pull MBs per bid
+    const fresh = (await api.view([idPub(id)])).state;
     const fa = fresh.auctions[a.id];
+    if (!fa) throw new Error('auction closed');
     const { locked } = await api.lockForBid(id, amount, fresh.params, fa, { state: fresh });
     await refreshBal(n);
     ledger(n, 'hold', amount, `Locked to the validators' FROST key · ${short(fa.title, 30)}`);
     saveW();
     try {
       const r = await api.bid(id, fa, amount, locked);
+      if (!quiet || n === ui.me) burst();
       if (n === ui.me && !quiet) toast(`${auto ? 'Max bid raised you to' : 'Bid'} <b>${fmt(amount)}</b> sent · checked by ${esc(r.via)}`, 'good');
       return { ok: true };
     } catch (e) {
@@ -524,7 +528,18 @@ function onNewState(prev) {
 
 // ---------- polling ----------
 let stateTag = '';
+let polling = false;
+// After an action, poll fast for a few seconds so the result shows the moment
+// its block commits (~1 s) instead of up to a poll later. 304s cost no body.
+let burstUntil = 0;
+function burst(ms = 3000) {
+  const first = burstUntil < Date.now();
+  burstUntil = Date.now() + ms;
+  if (first) (async function tick() { await pollState(); if (Date.now() < burstUntil) setTimeout(tick, 250); })();
+}
 async function pollState() {
+  if (polling) return;
+  polling = true;
   try {
     const prev = S;
     const r = await api.view(USERS.map((n) => idPub(ids[n])), stateTag);
@@ -537,7 +552,7 @@ async function pollState() {
     document.body.classList.toggle('arena-loading', !a);
     renderMedia(a); renderFeeds(a); renderChat(a); renderQueue(a); renderWallet();
     if (!$('[data-modal=outcome]').hidden) $('[data-slot=outcome]').innerHTML = outcomeHTML(a, ui.otab);
-  } catch (e) { /* gateway down */ }
+  } catch (e) { /* gateway down */ } finally { polling = false; }
 }
 async function pollNet() { try { NET = await api.network(); if (S) S.height = Math.max(S.height, ...NET.map((v) => v.height || 0)); renderNetwork(); } catch {} }
 async function pollChat() { try { CHAT = await api.chat(); renderChat(currentLot()); } catch {} }
@@ -612,7 +627,7 @@ document.addEventListener('submit', async (e) => {
       const r = await api.createAuction(meId(), { title: d.title, description: d.description, image: d.image, category: '', startPrice: +d.startPrice, minIncrement: +d.minIncrement, durationSec: +d.durationSec });
       toast(`Listed <b>${esc(d.title.slice(0, 30))}</b> · signed and accepted by ${esc(r.via)}`, 'good');
       $$('.drawer').forEach((x) => { x.hidden = true; });
-      setTimeout(() => { ui.lot = r.id; ui.pinned = true; pollState(); }, 1500);
+      ui.lot = r.id; ui.pinned = true; burst();
     } catch (err) { toast(esc(String(err.message).replace(/^.*log='([^']+)'.*$/, '$1')), 'danger'); }
   }
 });

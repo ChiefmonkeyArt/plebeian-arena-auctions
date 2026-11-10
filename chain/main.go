@@ -137,7 +137,7 @@ func cmdGateway(args []string) {
 	mu := http.NewServeMux()
 	mintURL, _ := url.Parse(*mint)
 	mp := httputil.NewSingleHostReverseProxy(mintURL)
-	mu.Handle("/mint/", http.StripPrefix("/mint", mp))
+	mu.Handle("/mint/", http.StripPrefix("/mint", mintHandler(mp)))
 
 	// state from the first healthy validator. ?view=client is the slim view
 	// the page polls (see view.go); it answers 304 when nothing changed.

@@ -1,4 +1,4 @@
-# Threat model: Plebeian Auctions arena (v0.2.0, status updated for v0.3.1)
+# Threat model: Plebeian Auctions arena (v0.2.0, status updated for v0.3.2)
 
 Status: draft, 2026-11-10. Covers `ChiefmonkeyArt/plebeian-arena-auctions` v0.2.0 as installed by Torii Suite v0.9.50-alpha at `auctions.<domain>`. Fake sats only. This document defines what must hold before real sats are used, and what an auditor should test.
 
@@ -121,6 +121,8 @@ Fix: reproducible builds checked by a second builder, and signed release checksu
 ### F10 Info: privacy
 
 All auctions, bids, amounts, bidder wallet keys and Nostr keys are public through `/api/state`. v0.3.1 adds `/api/state?view=client` and `/api/bid?id=` (ADR 0004). They expose nothing the full state did not already, and the `bidders` parameter only tells the gateway which public keys a browser holds, which it already learns when they sign events. Gzip is safe here: these responses carry no secrets, so compression side channels (BREACH) do not apply. Intended for an auction, but bidders are linkable across lots.
+
+v0.3.2 (ADR 0005) lets one path, `/mint/v1/ws`, upgrade to a WebSocket that is passed straight to the mint. Every other upgrade attempt gets a 400. A held socket costs a goroutine and two file descriptors and is cut after 10 minutes. Nginx rate-limits new upgrades like any other request, but this is not a cap on open sockets per client: on real sats, add a per-IP connection limit (`limit_conn`) in front.
 
 ## Already in place
 
