@@ -4,6 +4,9 @@
 import { ArenaClient, newIdentity, idPub, totalSats } from '../web/src/lib/arena.js';
 import { schnorr } from '../web/node_modules/@noble/curves/secp256k1.js';
 import { bytesToHex, hexToBytes } from '../web/node_modules/@noble/hashes/utils.js';
+import http from 'node:http';
+import https from 'node:https';
+import { randomBytes } from 'node:crypto';
 
 const BASE = process.argv[2] || 'http://127.0.0.1:8080';
 const c = new ArenaClient(BASE);
@@ -32,6 +35,30 @@ async function placeBid(u, au, amount, force = false) {
   // every running validator must have the block too before a release is asked for
   await until(async () => (await c.network()).filter((v) => v.up).every((v) => v.height >= bid.height), 15000, 'all validators at the bid block');
   return { id: r.id, via: r.via, state: bid };
+}
+
+// Raw WebSocket upgrade (Node 20 has no WebSocket client): resolves with the
+// status and, on 101, the socket.
+function upgrade(path) {
+  const u = new URL(BASE + path);
+  const mod = u.protocol === 'https:' ? https : http;
+  return new Promise((resolve, reject) => {
+    const req = mod.request(u, { headers: { connection: 'Upgrade', upgrade: 'websocket', 'sec-websocket-version': '13', 'sec-websocket-key': randomBytes(16).toString('base64') } });
+    req.on('upgrade', (res, sock) => resolve({ status: res.statusCode, sock }));
+    req.on('response', (res) => { res.resume(); resolve({ status: res.statusCode }); });
+    req.on('error', reject);
+    req.setTimeout(8000, () => req.destroy(new Error('upgrade timeout')));
+    req.end();
+  });
+}
+// one masked ping; resolves true on a pong (opcode 0xA)
+function pingPong(sock) {
+  return new Promise((resolve) => {
+    const t = setTimeout(() => resolve(false), 5000);
+    sock.once('data', (d) => { clearTimeout(t); resolve((d[0] & 0x0f) === 0x0a); });
+    sock.once('close', () => { clearTimeout(t); resolve(false); });
+    sock.write(Buffer.concat([Buffer.from([0x89, 0x80]), randomBytes(4)]));
+  });
 }
 
 const net0 = await c.network();
@@ -116,6 +143,17 @@ const fullB2 = await c.bidWithProofs(b2.id);
 ok(JSON.stringify(fullB2.proofs) === JSON.stringify(s.bids[b2.id].proofs), '/api/bid returns the committed proofs for one bid');
 await expectReject(c.bidWithProofs('ZZ'), /64 lowercase hex/, '/api/bid rejects a malformed id');
 await expectReject(c.bidWithProofs('0'.repeat(64)), /no such bid/, '/api/bid 404 for an unknown bid');
+
+step('W', "Mint WebSocket (v0.3.2): Coco's NUT-17 updates upgrade and stay open");
+const ws = await upgrade('/mint/v1/ws');
+ok(ws.status === 101, `/mint/v1/ws upgrades (${ws.status})`);
+if (ws.sock) {
+  await sleep(17000); // past the gateway's 15 s ReadTimeout
+  ok(await pingPong(ws.sock), 'socket still answers a ping after 17 s');
+  ws.sock.destroy();
+}
+const bad = await upgrade('/mint/v1/info');
+ok(bad.status === 400, `upgrade refused off /v1/ws (${bad.status})`);
 
 step(8, 'Loser refunds; two validators cannot release, forged signatures fail');
 await c.j('/api/admin/validator/3/stop', { method: 'POST' });

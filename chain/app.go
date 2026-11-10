@@ -133,7 +133,7 @@ func (a *App) Info(context.Context, *abci.InfoRequest) (*abci.InfoResponse, erro
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	// In-memory app: report height 0 so CometBFT replays the chain from genesis on restart.
-	return &abci.InfoResponse{Data: "arena-auctions", Version: "0.3.1", AppVersion: 1, LastBlockHeight: 0}, nil
+	return &abci.InfoResponse{Data: "arena-auctions", Version: "0.3.2", AppVersion: 1, LastBlockHeight: 0}, nil
 }
 
 func (a *App) InitChain(_ context.Context, req *abci.InitChainRequest) (*abci.InitChainResponse, error) {
