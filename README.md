@@ -57,4 +57,4 @@ Build a tarball locally:
 scripts/package.sh v0.2.0 dist-release
 ```
 
-Design decision: [ADR 0001](docs/adr/0001-frost-escrow-coco-wallet.md).
+Design decision: [ADR 0001](docs/adr/0001-frost-escrow-coco-wallet.md). Threat model: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
