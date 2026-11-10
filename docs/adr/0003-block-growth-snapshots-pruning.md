@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: proposed (§2 accepted and implemented in v0.3.3; §1, §3, §4, §5 still proposed)
 ---
 
 # ADR 0003: Block growth, state snapshots and pruning
@@ -42,6 +42,17 @@ As of v0.3.0 (`chain/node.go`, `chain/app.go`):
 - `Info` returns the newest snapshot's height and app hash. CometBFT then replays only the blocks after it.
 - On load, the validator recomputes the app hash and compares it with the stored hash and with the block header at that height. If they differ, it refuses to start (it does not quietly replay).
 - It keeps the last 2 snapshots.
+
+**Implemented in v0.3.3** (`chain/snapshot.go`). Differences from the text above, found while building it:
+
+- No chain format change. Snapshots are an extra file next to an unchanged chain, so `FORMAT` stays `3` and an upgrade keeps the chain. The first start after the upgrade still replays from genesis once, because v0.3.2 wrote no snapshot; it writes snapshots at every 1,000th block as it goes.
+- The interval is the node flag `-snapshot-every` (default 1,000; `0` means only on clean shutdown). The gateway does not pass it, so all four use the default.
+- The check against the chain is done by the validator itself before CometBFT starts. It reads block `h+1`'s header `AppHash` from the block store, or the saved CometBFT state when `h` is the tip. CometBFT's own handshake does not check the first replayed block, only the end result. A snapshot above the block store is refused. If Commit ran but CometBFT had not saved its state yet (crash window), there is no record to compare; the handshake replays that block with its mock app and checks it.
+- The file must also re-encode to the same bytes after parsing (canonical JSON), be a regular file (no symlinks) and be under 256 MiB.
+- Only the newest file is loaded. If it fails any check, the validator stops with the reason and the path; it does not fall back to an older snapshot or to genesis on its own.
+- Writes happen in the background after Commit (the bytes are immutable), serialised, never moving backwards in height. The shutdown write happens after the node has stopped.
+- The gateway now stops the four validators in parallel. One after another, with up to 8 s each, could pass systemd's 20 s `TimeoutStopSec` and get them killed before their shutdown snapshots.
+- Measured locally: clean gateway restart, all four back in 0.23 s (no replay). Hard-killed validator: restored from its last snapshot, caught up, same app hash as the others.
 
 ### 3. State sync for new validators
 

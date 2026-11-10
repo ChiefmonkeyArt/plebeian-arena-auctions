@@ -392,9 +392,14 @@ func cmdGateway(args []string) {
 		sigc := make(chan os.Signal, 1)
 		signalNotify(sigc)
 		<-sigc
+		// stop all four at once: each may take a few seconds to write its
+		// shutdown snapshot, and systemd's TimeoutStopSec is 20 s
+		var wg sync.WaitGroup
 		for i := 0; i < 4; i++ {
-			sup.stop(i)
+			wg.Add(1)
+			go func(i int) { defer wg.Done(); sup.stop(i) }(i)
 		}
+		wg.Wait()
 		os.Exit(0)
 	}()
 	log.Fatal(srv.ListenAndServe())
