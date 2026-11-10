@@ -799,3 +799,12 @@ body[data-layout=d] .btn-primary, body[data-layout=d] .btn-dark, body[data-layou
 body[data-layout=d] .urgent .d-timer { color: #000 !important; }
 .d-sticky .d-btn { gap: 8px; }
 body[data-layout=d] .bid-item.mine .bi-name::after { content: none; }
+/* v0.3.4 (ADR 0006): instant bid feedback */
+.c-ladder button, .c-sticky .btn-primary, .c-custom .btn-primary, .swipe { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.c-ladder button:active, .c-sticky .btn-primary:active { transform: scale(.94); }
+.sending { position: relative; pointer-events: auto; }
+.sending::after { content: ''; position: absolute; inset: -2px; border-radius: inherit; border: 2px solid var(--lime); animation: blink .8s infinite; pointer-events: none; }
+.is-pending .c-price .num { color: var(--lime); }
+.bid-item.pending { opacity: .85; background: color-mix(in oklab, var(--lime) 14%, transparent); }
+.bid-item.pending .tag-auto { animation: blink .8s infinite; }
+@media (prefers-reduced-motion: reduce) { .sending::after, .bid-item.pending .tag-auto { animation: none; } }
