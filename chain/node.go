@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -19,8 +18,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	cfg "github.com/cometbft/cometbft/config"
 	"github.com/cometbft/cometbft/crypto"
 	"github.com/cometbft/cometbft/crypto/ed25519"
@@ -58,11 +55,6 @@ func nodeConfig(home string, i int, peers string) *cfg.Config {
 	return c
 }
 
-type signerKey struct {
-	Priv string `json:"priv"`
-	Pub  string `json:"pub"`
-}
-
 func cmdInit(args []string) {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
 	root := fs.String("root", "run/chain", "chain root dir")
@@ -97,7 +89,6 @@ func cmdInit(args []string) {
 	os.RemoveAll(*root)
 	var vals []types.GenesisValidator
 	var nodeIDs []string
-	var cashu []string
 	for i := 0; i < 4; i++ {
 		home := homeOf(*root, i)
 		c := nodeConfig(home, i, "")
@@ -111,16 +102,17 @@ func cmdInit(args []string) {
 		nodeIDs = append(nodeIDs, string(nk.ID()))
 		pub, _ := pv.GetPubKey()
 		vals = append(vals, types.GenesisValidator{Address: pub.Address(), PubKey: pub, Power: 10, Name: names[i]})
-		// Cashu signer key (the validator's share of the 3-of-4 escrow lock)
-		var b [32]byte
-		rand.Read(b[:])
-		sk, _ := btcec.PrivKeyFromBytes(b[:])
-		pk := hex.EncodeToString(sk.PubKey().SerializeCompressed())
-		cashu = append(cashu, pk)
-		kb, _ := json.MarshalIndent(signerKey{Priv: hex.EncodeToString(b[:]), Pub: pk}, "", " ")
-		check(os.WriteFile(filepath.Join(home, "config", "cashu_signer.json"), kb, 0o600))
 	}
-	params := Params{MintURL: *mint, KeysetID: kid, Keys: keys.Keysets[0].Keys, Validators: cashu, ValidatorNames: names,
+	// FROST key ceremony: four shares of one escrow key, 3 needed to sign.
+	// Each share is written only to its own validator's home. (On a single
+	// host the operator can still read all four; separate machines fix that.)
+	shares, pkp, groupKey, err := frostDKG()
+	check(err)
+	for i := 0; i < 4; i++ {
+		kb, _ := json.MarshalIndent(frostKeyFile{Participant: i + 1, KeyPackage: shares[i], GroupKey: groupKey}, "", " ")
+		check(os.WriteFile(filepath.Join(homeOf(*root, i), "config", "frost_key.json"), kb, 0o600))
+	}
+	params := Params{MintURL: *mint, KeysetID: kid, Keys: keys.Keysets[0].Keys, GroupKey: groupKey, FrostPublic: pkp, ValidatorNames: names,
 		SoftCloseSec: 20, ExtendSec: 20, MaxExtendSec: 60, LockMarginSec: 30, MinDurationSec: 20, MaxDurationSec: 7200,
 		MaxProofs: 64, Threshold: 3}
 	ab, _ := json.Marshal(params)
@@ -138,7 +130,7 @@ func cmdInit(args []string) {
 		}
 		check(os.WriteFile(filepath.Join(home, "peers.txt"), []byte(strings.Join(peers, ",")), 0o600))
 	}
-	fmt.Printf("initialised 4 validators in %s, keyset %s\n", *root, kid)
+	fmt.Printf("initialised 4 validators in %s, keyset %s, FROST group key %s\n", *root, kid, groupKey)
 }
 
 func cmdNode(args []string) {
@@ -155,10 +147,14 @@ func cmdNode(args []string) {
 	pv := privval.LoadFilePV(c.PrivValidatorKeyFile(), c.PrivValidatorStateFile())
 	nk, err := p2p.LoadOrGenNodeKey(c.NodeKeyFile())
 	check(err)
-	var sk signerKey
-	kb, err := os.ReadFile(filepath.Join(home, "config", "cashu_signer.json"))
+	var fk frostKeyFile
+	kb, err := os.ReadFile(filepath.Join(home, "config", "frost_key.json"))
 	check(err)
-	check(json.Unmarshal(kb, &sk))
+	check(json.Unmarshal(kb, &fk))
+	if fk.Participant != i+1 {
+		log.Fatal("frost_key.json belongs to another validator")
+	}
+	sessions := &frostSessions{m: map[string]frostSession{}}
 
 	app := NewApp()
 	logger := cmtlog.NewFilter(cmtlog.NewTMLogger(cmtlog.NewSyncWriter(os.Stdout)), cmtlog.AllowError())
@@ -176,7 +172,7 @@ func cmdNode(args []string) {
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		bs := n.BlockStore()
 		h := bs.Height()
-		out := map[string]any{"name": names[i], "index": i + 1, "height": h, "peers": n.Switch().Peers().Size(), "cashuPub": sk.Pub}
+		out := map[string]any{"name": names[i], "index": i + 1, "height": h, "peers": n.Switch().Peers().Size(), "frostParticipant": fk.Participant, "groupKey": fk.GroupKey}
 		if meta := bs.LoadBlockMeta(h); meta != nil {
 			out["time"] = meta.Header.Time.Unix()
 			out["appHash"] = hex.EncodeToString(meta.Header.AppHash)
@@ -192,7 +188,8 @@ func cmdNode(args []string) {
 		}
 		writeJSON(w, 200, out)
 	})
-	mux.HandleFunc("/sign", func(w http.ResponseWriter, r *http.Request) { handleSign(w, r, app, sk, i) })
+	mux.HandleFunc("/frost/commit", func(w http.ResponseWriter, r *http.Request) { handleCommit(w, r, app, fk, sessions, i) })
+	mux.HandleFunc("/frost/sign", func(w http.ResponseWriter, r *http.Request) { handleShare(w, r, fk, sessions, i) })
 	srv := &http.Server{Addr: fmt.Sprintf("127.0.0.1:%d", httpPort(i)), Handler: mux}
 	go func() { log.Println(srv.ListenAndServe()) }()
 
@@ -217,21 +214,11 @@ type SignReq struct {
 	Auth    string       `json:"auth"` // BIP340 sig by the bidder (refund) or seller (payout) wallet over the SIG_ALL hash
 }
 
-// handleSign: this validator co-signs a release of escrowed proofs only when its own
-// copy of the agreed state says the release is allowed.
-func handleSign(w http.ResponseWriter, r *http.Request, app *App, sk signerKey, i int) {
-	if r.Method != http.MethodPost {
-		writeJSON(w, 405, map[string]string{"error": "POST only"})
-		return
-	}
-	var req SignReq
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
-		writeJSON(w, 400, map[string]string{"error": "bad request"})
-		return
-	}
-	var msg string
-	var authKey string
-	var err error
+// releasePolicy: this validator agrees to a release of escrowed proofs only
+// when its own copy of the agreed state allows it, and the right wallet has
+// authorised it. Returns the SIG_ALL hash the escrow signature must cover.
+func releasePolicy(app *App, req SignReq) (h [32]byte, code int, err error) {
+	var msg, authKey string
 	app.Read(func(s *State) {
 		bid, ok := s.Bids[req.Bid]
 		if !ok {
@@ -280,22 +267,81 @@ func handleSign(w http.ResponseWriter, r *http.Request, app *App, sk signerKey, 
 		msg = sb.String()
 	})
 	if err != nil {
-		writeJSON(w, 409, map[string]string{"error": err.Error(), "validator": names[i]})
-		return
+		return h, 409, err
 	}
-	h := sha256.Sum256([]byte(msg))
+	h = sha256.Sum256([]byte(msg))
 	if !schnorrVerifyHash(h[:], authKey, req.Auth) {
-		writeJSON(w, 403, map[string]string{"error": "authorisation signature invalid", "validator": names[i]})
+		return h, 403, errors.New("authorisation signature invalid")
+	}
+	return h, 200, nil
+}
+
+// handleCommit: FROST round 1. If policy allows the release, make fresh
+// one-time nonces bound to this exact release and publish their commitments.
+func handleCommit(w http.ResponseWriter, r *http.Request, app *App, fk frostKeyFile, ss *frostSessions, i int) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]string{"error": "POST only"})
 		return
 	}
-	kb, _ := hex.DecodeString(sk.Priv)
-	priv, _ := btcec.PrivKeyFromBytes(kb)
-	sig, e := schnorr.Sign(priv, h[:])
-	if e != nil {
-		writeJSON(w, 500, map[string]string{"error": "sign failed"})
+	var req SignReq
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "bad request"})
 		return
 	}
-	writeJSON(w, 200, map[string]string{"validator": names[i], "pubkey": sk.Pub, "signature": hex.EncodeToString(sig.Serialize())})
+	h, code, err := releasePolicy(app, req)
+	if err != nil {
+		writeJSON(w, code, map[string]string{"error": err.Error(), "validator": names[i]})
+		return
+	}
+	var out struct {
+		Nonces      json.RawMessage `json:"nonces"`
+		Commitments json.RawMessage `json:"commitments"`
+	}
+	if err := frostCall("commit", map[string]any{"key_package": fk.KeyPackage}, &out); err != nil {
+		writeJSON(w, 500, map[string]string{"error": "commit failed", "validator": names[i]})
+		return
+	}
+	id, err := ss.put(out.Nonces, hex.EncodeToString(h[:]))
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": err.Error(), "validator": names[i]})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"validator": names[i], "participant": fk.Participant, "session": id, "message": hex.EncodeToString(h[:]), "commitments": out.Commitments})
+}
+
+// handleShare: FROST round 2. Sign only the release agreed in round 1; the
+// nonces are deleted before use so they can never sign twice.
+func handleShare(w http.ResponseWriter, r *http.Request, fk frostKeyFile, ss *frostSessions, i int) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]string{"error": "POST only"})
+		return
+	}
+	var req struct {
+		Session        string          `json:"session"`
+		SigningPackage json.RawMessage `json:"signing_package"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "bad request"})
+		return
+	}
+	sess, ok := ss.take(req.Session)
+	if !ok {
+		writeJSON(w, 409, map[string]string{"error": "unknown or expired signing session", "validator": names[i]})
+		return
+	}
+	m, err := signingPackageMessage(req.SigningPackage)
+	if err != nil || m != sess.hash {
+		writeJSON(w, 409, map[string]string{"error": "signing package is not the release this validator agreed to", "validator": names[i]})
+		return
+	}
+	var out struct {
+		Share json.RawMessage `json:"share"`
+	}
+	if err := frostCall("sign", map[string]any{"key_package": fk.KeyPackage, "nonces": sess.nonces, "signing_package": req.SigningPackage}, &out); err != nil {
+		writeJSON(w, 409, map[string]string{"error": "sign failed: " + err.Error(), "validator": names[i]})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"validator": names[i], "participant": fk.Participant, "share": out.Share})
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

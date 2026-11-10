@@ -1,0 +1,20 @@
+[package]
+name = "arena-frost"
+version = "0.2.0"
+edition = "2021"
+publish = false
+description = "Plebeian Auctions arena: FROST 3-of-4 key generation and signing for the escrow (fake sats)"
+
+[dependencies]
+frost-secp256k1-tr = { version = "=3.0.0", features = ["serde"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

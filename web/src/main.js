@@ -1,6 +1,6 @@
 import './template.css';
 import './arena.css';
-import { ArenaClient, newIdentity, idPub, walletPub, totalSats, lockOf } from './lib/arena.js';
+import { ArenaClient, newIdentity, ensureSeed, idPub, walletPub, totalSats, lockOf } from './lib/arena.js';
 
 // ---------- basics ----------
 const $ = (s, r = document) => r.querySelector(s);
@@ -25,11 +25,13 @@ const save = (k, v) => { try { store.setItem(LS + k, JSON.stringify(v)); } catch
 const USERS = ['Seller', 'Alice', 'Bob', 'Carol'];
 const COLORS = { Seller: '#FF3EB5', Alice: '#16A35A', Bob: '#F7931A', Carol: '#6C5CE7' };
 const ids = load('ids', null) || Object.fromEntries(USERS.map((n) => [n, newIdentity(n)]));
+USERS.forEach((n) => ensureSeed(ids[n]));
 save('ids', ids);
 const pubToUser = {};
 USERS.forEach((n) => { pubToUser[idPub(ids[n])] = n; });
 
-// per-user wallet: { proofs:[], ledger:[], stranded:[{locked, auction, at}] }
+// per-user wallet history: { ledger:[], stranded:[{locked, auction, at}] }; the ecash itself lives in each user's Coco wallet.
+// (`proofs` is only read once, to move a pre-Coco v0.1 wallet into Coco.)
 const W = load('wallets', {});
 USERS.forEach((n) => { W[n] = W[n] || { proofs: [], ledger: [], stranded: [] }; });
 const claimed = new Set(load('claimed', []));
@@ -53,7 +55,9 @@ const meId = () => ids[ui.me];
 const mePub = () => idPub(meId());
 const nameOfPub = (pk) => pubToUser[pk] || pk.slice(0, 8);
 const nameOfBid = (b) => pubToUser[b.bidder] || `${b.name || 'Guest'} ·${b.bidder.slice(0, 4)}`;
-const bal = (n) => totalSats(W[n].proofs);
+const BAL = {};
+const bal = (n) => BAL[n] || 0;
+async function refreshBal(n) { BAL[n] = await api.balance(ids[n]); return BAL[n]; }
 const ledger = (n, type, amount, note) => { W[n].ledger.unshift({ type, amount, note, ts: Date.now() / 1000 }); W[n].ledger = W[n].ledger.slice(0, 60); };
 
 function avatar(name, size = 28) {
@@ -157,8 +161,8 @@ function role(a, n = ui.me) {
 
 // ---------- wallet ops ----------
 async function topup(n, amount, quiet) {
-  const ps = await api.faucet(amount);
-  W[n].proofs.push(...ps); ledger(n, 'topup', amount, 'Fake-sats faucet (test mint)'); saveW();
+  BAL[n] = await api.faucet(ids[n], amount);
+  ledger(n, 'topup', amount, 'Fake-sats faucet (test mint) · Coco wallet'); saveW();
   if (!quiet && n === ui.me) { pulse($('.wallet-chip'), 'got'); toast(`+${fmt(amount)} fake sats minted`, 'good'); }
 }
 
@@ -175,9 +179,9 @@ async function placeBid(n, a, amount, { quiet = false, auto = false } = {}) {
     }
     const fresh = await api.state();
     const fa = fresh.auctions[a.id];
-    const { keep, locked } = await api.lockForBid(id, W[n].proofs, amount, fresh.params, fa, { state: fresh });
-    W[n].proofs = keep;
-    ledger(n, 'hold', amount, `Locked to 3-of-4 validators · ${short(fa.title, 30)}`);
+    const { locked } = await api.lockForBid(id, amount, fresh.params, fa, { state: fresh });
+    await refreshBal(n);
+    ledger(n, 'hold', amount, `Locked to the validators' FROST key · ${short(fa.title, 30)}`);
     saveW();
     try {
       const r = await api.bid(id, fa, amount, locked);
@@ -211,18 +215,18 @@ async function settleLoop() {
       busy.add('c:' + b.id);
       try {
         const r = await api.claim(ids[n], b, purpose, S.params);
-        W[n].proofs.push(...r.proofs); claimed.add(b.id);
+        claimed.add(b.id); await refreshBal(n);
         const who = r.cosigners.map((v) => v.replace('Validator ', 'V')).join(', ');
         if (purpose === 'refund') {
-          ledger(n, 'refund', b.amount, `Refund co-signed by ${who}`);
+          ledger(n, 'refund', b.amount, `Refund · FROST signature by ${who}`);
           if (n === ui.me) {
             const by = au.highBid && S.bids[au.highBid] ? nameOfBid(S.bids[au.highBid]) : 'the winner';
-            toast(b.status === 'outbid' ? `Outbid by <b>${esc(by)}</b> · ${fmt(b.amount)} sats refunded by ${who}` : `${fmt(b.amount)} sats returned · co-signed by ${who}`, 'danger', b.status === 'outbid' && au.status === 'open' ? ['Bid again', 'bid-next'] : null);
+            toast(b.status === 'outbid' ? `Outbid by <b>${esc(by)}</b> · ${fmt(b.amount)} sats refunded by ${who}` : `${fmt(b.amount)} sats returned · signed by ${who}`, 'danger', b.status === 'outbid' && au.status === 'open' ? ['Bid again', 'bid-next'] : null);
             flyCoins($('.c-price'));
           }
         } else {
           ledger(n, 'pay', b.amount, `Payout for “${short(au.title, 26)}” · ${who}`);
-          if (n === ui.me) { toast(`Payout <b>${fmt(b.amount)}</b> sats received · co-signed by ${who}`, 'good'); flyCoins($('.c-price'), 10); }
+          if (n === ui.me) { toast(`Payout <b>${fmt(b.amount)}</b> sats received · signed by ${who}`, 'good'); flyCoins($('.c-price'), 10); }
         }
         saveW();
       } catch (e) {
@@ -236,9 +240,9 @@ async function settleLoop() {
       if (Date.now() / 1000 < lt + 2 || busy.has('s:' + lt)) continue;
       busy.add('s:' + lt);
       try {
-        const ps = await api.reclaimExpired(ids[n], s.locked);
-        W[n].proofs.push(...ps); W[n].stranded = W[n].stranded.filter((x) => x !== s);
-        ledger(n, 'refund', totalSats(ps), 'Reclaimed alone after locktime'); saveW();
+        const got = await api.reclaimExpired(ids[n], s.locked, S.params);
+        W[n].stranded = W[n].stranded.filter((x) => x !== s); await refreshBal(n);
+        ledger(n, 'refund', got, 'Reclaimed alone after locktime'); saveW();
       } catch (e) { if (/spent/i.test(e.message)) { W[n].stranded = W[n].stranded.filter((x) => x !== s); saveW(); } }
       finally { busy.delete('s:' + lt); }
     }
@@ -291,7 +295,7 @@ function myStatusHTML(a) {
     return `<div class="ms neutral">${a.winner ? `Sold to ${esc(nameOfBid(S.bids[a.winner]))} for ${fmt(a.highAmount)}` : 'Ended without bids'} <button data-act="outcome">See outcome →</button></div>`;
   }
   if (r === 'winning') return `<div class="ms win"><span class="pulse"></span>You're the top bidder${ui.max[a.id] ? ' · max ' + fmt(ui.max[a.id]) : ''}</div>`;
-  if (r === 'outbid') return `<div class="ms lose">You've been outbid · refund co-signed instantly. Bid again?</div>`;
+  if (r === 'outbid') return `<div class="ms lose">You've been outbid · refund signed instantly. Bid again?</div>`;
   return '';
 }
 
@@ -336,7 +340,7 @@ function renderFrame() {
     setV('bidcountn', String(bs.length));
     setV('bidders', String(new Set(bs.map((b) => b.bidder)).size));
     setV('extensionsn', String(a.extensions));
-    setV('escrownote', `Bids lock ecash to a 3-of-4 validator escrow. Outbid? 3 validators co-sign your refund at once. Fallback: you can reclaim alone after ${clock(a.hardEnd + S.params.lockMarginSec + 15)}.`);
+    setV('escrownote', `Bids lock ecash to one FROST key the 4 validators share; any 3 can sign. Outbid? 3 validators sign your refund at once. Fallback: you can reclaim alone after ${clock(a.hardEnd + S.params.lockMarginSec + 15)}.`);
     const r = remaining(a);
     $$('[data-urgent]').forEach((el) => { el.classList.toggle('urgent', live && r < 10); el.classList.toggle('ended', !live); });
     document.body.classList.toggle('is-ended', !live);
@@ -396,7 +400,7 @@ function renderFeeds(a) {
   // chain feed
   const cf = $('[data-feed=chain]');
   const rej = S.rejections.slice().reverse().slice(0, 6).map((r) => `<li class="chain-item bad"><b>Rejected</b> ${esc(r.reason)}<time>block ${r.height}</time></li>`);
-  const evs = Object.values(S.bids).filter((b) => b.auction === (a && a.id)).sort((x, y) => y.height - x.height).slice(0, 10).map((b) => `<li class="chain-item"><b>${esc(nameOfBid(b))} ${fmt(b.amount)}</b> · ${b.proofs.length} proofs locked 3-of-4 · DLEQ ok<time>block ${b.height} · ${b.id.slice(0, 10)}…</time></li>`);
+  const evs = Object.values(S.bids).filter((b) => b.auction === (a && a.id)).sort((x, y) => y.height - x.height).slice(0, 10).map((b) => `<li class="chain-item"><b>${esc(nameOfBid(b))} ${fmt(b.amount)}</b> · ${b.proofs.length} proofs locked to FROST key · DLEQ ok<time>block ${b.height} · ${b.id.slice(0, 10)}…</time></li>`);
   const ch = [`<li class="chain-item head">Height <b>${S.height}</b> · ${S.txCount} txs accepted · app hash agreed by ${new Set(NET.filter((v) => v.up && v.height === S.height).map((v) => v.appHash)).size === 1 ? NET.filter((v) => v.up && v.height === S.height).length : '–'} nodes</li>`, ...evs, ...rej].join('');
   if (cf._h !== ch) { cf.innerHTML = ch; cf._h = ch; }
 }
@@ -419,11 +423,11 @@ function renderNetwork() {
   const up = NET.filter((v) => v.up).length;
   const strip = NET.map((v) => `<button class="v-chip ${v.up ? 'on' : 'off'}" data-act="network"><i></i>${esc(v.name.replace('Validator ', 'V'))}<small>${v.up ? '#' + v.height : 'offline'}</small></button>`).join('');
   const vs = $('[data-slot=vstrip]'); if (vs._h !== strip) { vs.innerHTML = `<span class="muted">Consensus</span>${strip}`; vs._h = strip; }
-  setV('netsummary', `${up} of 4 validators online. Blocks need 3 signatures; escrow releases need 3 co-signers. ${up >= 3 ? 'The arena keeps running.' : 'Below threshold: the chain is paused until a validator returns.'}`);
+  setV('netsummary', `${up} of 4 validators online. Blocks need 3 signatures; escrow releases need a FROST signature from 3. ${up >= 3 ? 'The arena keeps running.' : 'Below threshold: the chain is paused until a validator returns.'}`);
   const cards = NET.map((v) => `<div class="v-card ${v.up ? 'on' : 'off'}"><div class="v-top"><i></i><b>${esc(v.name)}</b><button class="btn-ghost sm" data-act="${v.up || v.process ? 'v-stop' : 'v-start'}" data-i="${v.index}">${v.up || v.process ? 'Stop' : 'Start'}</button></div>
     <div class="v-meta"><span>Height <b>${v.height ?? '–'}</b></span><span>Peers <b>${v.peers ?? '–'}</b></span><span>App hash <b>${v.appHash ? v.appHash.slice(0, 10) : '–'}</b></span></div>
     <div class="v-sigs">${(v.signers || []).map((s, i) => `<span class="${s ? 'y' : 'n'}" title="Validator ${i + 1} ${s ? 'signed' : 'missing'}">V${i + 1}</span>`).join('')}<small>signed last block</small></div>
-    <div class="v-key">escrow key ${v.cashuPub ? v.cashuPub.slice(0, 18) + '…' : '–'}</div></div>`).join('');
+    <div class="v-key">${v.frostParticipant ? `FROST share ${v.frostParticipant} of 4 · group key ${v.groupKey.slice(0, 14)}…` : '–'}</div></div>`).join('');
   const vc = $('[data-slot=vcards]'); if (vc._h !== cards) { vc.innerHTML = cards; vc._h = cards; }
   const rj = S ? S.rejections.slice().reverse().slice(0, 12).map((r) => `<li class="lg pay"><span class="lg-type">Block ${r.height}</span><span class="lg-note">${esc(r.reason)}<time>${clock(r.time)} · ${esc(nameOfPub(r.pubkey || ''))}</time></span><b></b></li>`).join('') : '';
   const rb = $('[data-slot=rejections]'); const rh = rj || '<li class="empty">Nothing rejected yet.</li>'; if (rb._h !== rh) { rb.innerHTML = rh; rb._h = rh; }
@@ -436,7 +440,7 @@ function renderWallet() {
   const lh = W[n].ledger.slice(0, 30).map((l) => `<li class="lg ${l.type}"><span class="lg-type">${label[l.type]}</span><span class="lg-note">${esc(l.note)}<time>${clock(l.ts)}</time></span><b>${l.type === 'hold' ? '−' : '+'}${fmt(l.amount)}</b></li>`).join('') || '<li class="empty">No activity yet.</li>';
   const lb = $('[data-slot=ledger]'); if (lb._h !== lh) { lb.innerHTML = lh; lb._h = lh; }
   const es = S ? Object.values(S.bids).filter((b) => b.bidder === pk).sort((x, y) => y.height - x.height).slice(0, 12) : [];
-  const eh = es.map((b) => { const st = claimed.has(b.id) ? 'released' : b.status; return `<li class="lg ${st === 'leading' ? 'hold' : st === 'won' ? 'pay' : 'refund'}"><span class="lg-type">${{ leading: 'Leading', outbid: 'Refunding', lost: 'Refunding', won: 'Won', released: b.status === 'won' ? 'Paid' : 'Refunded' }[st]}</span><span class="lg-note">${esc(S.auctions[b.auction].title.slice(0, 30))}<time>block ${b.height} · ${b.proofs.length} proofs · 3-of-4</time></span><b>${fmt(b.amount)}</b></li>`; }).join('')
+  const eh = es.map((b) => { const st = claimed.has(b.id) ? 'released' : b.status; return `<li class="lg ${st === 'leading' ? 'hold' : st === 'won' ? 'pay' : 'refund'}"><span class="lg-type">${{ leading: 'Leading', outbid: 'Refunding', lost: 'Refunding', won: 'Won', released: b.status === 'won' ? 'Paid' : 'Refunded' }[st]}</span><span class="lg-note">${esc(S.auctions[b.auction].title.slice(0, 30))}<time>block ${b.height} · ${b.proofs.length} proofs · FROST 3-of-4</time></span><b>${fmt(b.amount)}</b></li>`; }).join('')
     + W[n].stranded.map((s) => `<li class="lg hold"><span class="lg-type">Stranded</span><span class="lg-note">Rejected bid · reclaim after<time>${clock(lockOf(s.locked[0])?.locktime || 0)}</time></span><b>${fmt(totalSats(s.locked))}</b></li>`).join('');
   const eb = $('[data-slot=escrows]'); const ehh = eh || '<li class="empty">No escrows.</li>'; if (eb._h !== ehh) { eb.innerHTML = ehh; eb._h = ehh; }
   setV('keys', `Nostr ${idPub(meId()).slice(0, 16)}… · wallet ${walletPub(meId()).slice(0, 18)}…`);
@@ -459,12 +463,12 @@ function outcomeHTML(a, tab) {
   }
   if (tab === 'seller') {
     return `<div class="o-hero sell"><span class="o-eyebrow">Seller view · ${esc(a.sellerName || 'Seller')}</span><h2>Sold for ${price} sats</h2><p>to <b>${wn}</b> · ${a.bids.length} bids from ${new Set(bidsOf(a).map((b) => b.bidder)).size} bidders · ${a.extensions} time extensions</p>
-      ${facts([['Hammer price', price], ['Escrow release', '3 of 4 co-signed'], ['Payout', claimed.has(a.winner) || role(a) !== 'seller' ? 'Released to wallet' : 'Settling…']])}</div>`;
+      ${facts([['Hammer price', price], ['Escrow release', 'FROST, 3 of 4'], ['Payout', claimed.has(a.winner) || role(a) !== 'seller' ? 'Released to wallet' : 'Settling…']])}</div>`;
   }
   const refunded = losers.filter((b) => claimed.has(b.id)).reduce((s, b) => s + b.amount, 0);
   const total = losers.reduce((s, b) => s + b.amount, 0);
   return `<div class="o-hero lose"><h2>Outbid this time</h2><p>${wn} won at <b>${price} sats</b>. ${losers.length} losing bids.</p>
-    <div class="refund-card"><span class="rf-ico">↩</span><div><b>${fmt(total)} sats in losing escrows · ${fmt(refunded)} returned by this browser's users</b><small>Each refund is co-signed by 3 of the 4 validators the moment a bid is beaten. If validators vanish, bidders reclaim alone after locktime.</small></div></div></div>`;
+    <div class="refund-card"><span class="rf-ico">↩</span><div><b>${fmt(total)} sats in losing escrows · ${fmt(refunded)} returned by this browser's users</b><small>Each refund is one FROST signature made by 3 of the 4 validators the moment a bid is beaten. If validators vanish, bidders reclaim alone after locktime.</small></div></div></div>`;
 }
 function openOutcome(tab) {
   const a = currentLot();
@@ -621,6 +625,13 @@ document.addEventListener('submit', async (e) => {
 })();
 
 // ---------- boot ----------
+// Move any pre-Coco (v0.1) local proofs into each user's Coco wallet, then read balances.
+for (const n of USERS) {
+  if (W[n].proofs?.length) { try { await api.receive(ids[n], W[n].proofs); } catch (e) { console.warn('migrate', n, e.message); } }
+  delete W[n].proofs;
+}
+saveW();
+await Promise.all(USERS.map((n) => refreshBal(n).catch(() => 0)));
 renderUsers();
 requestAnimationFrame(renderFrame);
 await pollNet();
