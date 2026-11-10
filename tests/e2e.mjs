@@ -91,12 +91,27 @@ ok(await bal(alice) === 1000 && r1.cosigners.length === 3, `Alice refunded 100 i
 ok(/^[0-9a-f]{128}$/.test(r1.signature), 'release is one 64-byte BIP-340 signature');
 await expectReject(c.claim(alice, s.bids[b1.id], 'refund', s.params), /already spent|spent/i, 'second refund of the same escrow rejected by mint');
 await expectReject(placeBid(carol, A, 115), /at least 120/, 'under-increment bid stopped by the client before locking');
-await expectReject(placeBid(carol, A, 115, true), /at least 120/, 'under-increment bid rejected by validators (sats were locked)');
-await expectReject((async () => { const st = await c.state(); return c.bid(seller, st.auctions[A], 500, []); })(), /seller cannot bid/, 'seller cannot bid on own lot');
+{
+  // v0.4.0 (ADR 0007): a locked bid that lost the race is recorded as void
+  // and refunded at once, instead of staying locked until locktime
+  const st = await c.state();
+  const { locked } = await c.lockForBid(carol, 115, st.params, st.auctions[A], { force: true, state: st });
+  const r = await c.bid(carol, st.auctions[A], 115, locked);
+  ok(r.ok && /at least 120/.test(r.late || ''), `under-increment locked bid answered at once as late -> "${r.late}"`);
+  const sv = await until(async () => { const x = await c.state(); return x.bids[r.id] && x; }, 15000, 'void bid commit');
+  ok(sv.bids[r.id].status === 'void' && !sv.auctions[A].bids.includes(r.id) && sv.auctions[A].highBid === b2.id, 'recorded on chain as void; Bob still leads');
+  await until(async () => (await c.network()).filter((v) => v.up).every((v) => v.height >= sv.bids[r.id].height), 15000, 'all validators at the void block');
+  const rv = await c.claim(carol, sv.bids[r.id], 'refund', sv.params);
+  ok(await bal(carol) === 1000 && rv.cosigners.length === 3, `Carol's late 115 refunded at once by ${rv.cosigners.join(', ')}`);
+  const v = await c.view([idPub(carol)]);
+  ok(v.state.bids[r.id]?.status === 'void' && !(await c.view([idPub(alice)])).state.bids[r.id], "the void bid is in Carol's view only");
+}
+await expectReject((async () => { const st = await c.state(); return c.bid(seller, st.auctions[A], 500, []); })(), /proof count/, 'a bid without an escrow is refused outright');
 
 step(4, 'Late bid extends the clock (anti-sniping)');
 s = await c.state();
-await until(async () => { const st = await c.state(); return st.auctions[A].endAt - st.time < st.params.softCloseSec; }, 30000, 'soft-close window');
+// wall clock: with blocks on demand the last block's time can be old
+await until(async () => { const st = await c.state(); return st.auctions[A].endAt - Date.now() / 1000 < st.params.softCloseSec - 2; }, 30000, 'soft-close window');
 const endBefore = (await c.state()).auctions[A].endAt;
 const b3 = await placeBid(carol, A, 200);
 ok(b3.state.bids[b3.id].extended && b3.state.auctions[A].endAt > endBefore, `end moved ${endBefore} -> ${b3.state.auctions[A].endAt}`);
@@ -105,10 +120,10 @@ ok(b3.state.auctions[A].endAt <= b3.state.auctions[A].hardEnd, 'extension capped
 step(5, 'Stop Validator 4; bidding continues on 3 of 4');
 await c.j('/api/admin/validator/4/stop', { method: 'POST' });
 const h0 = (await c.state()).height;
-await until(async () => (await c.state()).height >= h0 + 2, 20000, 'blocks with V4 down');
-const net1 = await c.network();
-ok(!net1[3].up && net1.slice(0, 3).every((v) => v.up), 'V4 down, V1-V3 producing blocks');
+await until(async () => { const n = await c.network(); return !n[3].up && n; }, 10000, 'V4 down');
 const b4 = await placeBid(alice, A, 250);
+const net1 = await c.network();
+ok(!net1[3].up && net1.slice(0, 3).every((v) => v.up && v.height >= b4.state.bids[b4.id].height), 'V4 down, V1-V3 commit the next bid');
 ok(b4.state.auctions[A].highBid === b4.id, 'Alice leads at 250 with only 3 validators');
 s = b4.state;
 const r3 = await c.claim(carol, s.bids[b3.id], 'refund', s.params);
@@ -116,7 +131,9 @@ ok(!r3.cosigners.includes('Validator 4') && r3.cosigners.length === 3, 'Carol re
 
 step(6, 'Auction auto-closes; validators agree on the winner');
 s = await until(async () => { const st = await c.state(); return st.auctions[A].status === 'closed' && st; }, 200000, 'close');
+const lateBy = Date.now() / 1000 - s.auctions[A].endAt;
 ok(s.auctions[A].winner === b4.id && s.bids[b4.id].status === 'won', 'Alice wins at 250');
+ok(lateBy < 4 && s.auctions[A].closedAt - s.auctions[A].endAt <= 2, `closed by the validators' close txs ${lateBy.toFixed(1)} s after the end (block time +${s.auctions[A].closedAt - s.auctions[A].endAt} s)`);
 // compare app hashes at one height (validators can be a block apart for a moment)
 const net2 = await until(async () => { const n = (await c.network()).filter((v) => v.up); return n.every((v) => v.height === n[0].height) && n; }, 20000, 'validators at one height');
 const hashes = new Set(net2.map((v) => v.appHash));
@@ -143,6 +160,37 @@ const fullB2 = await c.bidWithProofs(b2.id);
 ok(JSON.stringify(fullB2.proofs) === JSON.stringify(s.bids[b2.id].proofs), '/api/bid returns the committed proofs for one bid');
 await expectReject(c.bidWithProofs('ZZ'), /64 lowercase hex/, '/api/bid rejects a malformed id');
 await expectReject(c.bidWithProofs('0'.repeat(64)), /no such bid/, '/api/bid 404 for an unknown bid');
+
+step('P', 'Push (v0.4.0): blocks on demand, and /api/events says when one commits');
+{
+  const hIdle = (await c.network())[0].height;
+  await sleep(4000);
+  ok((await c.network())[0].height <= hIdle + 1, `idle chain makes no blocks (height ${hIdle})`);
+  const ac = new AbortController();
+  const res = await fetch(BASE + '/api/events', { signal: ac.signal, headers: { 'accept-encoding': 'gzip' } });
+  ok(res.status === 200 && /text\/event-stream/.test(res.headers.get('content-type')) && !res.headers.get('content-encoding'), 'event stream opens, not gzipped');
+  const rd = res.body.getReader();
+  let buf = '';
+  const nextEvent = async (ms) => {
+    const t0 = Date.now();
+    for (;;) {
+      const m = buf.match(/data: (\{[^\n]*\})\n\n/);
+      if (m) { buf = buf.slice(buf.indexOf(m[0]) + m[0].length); return JSON.parse(m[1]); }
+      if (Date.now() - t0 > ms) return null;
+      const { value, done } = await Promise.race([rd.read(), sleep(ms).then(() => ({}))]);
+      if (done) return null;
+      if (value) buf += new TextDecoder().decode(value);
+    }
+  };
+  const e0 = await nextEvent(3000);
+  ok(e0 && e0.h >= hIdle && Math.abs(e0.now - Date.now()) < 2000, `first event carries height ${e0?.h} and the wall clock`);
+  const t1 = Date.now();
+  const lot = await c.createAuction(seller, { title: 'push probe', description: '', image: '', category: 'Art', startPrice: 10, minIncrement: 1, durationSec: 20 });
+  const e1 = await nextEvent(5000);
+  ok(e1 && e1.h > e0.h, `a commit is pushed ${Date.now() - t1} ms after the tx (height ${e1?.h})`);
+  ok(!!lot.id, 'probe lot listed');
+  ac.abort();
+}
 
 step('W', "Mint WebSocket (v0.3.2): Coco's NUT-17 updates upgrade and stay open");
 const ws = await upgrade('/mint/v1/ws');
@@ -183,7 +231,7 @@ const st0 = await c.state();
 // reclaim wait is only exercised when the chain was initialised with a short one.
 const longMargin = st0.params.lockMarginSec > 120;
 let pendingReclaim = 0;
-if (longMargin) {
+if (longMargin && stranded.length) {
   for (const { locked } of stranded) pendingReclaim += totalSats(locked);
   await expectReject(c.reclaimExpired(stranded[0].u, stranded[0].locked, st0.params), /.+/, 'reclaim before locktime refused by mint');
   console.log(`  lock margin ${st0.params.lockMarginSec}s: skipping the locktime wait (${pendingReclaim} sats stay locked until then)`);

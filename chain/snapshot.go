@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	snapshotFormat = 1
+	snapshotFormat = 2 // v0.4.0: canonical state (height/time zero) + "time"
 	snapshotsKept  = 2
 	maxSnapshotB   = 256 << 20 // refuse absurd files rather than exhaust memory
 )
@@ -40,12 +40,14 @@ const (
 type snapshotFile struct {
 	Format  int             `json:"format"`
 	Height  int64           `json:"height"`
+	Time    int64           `json:"time"`
 	AppHash string          `json:"appHash"`
 	State   json.RawMessage `json:"state"`
 }
 
 type snapshot struct {
 	height  int64
+	time    int64
 	appHash []byte
 	raw     []byte // canonical state JSON, as hashed
 	state   *State
@@ -65,7 +67,14 @@ func snapshotName(h int64) string { return strconv.FormatInt(h, 10) + ".json" }
 // write stores one snapshot atomically: temp file, fsync, rename, fsync dir.
 // raw is never modified after Commit publishes it, so it can be written from
 // another goroutine without copying.
-func (s *snapshotter) write(h int64, appHash, raw []byte) error {
+// lastHeight is the newest snapshot written (or restored).
+func (s *snapshotter) lastHeight() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.last
+}
+
+func (s *snapshotter) write(h, t int64, appHash, raw []byte) error {
 	if h <= 0 || len(raw) == 0 {
 		return nil
 	}
@@ -83,7 +92,7 @@ func (s *snapshotter) write(h int64, appHash, raw []byte) error {
 	}
 	defer os.Remove(tmp.Name()) // no-op after a successful rename
 	var head bytes.Buffer
-	fmt.Fprintf(&head, `{"format":%d,"height":%d,"appHash":"%s","state":`, snapshotFormat, h, hex.EncodeToString(appHash))
+	fmt.Fprintf(&head, `{"format":%d,"height":%d,"time":%d,"appHash":"%s","state":`, snapshotFormat, h, t, hex.EncodeToString(appHash))
 	for _, b := range [][]byte{head.Bytes(), raw, []byte("}\n")} {
 		if _, err := tmp.Write(b); err != nil {
 			tmp.Close()
@@ -196,14 +205,11 @@ func readSnapshot(path string, wantHeight int64) (*snapshot, error) {
 	if err := json.Unmarshal(f.State, st); err != nil {
 		return nil, fmt.Errorf("state: %w", err)
 	}
-	re, _ := json.Marshal(st)
-	if !bytes.Equal(re, f.State) {
+	if !bytes.Equal(st.canonical(), f.State) {
 		return nil, errors.New("state is not canonical (re-encodes differently)")
 	}
-	if st.Height != f.Height {
-		return nil, fmt.Errorf("state height %d, file height %d", st.Height, f.Height)
-	}
-	return &snapshot{height: f.Height, appHash: want, raw: []byte(f.State), state: st}, nil
+	st.Height, st.Time = f.Height, f.Time
+	return &snapshot{height: f.Height, time: f.Time, appHash: want, raw: []byte(f.State), state: st}, nil
 }
 
 // chainRecord is what the chain itself says the app hash after height h was:
@@ -277,13 +283,13 @@ func (a *App) restore(s *snapshot) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.st = s.state
-	a.committed, a.committedH, a.appHash = s.raw, s.height, s.appHash
+	a.committed, a.committedH, a.committedT, a.appHash = s.raw, s.height, s.time, s.appHash
 	a.committedHash = s.appHash
 }
 
 // committedSnapshot is the latest committed height, hash and bytes.
-func (a *App) committedSnapshot() (int64, []byte, []byte) {
+func (a *App) committedSnapshot() (int64, int64, []byte, []byte) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.committedH, a.committedHash, a.committed
+	return a.committedH, a.committedT, a.committedHash, a.committed
 }

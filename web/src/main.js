@@ -141,6 +141,8 @@ function currentLot() {
   ui.lot = a && a.id; ui.pinned = false;
   return a;
 }
+// outbid and lost bids are refunded; so are late ("void") ones (ADR 0007)
+const refundable = (b) => b.status === 'outbid' || b.status === 'lost' || b.status === 'void';
 const proofsOf = (b) => b.proofCount ?? b.proofs?.length ?? 0;
 const bidsOf = (a) => (a ? a.bids.map((id) => S.bids[id]) : []);
 const minNext = (a) => (a.highBid ? a.highAmount + a.minIncrement : a.startPrice);
@@ -149,7 +151,7 @@ const remaining = (a) => Math.max(0, a.endAt - chainNow());
 function heldBy(n) {
   if (!S) return 0;
   const pk = idPub(ids[n]);
-  return Object.values(S.bids).filter((b) => b.bidder === pk && (b.status === 'leading' || ((b.status === 'outbid' || b.status === 'lost') && !claimed.has(b.id)))).reduce((s, b) => s + b.amount, 0)
+  return Object.values(S.bids).filter((b) => b.bidder === pk && (b.status === 'leading' || (refundable(b) && !claimed.has(b.id)))).reduce((s, b) => s + b.amount, 0)
     + W[n].stranded.reduce((s, x) => s + totalSats(x.locked), 0);
 }
 function role(a, n = ui.me) {
@@ -207,7 +209,14 @@ async function placeBid(n, a, amount, { quiet = false, auto = false, steps = nul
     const { locked } = await api.lockForBid(id, amount, fresh.params, fa, { state: fresh });
     try {
       const r = await api.bid(id, fa, amount, locked);
-      onSent?.(amount);
+      onSent?.(amount, r);
+      if (r.late) {
+        // on chain as a void bid: the validators refund it as soon as it lands
+        ledger(n, 'hold', amount, `Too late (${r.late}) · refund on its way`);
+        saveW(); refreshBal(n).catch(() => {});
+        if (n === ui.me && !quiet) toast(`Too late: ${esc(r.late)} · your ${fmt(amount)} sats come straight back`, 'danger');
+        return { ok: false, late: true, reason: r.late };
+      }
       ledger(n, 'hold', amount, `Locked to the validators' FROST key · ${short(fa.title, 30)}`);
       saveW(); refreshBal(n).catch(() => {});
       if (!quiet || n === ui.me) burst();
@@ -239,6 +248,7 @@ function tapBid(intent, el) {
   const a = currentLot();
   if (!a || a.status !== 'open') return;
   humanAt = Date.now();
+  intent = { ...intent, t0: performance.now() };
   navigator.vibrate?.(10);
   pulse(el, 'hit');
   if (role(a) === 'seller') return toast("You're the seller of this lot", 'danger');
@@ -253,15 +263,24 @@ async function humanBid(intent, el) {
   const a = S && S.auctions[intent.lot];
   if (!a) return;
   const shown = intent.amount ?? stepAmt(a, intent.steps);
-  pending = { lot: a.id, amount: shown, state: 'sending', at: Date.now() };
+  const t0 = intent.t0 ?? performance.now();
+  const tm = { t0, amount: shown, at: Date.now() };
+  timing.unshift(tm); timing.length = Math.min(timing.length, 20);
+  pending = { lot: a.id, amount: shown, state: 'sending', at: Date.now(), tm };
   el?.classList.add('sending');
   renderFeeds(currentLot());
+  requestAnimationFrame(() => { tm.shown = performance.now() - t0; renderTimings(); });
   const r = await placeBid(ui.me, a, intent.amount ?? 0, {
     steps: intent.amount == null ? intent.steps : null,
     maxAmount: shown + 2 * a.minIncrement,
     onAmount: (amt) => { if (pending) pending.amount = amt; },
-    onSent: (amt) => { if (pending) Object.assign(pending, { amount: amt, state: 'sent', at: Date.now() }); renderFeeds(currentLot()); },
+    onSent: (amt, res) => {
+      tm.amount = amt; tm.accepted = performance.now() - t0; tm.late = res?.late; tm.id = res?.id;
+      if (pending) Object.assign(pending, { amount: amt, state: 'sent', at: Date.now(), id: res?.id });
+      renderFeeds(currentLot()); renderTimings();
+    },
   });
+  if (!r.ok && !r.late) { tm.failed = r.reason; renderTimings(); }
   el?.classList.remove('sending');
   humanAt = Date.now();
   if (r.ok) pulse(el, 'done');
@@ -272,7 +291,8 @@ async function humanBid(intent, el) {
 function reconcilePending() {
   if (pending) {
     const a = S.auctions[pending.lot];
-    const landed = a && bidsOf(a).some((b) => b.bidder === mePub() && b.amount === pending.amount);
+    const landed = (pending.id && S.bids[pending.id]) || (a && bidsOf(a).some((b) => b.bidder === mePub() && b.amount === pending.amount));
+    if (landed && pending.tm && pending.tm.chain == null) { pending.tm.chain = performance.now() - pending.tm.t0; renderTimings(); }
     if (landed || !a || a.status !== 'open' || (pending.state === 'sent' && Date.now() - pending.at > 10000)) pending = null;
   }
   if (pending || !queued || busy.has('bid:' + ui.me)) return;
@@ -296,7 +316,7 @@ async function settleLoop() {
       if (claimed.has(b.id) || busy.has('c:' + b.id)) continue;
       const au = S.auctions[b.auction];
       let purpose = null;
-      if (b.bidder === pk && (b.status === 'outbid' || b.status === 'lost')) purpose = 'refund';
+      if (b.bidder === pk && refundable(b)) purpose = 'refund';
       if (au.seller === pk && b.status === 'won' && au.sellerWallet === walletPub(ids[n])) purpose = 'payout';
       if (!purpose) continue;
       busy.add('c:' + b.id);
@@ -308,7 +328,7 @@ async function settleLoop() {
           ledger(n, 'refund', b.amount, `Refund · FROST signature by ${who}`);
           if (n === ui.me) {
             const by = au.highBid && S.bids[au.highBid] ? nameOfBid(S.bids[au.highBid]) : 'the winner';
-            toast(b.status === 'outbid' ? `Outbid by <b>${esc(by)}</b> · ${fmt(b.amount)} sats refunded by ${who}` : `${fmt(b.amount)} sats returned · signed by ${who}`, 'danger', b.status === 'outbid' && au.status === 'open' ? ['Bid again', 'bid-next'] : null);
+            toast(b.status === 'void' ? `Late bid · ${fmt(b.amount)} sats refunded by ${who}` : b.status === 'outbid' ? `Outbid by <b>${esc(by)}</b> · ${fmt(b.amount)} sats refunded by ${who}` : `${fmt(b.amount)} sats returned · signed by ${who}`, 'danger', b.status === 'outbid' && au.status === 'open' ? ['Bid again', 'bid-next'] : null);
             flyCoins($('.c-price'));
           }
         } else {
@@ -532,7 +552,7 @@ function renderWallet() {
   const lh = W[n].ledger.slice(0, 30).map((l) => `<li class="lg ${l.type}"><span class="lg-type">${label[l.type]}</span><span class="lg-note">${esc(l.note)}<time>${clock(l.ts)}</time></span><b>${l.type === 'hold' ? '−' : '+'}${fmt(l.amount)}</b></li>`).join('') || '<li class="empty">No activity yet.</li>';
   const lb = $('[data-slot=ledger]'); if (lb._h !== lh) { lb.innerHTML = lh; lb._h = lh; }
   const es = S ? Object.values(S.bids).filter((b) => b.bidder === pk).sort((x, y) => y.height - x.height).slice(0, 12) : [];
-  const eh = es.map((b) => { const st = claimed.has(b.id) ? 'released' : b.status; return `<li class="lg ${st === 'leading' ? 'hold' : st === 'won' ? 'pay' : 'refund'}"><span class="lg-type">${{ leading: 'Leading', outbid: 'Refunding', lost: 'Refunding', won: 'Won', released: b.status === 'won' ? 'Paid' : 'Refunded' }[st]}</span><span class="lg-note">${esc(S.auctions[b.auction].title.slice(0, 30))}<time>block ${b.height} · ${proofsOf(b)} proofs · FROST 3-of-4</time></span><b>${fmt(b.amount)}</b></li>`; }).join('')
+  const eh = es.map((b) => { const st = claimed.has(b.id) ? 'released' : b.status; return `<li class="lg ${st === 'leading' ? 'hold' : st === 'won' ? 'pay' : 'refund'}"><span class="lg-type">${{ leading: 'Leading', outbid: 'Refunding', lost: 'Refunding', void: 'Too late', won: 'Won', released: b.status === 'won' ? 'Paid' : 'Refunded' }[st]}</span><span class="lg-note">${esc(S.auctions[b.auction].title.slice(0, 30))}<time>block ${b.height} · ${proofsOf(b)} proofs · FROST 3-of-4</time></span><b>${fmt(b.amount)}</b></li>`; }).join('')
     + W[n].stranded.map((s) => `<li class="lg hold"><span class="lg-type">Stranded</span><span class="lg-note">Rejected bid · reclaim after<time>${clock(lockOf(s.locked[0])?.locktime || 0)}</time></span><b>${fmt(totalSats(s.locked))}</b></li>`).join('');
   const eb = $('[data-slot=escrows]'); const ehh = eh || '<li class="empty">No escrows.</li>'; if (eb._h !== ehh) { eb.innerHTML = ehh; eb._h = ehh; }
   setV('keys', `Nostr ${idPub(meId()).slice(0, 16)}… · wallet ${walletPub(meId()).slice(0, 18)}…`);
@@ -611,6 +631,34 @@ function onNewState(prev) {
   firstState = false;
 }
 
+// ---------- timings (Network drawer) ----------
+const timing = []; // last 20 of your bids: ms from tap to shown / accepted / in a block
+let rtt = 0;       // smoothed round trip to the gateway, ms
+function renderTimings() {
+  const ms = (v) => (v == null ? '…' : v < 1000 ? Math.round(v) + ' ms' : (v / 1000).toFixed(1) + ' s');
+  const h = timing.map((t) => `<li class="lg ${t.failed ? 'pay' : t.late ? 'refund' : 'hold'}"><span class="lg-type">${fmt(t.amount)}</span><span class="lg-note">${t.failed ? esc(short(t.failed, 40)) : t.late ? 'Too late · refunded' : 'Bid'}<time>shown ${ms(t.shown)} · accepted ${t.failed ? '–' : ms(t.accepted)} · in block ${t.failed ? '–' : ms(t.chain)}</time></span><b>${clock(t.at / 1000)}</b></li>`).join('')
+    || '<li class="empty">Bid and the timings show here.</li>';
+  const box = $('[data-slot=timings]'); if (box && box._h !== h) { box.innerHTML = h; box._h = h; }
+  setV('pushmode', push.open ? `pushed the moment a block commits · round trip ${Math.round(rtt)} ms` : `polled every second · round trip ${Math.round(rtt)} ms`);
+}
+
+// ---------- push (ADR 0007) ----------
+// The gateway says "new block" over Server-Sent Events; the page then reads
+// the state at once. Polling stays as the fallback, slowed while push works.
+const push = { open: false, h: 0, es: null };
+function startPush() {
+  if (typeof EventSource === 'undefined') return;
+  const es = new EventSource(base + '/api/events');
+  push.es = es;
+  es.onopen = () => { push.open = true; renderTimings(); };
+  es.onerror = () => { push.open = false; renderTimings(); }; // the browser retries by itself
+  es.onmessage = (m) => {
+    let d; try { d = JSON.parse(m.data); } catch { return; }
+    if (d.now) offsetMs = d.now - Date.now();
+    if (d.h > push.h) { push.h = d.h; if (S) S.height = Math.max(S.height, d.h); pollState(); }
+  };
+}
+
 // ---------- polling ----------
 let stateTag = '';
 let polling = false;
@@ -618,6 +666,7 @@ let polling = false;
 // its block commits (~1 s) instead of up to a poll later. 304s cost no body.
 let burstUntil = 0;
 function burst(ms = 3000) {
+  if (push.open) return; // blocks are pushed
   const first = burstUntil < Date.now();
   burstUntil = Date.now() + ms;
   if (first) (async function tick() { await pollState(); if (Date.now() < burstUntil) setTimeout(tick, 250); })();
@@ -627,11 +676,16 @@ async function pollState() {
   polling = true;
   try {
     const prev = S;
+    const q0 = performance.now();
     const r = await api.view(USERS.map((n) => idPub(ids[n])), stateTag);
+    rtt = rtt ? rtt * 0.7 + (performance.now() - q0) * 0.3 : performance.now() - q0;
     if (!r) { renderFeeds(currentLot()); return; } // unchanged: the frame loop keeps the clocks moving
     S = r.state; stateTag = r.etag;
     if (NET.length) S.height = Math.max(S.height, ...NET.map((v) => v.height || 0));
-    offsetMs = S.time * 1000 + 500 - Date.now();
+    // the validator's wall clock, not the last block's time: with blocks on
+    // demand the last block can be a minute old (ADR 0003 §1)
+    offsetMs = S.now ? S.now + rtt / 2 - Date.now() : S.time * 1000 + 500 - Date.now();
+    for (const tm of timing) if (tm.id && tm.chain == null && S.bids[tm.id]) { tm.chain = performance.now() - tm.t0; renderTimings(); }
     onNewState(prev);
     reconcilePending();
     const a = currentLot();
@@ -746,7 +800,9 @@ requestAnimationFrame(renderFrame);
 await pollNet();
 await pollState();
 await seedIfEmpty();
-setInterval(pollState, 1000);
+startPush();
+(function fallback() { pollState(); setTimeout(fallback, push.open ? 5000 : 1000); })();
+renderTimings();
 setInterval(pollNet, 2000);
 setInterval(pollChat, 2500);
 setInterval(() => settleLoop().catch(() => {}), 1500);
