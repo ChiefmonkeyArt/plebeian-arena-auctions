@@ -1,5 +1,5 @@
 ---
-status: proposed (§2 accepted and implemented in v0.3.3; §1, §3, §4, §5 still proposed)
+status: proposed (§2 accepted in v0.3.3; §1 and §4 accepted in v0.4.0; §3 and §5 still proposed)
 ---
 
 # ADR 0003: Block growth, state snapshots and pruning
@@ -36,6 +36,14 @@ As of v0.3.0 (`chain/node.go`, `chain/app.go`):
 - **Correctness does not depend on this.** A bid in a block whose time is at or after `EndAt` is already rejected, so a late close only delays the status change; it cannot change the winner. Refunds and payouts need `closed`, so close latency is bounded by the close transaction, with the heartbeat as a fallback.
 - **Expected effect:** about 1,440 blocks a day at idle, plus one block per burst of activity, instead of 86,400.
 
+**Implemented in v0.4.0** (`chain/app.go`, `chain/node.go`, chain `FORMAT` 4). Differences from the text above, found while building it:
+
+- **The app hash no longer covers height and time.** CometBFT makes an extra block whenever the app hash changed (`needProofBlock`), and the state's `height` and `time` fields changed every block, so an idle chain would never have stopped. They are now hashed as zero; the published state (`/state`, `/api/state`, snapshots) still carries the real values. The snapshot file format went to `2` and adds `time`.
+- **Block time is the proposer's clock (PBTS).** With the default BFT time a block after an idle minute is stamped with the median of the previous votes, which can be up to a minute old. That would close lots late and could let a late bid in. Genesis now sets `feature.pbts_enable_height = 1`: each validator checks the proposer's time against its own clock (precision 505 ms (CometBFT default) and message delay 2 s (default 15 s), which bounds how far a dishonest proposer can backdate a block to about 2.5 s). On separate servers the validators need NTP.
+- **Each validator sends the close transaction itself**, not the gateway: a 250 ms timer, once a second per due lot, to its own RPC. The format is `close:<auction id>:<endAt>:<unix seconds>`. The timestamp makes each second's copy unique (the mempool cache drops repeats). CheckTx refuses it unless that auction is open, still ends at `endAt`, `endAt` has passed on that validator's clock, and the timestamp is under 30 s old. The gateway's `/api/tx` takes only JSON, so the public cannot send one. FinalizeBlock treats it as a no-op: `closeDue` runs at the start of every block.
+- **A bid that arrives after the end is void, not rejected** (ADR 0007): it is recorded and refunded at once.
+- `TimeoutCommit` went from 1 s to 300 ms. With no empty blocks to pace, a bid now waits only for its own block. Measured locally: a lot closed 0.3 s after `EndAt` on an idle chain, with block time equal to `EndAt`; the e2e run of 55 checks ended at height 19, where v0.3.4 made about 300 blocks.
+
 ### 2. State snapshots on disk
 
 - Every `SnapshotEvery` blocks (default 1,000) and on clean shutdown, a validator writes its committed state to `vN/data/app-state/<height>.json`. Each file holds the canonical JSON that `hash()` covers, plus the height and app hash. Writes are atomic: a temp file, `fsync`, then rename.
@@ -67,6 +75,11 @@ As of v0.3.0 (`chain/node.go`, `chain/app.go`):
 - Both are configurable: `-retain-blocks` (0 means keep everything, for anyone who wants a full archive node) and `-snapshot-every`.
 - `TxIndex.Indexer = "null"`, because nothing queries it; the gateway reads state and the ledger archive. `Storage.DiscardABCIResponses = true`.
 
+**Implemented in v0.4.0** (`chain/ledger.go`). Differences:
+
+- **Each validator writes its own archive**, `vN/data/ledger.jsonl`, not the gateway: one line per transaction it executed (`ok`, `void` or `rejected`, with height, block time, kind, event id, reason, and the signed event for accepted ones). It is written and `fsync`ed at Commit, so a line is on disk long before its block can be pruned. On restart, blocks replayed below the last archived height are skipped, and a torn last line is cut. The four files are byte-identical (checked locally), so any one of them is the record, and they can be compared.
+- `-retain-blocks` (default 100,000) is a node flag. Pruning starts only once the newest snapshot is more than that many blocks in.
+
 ### 5. Trimming the state
 
 - A closed auction, and all its bids, move from live state into the ledger archive once every bid on it is settled (refunded or paid out) or its locktime has passed. Settled means a validator has co-signed the release, which is recorded in a new deterministic `Settled` mark set by a "settle" transaction from the coordinator.
@@ -84,7 +97,7 @@ As of v0.3.0 (`chain/node.go`, `chain/app.go`):
 
 ## Consequences
 
-- **Format change.** `chainFormat` goes to `4`. The Suite's `arena init -if-needed` re-creates older chains (fake sats, as before).
+- **Format change.** `chainFormat` goes to `4` (done in v0.4.0). The Suite's `arena init -if-needed` re-creates older chains (fake sats, as before).
 - **New moving parts:** the close transaction, the settle transaction, snapshot files and the ledger archive. Each needs tests, at least:
   - a close happens within a few seconds of `EndAt` while the chain is idle;
   - a restart from a snapshot ends at the same app hash as a replay from genesis;

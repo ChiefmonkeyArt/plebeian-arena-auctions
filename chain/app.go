@@ -4,6 +4,7 @@ package main
 // AppHash (sha256 of the canonical JSON state) proves they agree.
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -12,8 +13,10 @@ import (
 	"log"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	abci "github.com/cometbft/cometbft/abci/types"
 )
@@ -55,7 +58,8 @@ type Auction struct {
 	HighAmount   int64    `json:"highAmount"`
 	Bids         []string `json:"bids"`
 	Extensions   int      `json:"extensions"`
-	Winner       string   `json:"winner"` // bid id
+	Winner       string   `json:"winner"`          // bid id
+	Voids        []string `json:"voids,omitempty"` // late bids, refundable at once (ADR 0007)
 	ClosedAt     int64    `json:"closedAt"`
 	ClosedH      int64    `json:"closedHeight"`
 }
@@ -71,7 +75,7 @@ type Bid struct {
 	Locktime int64   `json:"locktime"`
 	Height   int64   `json:"height"`
 	Time     int64   `json:"time"`
-	Status   string  `json:"status"` // leading | outbid | won | lost
+	Status   string  `json:"status"` // leading | outbid | won | lost | void
 	Extended bool    `json:"extended"`
 }
 
@@ -84,6 +88,10 @@ type Rejection struct {
 	Reason string `json:"reason"`
 }
 
+// Height and Time are kept in memory and published, but hashed as zero
+// (canonical): an empty block then leaves the app hash unchanged, so
+// CometBFT does not need a block to prove it (ADR 0003 §1). They must stay
+// the first two fields: publish() rewrites that prefix.
 type State struct {
 	Height     int64               `json:"height"`
 	Time       int64               `json:"time"`
@@ -100,19 +108,48 @@ func newState() *State {
 	return &State{Auctions: map[string]*Auction{}, Bids: map[string]*Bid{}, UsedY: map[string]string{}, Rejections: []Rejection{}, Order: []string{}}
 }
 
+// canonical is the hashed encoding: the state with Height and Time zeroed.
+// Go sorts map keys, so it is deterministic.
+func (s *State) canonical() []byte {
+	c := *s
+	c.Height, c.Time = 0, 0
+	b, _ := json.Marshal(&c)
+	return b
+}
+
 func (s *State) hash() []byte {
-	b, _ := json.Marshal(s) // Go sorts map keys: canonical
-	h := sha256.Sum256(b)
+	h := sha256.Sum256(s.canonical())
 	return h[:]
+}
+
+const canonPrefix = `{"height":0,"time":0,`
+
+// publish turns canonical bytes into the published state by filling in the
+// height and time.
+func publish(canon []byte, h, t int64) []byte {
+	if !bytes.HasPrefix(canon, []byte(canonPrefix)) {
+		return canon
+	}
+	out := make([]byte, 0, len(canon)+24)
+	out = append(out, `{"height":`...)
+	out = strconv.AppendInt(out, h, 10)
+	out = append(out, `,"time":`...)
+	out = strconv.AppendInt(out, t, 10)
+	out = append(out, ',')
+	return append(out, canon[len(canonPrefix):]...)
 }
 
 type App struct {
 	abci.BaseApplication
 	mu         sync.RWMutex
 	st         *State
-	committed  []byte // JSON snapshot of last committed state
-	committedH int64  // height of that snapshot
-	pending    []byte // snapshot made in FinalizeBlock, published at Commit
+	committed  []byte  // canonical JSON of the last committed state (Height, Time zero)
+	committedH int64   // height of that snapshot
+	committedT int64   // its block time
+	pending    []byte  // snapshot made in FinalizeBlock, published at Commit
+	ledger     *ledger // per-block tx archive (ADR 0003 §4); nil in tests
+	retain     int64   // keep this many blocks below the newest snapshot; 0 keeps all
+	pendLines  []ledgerLine
 	appHash    []byte
 	// hash of committed; Info reports it with committedH (ADR 0003 §2)
 	committedHash []byte
@@ -121,10 +158,11 @@ type App struct {
 
 func NewApp() *App { return &App{st: newState()} }
 
+// Snapshot is the published committed state (with its height and time).
 func (a *App) Snapshot() []byte {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.committed
+	return publish(a.committed, a.committedH, a.committedT)
 }
 
 func (a *App) Read(f func(s *State)) {
@@ -138,7 +176,7 @@ func (a *App) Info(context.Context, *abci.InfoRequest) (*abci.InfoResponse, erro
 	defer a.mu.RUnlock()
 	// The committed height and hash: 0 on a fresh start (CometBFT replays
 	// from genesis), or a restored snapshot's (it replays only what follows).
-	return &abci.InfoResponse{Data: "arena-auctions", Version: "0.3.4", AppVersion: 1,
+	return &abci.InfoResponse{Data: "arena-auctions", Version: "0.4.0", AppVersion: 1,
 		LastBlockHeight: a.committedH, LastBlockAppHash: a.committedHash}, nil
 }
 
@@ -149,7 +187,7 @@ func (a *App) InitChain(_ context.Context, req *abci.InitChainRequest) (*abci.In
 	if err := json.Unmarshal(req.AppStateBytes, &a.st.Params); err != nil {
 		return nil, fmt.Errorf("bad app_state: %w", err)
 	}
-	a.committed, _ = json.Marshal(a.st)
+	a.committed = a.st.canonical()
 	return &abci.InitChainResponse{}, nil
 }
 
@@ -172,6 +210,48 @@ type BidContent struct {
 	Name    string  `json:"name"`
 	Proofs  []Proof `json:"proofs"`
 }
+
+// closeTx is the validators' own "close what is due" transaction (ADR 0003
+// §1): close:<auction id>:<endAt>:<unix seconds sent>. It is not a Nostr
+// event, so the gateway's /api/tx (JSON only) cannot submit one.
+const closePrefix = "close:"
+
+type closeTx struct {
+	Auction string
+	EndAt   int64
+	Sent    int64
+}
+
+func parseClose(tx []byte) (*closeTx, bool) {
+	if !bytes.HasPrefix(tx, []byte(closePrefix)) || len(tx) > 128 {
+		return nil, false
+	}
+	parts := strings.Split(string(tx[len(closePrefix):]), ":")
+	if len(parts) != 3 || !lowerHex(parts[0], 64) {
+		return nil, false
+	}
+	end, e1 := strconv.ParseInt(parts[1], 10, 64)
+	sent, e2 := strconv.ParseInt(parts[2], 10, 64)
+	if e1 != nil || e2 != nil {
+		return nil, false
+	}
+	return &closeTx{parts[0], end, sent}, true
+}
+
+func makeClose(id string, endAt, now int64) []byte {
+	return []byte(fmt.Sprintf("%s%s:%d:%d", closePrefix, id, endAt, now))
+}
+
+// lateBid is a bid that is well formed and fully locked to the escrow key
+// but lost a race (too low, already leading, lot ended). The chain records
+// it as void so the validators can refund it at once (ADR 0007).
+type lateBid struct{ reason string }
+
+func (e *lateBid) Error() string { return e.reason }
+
+// maxVoids caps the late bids one auction keeps; past it they are refused
+// (the bidder reclaims after locktime, as before).
+const maxVoids = 256
 
 func decodeTx(tx []byte) (*Event, error) {
 	var ev Event
@@ -306,22 +386,7 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 	if !ok {
 		return errors.New("unknown auction")
 	}
-	if au.Status != "open" || (timed && now >= au.EndAt) {
-		return errors.New("auction closed")
-	}
-	if ev.Pubkey == au.Seller {
-		return errors.New("seller cannot bid on own lot")
-	}
-	min := au.StartPrice
-	if au.HighBid != "" {
-		min = au.HighAmount + au.MinIncrement
-		if s.Bids[au.HighBid].Bidder == ev.Pubkey {
-			return errors.New("you are already the highest bidder")
-		}
-	}
-	if b.Amount < min {
-		return fmt.Errorf("bid must be at least %d sats", min)
-	}
+	// 1. Is it a real, fully locked escrow? If not, refuse it outright.
 	wallet := strings.ToLower(b.Wallet)
 	if !isPubHex(wallet) {
 		return errors.New("wallet pubkey invalid")
@@ -371,14 +436,42 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 	if err != nil {
 		return err
 	}
+	// 2. Did it lose a race? Then it is late: recorded as void, refundable now.
+	var late error
+	min := au.StartPrice
+	if au.HighBid != "" {
+		min = au.HighAmount + au.MinIncrement
+	}
+	switch {
+	case au.Status != "open" || (timed && now >= au.EndAt):
+		late = &lateBid{"auction closed"}
+	case ev.Pubkey == au.Seller:
+		late = &lateBid{"seller cannot bid on own lot"}
+	case au.HighBid != "" && s.Bids[au.HighBid].Bidder == ev.Pubkey:
+		late = &lateBid{"you are already the highest bidder"}
+	case b.Amount < min:
+		late = &lateBid{fmt.Sprintf("bid must be at least %d sats", min)}
+	}
+	if late != nil && len(au.Voids) >= maxVoids {
+		return errors.New(late.Error() + " (late-bid limit reached for this lot)")
+	}
 	if !apply {
-		return nil
+		return late
+	}
+	bid := &Bid{ID: ev.ID, Auction: au.ID, Bidder: ev.Pubkey, Name: b.Name, Wallet: wallet, Amount: b.Amount,
+		Proofs: b.Proofs, Locktime: lt, Height: height, Time: now, Status: "leading"}
+	s.Bids[ev.ID] = bid
+	for _, y := range ys {
+		s.UsedY[y] = ev.ID
+	}
+	if late != nil {
+		bid.Status = "void"
+		au.Voids = append(au.Voids, ev.ID)
+		return late
 	}
 	if au.HighBid != "" {
 		s.Bids[au.HighBid].Status = "outbid"
 	}
-	bid := &Bid{ID: ev.ID, Auction: au.ID, Bidder: ev.Pubkey, Name: b.Name, Wallet: wallet, Amount: b.Amount,
-		Proofs: b.Proofs, Locktime: lt, Height: height, Time: now, Status: "leading"}
 	if au.EndAt-now < s.Params.SoftCloseSec {
 		ne := now + s.Params.ExtendSec
 		if ne > au.HardEnd {
@@ -389,10 +482,6 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 			au.Extensions++
 			bid.Extended = true
 		}
-	}
-	s.Bids[ev.ID] = bid
-	for _, y := range ys {
-		s.UsedY[y] = ev.ID
 	}
 	au.HighBid, au.HighAmount = ev.ID, b.Amount
 	au.Bids = append(au.Bids, ev.ID)
@@ -420,6 +509,9 @@ func (s *State) closeDue(now, height int64) {
 }
 
 func (a *App) CheckTx(_ context.Context, req *abci.CheckTxRequest) (*abci.CheckTxResponse, error) {
+	if c, ok := parseClose(req.Tx); ok {
+		return a.checkClose(c, time.Now().Unix()), nil
+	}
 	ev, err := decodeTx(req.Tx)
 	if err != nil {
 		return &abci.CheckTxResponse{Code: 1, Log: err.Error()}, nil
@@ -432,10 +524,33 @@ func (a *App) CheckTx(_ context.Context, req *abci.CheckTxRequest) (*abci.CheckT
 	case KindBid:
 		err = a.st.applyBid(ev, a.st.Time, a.st.Height, false, false)
 	}
+	var late *lateBid
+	if errors.As(err, &late) {
+		return &abci.CheckTxResponse{Code: 0, Log: "late: " + late.reason}, nil
+	}
 	if err != nil {
 		return &abci.CheckTxResponse{Code: 2, Log: err.Error()}, nil
 	}
 	return &abci.CheckTxResponse{Code: 0}, nil
+}
+
+// checkClose admits a close transaction only while that auction is open,
+// still ends at endAt, and endAt has passed on this validator's clock; and
+// only if it was made in the last 30 s. Anything else is refused, so it is
+// no use for spam.
+func (a *App) checkClose(c *closeTx, now int64) *abci.CheckTxResponse {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	au := a.st.Auctions[c.Auction]
+	switch {
+	case au == nil || au.Status != "open" || au.EndAt != c.EndAt:
+		return &abci.CheckTxResponse{Code: 3, Log: "nothing to close"}
+	case c.EndAt > now:
+		return &abci.CheckTxResponse{Code: 3, Log: "not due yet"}
+	case c.Sent < now-30 || c.Sent > now+5:
+		return &abci.CheckTxResponse{Code: 3, Log: "stale close"}
+	}
+	return &abci.CheckTxResponse{Code: 0}
 }
 
 func (a *App) FinalizeBlock(_ context.Context, req *abci.FinalizeBlockRequest) (*abci.FinalizeBlockResponse, error) {
@@ -446,7 +561,13 @@ func (a *App) FinalizeBlock(_ context.Context, req *abci.FinalizeBlockRequest) (
 	s.Height, s.Time = req.Height, now
 	s.closeDue(now, req.Height)
 	res := make([]*abci.ExecTxResult, len(req.Txs))
+	lines := make([]ledgerLine, 0, len(req.Txs))
 	for i, tx := range req.Txs {
+		if _, ok := parseClose(tx); ok {
+			// closeDue above already did the work; the tx only made the block
+			res[i] = &abci.ExecTxResult{Code: 0}
+			continue
+		}
 		ev, err := decodeTx(tx)
 		if err == nil {
 			switch ev.Kind {
@@ -455,6 +576,13 @@ func (a *App) FinalizeBlock(_ context.Context, req *abci.FinalizeBlockRequest) (
 			case KindBid:
 				err = s.applyBid(ev, now, req.Height, true, true)
 			}
+		}
+		var late *lateBid
+		if errors.As(err, &late) {
+			s.TxCount++
+			res[i] = &abci.ExecTxResult{Code: 0, Log: "void: " + late.reason}
+			lines = append(lines, ledgerLine{Height: req.Height, Time: now, Kind: ev.Kind, Event: ev.ID, Result: "void", Reason: late.reason})
+			continue
 		}
 		if err != nil {
 			r := Rejection{Height: req.Height, Time: now, Reason: err.Error()}
@@ -466,14 +594,21 @@ func (a *App) FinalizeBlock(_ context.Context, req *abci.FinalizeBlockRequest) (
 				s.Rejections = s.Rejections[len(s.Rejections)-50:]
 			}
 			res[i] = &abci.ExecTxResult{Code: 2, Log: err.Error()}
+			ll := ledgerLine{Height: req.Height, Time: now, Result: "rejected", Reason: err.Error()}
+			if ev != nil {
+				ll.Kind, ll.Event = ev.Kind, ev.ID
+			}
+			lines = append(lines, ll)
 			continue
 		}
 		s.TxCount++
 		res[i] = &abci.ExecTxResult{Code: 0}
+		lines = append(lines, ledgerLine{Height: req.Height, Time: now, Kind: ev.Kind, Event: ev.ID, Result: "ok", Tx: json.RawMessage(tx)})
 	}
+	a.pendLines = lines
 	// One serialisation per block: the app hash is the SHA-256 of the same
 	// canonical JSON that Commit publishes (identical to s.hash()).
-	b, _ := json.Marshal(s)
+	b := s.canonical()
 	h := sha256.Sum256(b)
 	a.appHash, a.pending = h[:], b
 	return &abci.FinalizeBlockResponse{TxResults: res, AppHash: a.appHash}, nil
@@ -486,18 +621,31 @@ func (a *App) Commit(context.Context, *abci.CommitRequest) (*abci.CommitResponse
 		a.committed, a.pending = a.pending, nil
 		a.committedHash = a.appHash
 	} else {
-		a.committed, _ = json.Marshal(a.st)
+		a.committed = a.st.canonical()
 		h := sha256.Sum256(a.committed)
 		a.committedHash = h[:]
 	}
-	a.committedH = a.st.Height
+	a.committedH, a.committedT = a.st.Height, a.st.Time
+	// the ledger line goes to disk before any block it covers can be pruned
+	if a.ledger != nil {
+		if err := a.ledger.append(a.committedH, a.pendLines); err != nil {
+			log.Printf("ledger %d: %v", a.committedH, err)
+		}
+	}
+	a.pendLines = nil
+	var retain int64
+	if a.retain > 0 && a.snap != nil {
+		if r := a.snap.lastHeight() - a.retain; r > 0 {
+			retain = r
+		}
+	}
 	if a.snap != nil && a.snap.every > 0 && a.committedH%a.snap.every == 0 {
-		h, hash, raw := a.committedH, a.committedHash, a.committed
+		h, t, hash, raw := a.committedH, a.committedT, a.committedHash, a.committed
 		go func() {
-			if err := a.snap.write(h, hash, raw); err != nil {
+			if err := a.snap.write(h, t, hash, raw); err != nil {
 				log.Printf("snapshot %d: %v", h, err)
 			}
 		}()
 	}
-	return &abci.CommitResponse{}, nil
+	return &abci.CommitResponse{RetainHeight: retain}, nil
 }

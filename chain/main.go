@@ -180,6 +180,19 @@ func cmdGateway(args []string) {
 		writeJSON(w, 503, map[string]string{"error": "no validator reachable"})
 	})
 
+	// push: "a block was committed" as Server-Sent Events (events.go)
+	evCl := &http.Client{Timeout: 500 * time.Millisecond}
+	mu.Handle("/api/events", newEventHub(func() (int64, bool) {
+		for i := 0; i < 4; i++ {
+			if sup.running(i) {
+				if h, ok := heightFrom(evCl, fmt.Sprintf("http://127.0.0.1:%d/height", httpPort(i))); ok {
+					return h, true
+				}
+			}
+		}
+		return 0, false
+	}))
+
 	// one bid with its proofs, for releasing it
 	mu.HandleFunc("/api/bid", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
@@ -284,7 +297,12 @@ func cmdGateway(args []string) {
 				writeJSON(w, 400, map[string]any{"ok": false, "error": rr.Result.Log, "via": names[i]})
 				return
 			}
-			writeJSON(w, 200, map[string]any{"ok": true, "hash": rr.Result.Hash, "via": names[i]})
+			out := map[string]any{"ok": true, "hash": rr.Result.Hash, "via": names[i]}
+			if strings.HasPrefix(rr.Result.Log, "late: ") {
+				// a late bid: on chain as void, refundable as soon as it lands (ADR 0007)
+				out["late"] = strings.TrimPrefix(rr.Result.Log, "late: ")
+			}
+			writeJSON(w, 200, out)
 			return
 		}
 		writeJSON(w, 503, map[string]string{"error": "no validator reachable"})

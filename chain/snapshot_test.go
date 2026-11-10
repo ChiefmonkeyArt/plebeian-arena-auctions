@@ -89,8 +89,8 @@ func TestSnapshotKeepsTwoAndShutdownWrite(t *testing.T) {
 	a.snap.every = 0 // only explicit (shutdown) writes
 	for h := int64(501); h <= 503; h++ {
 		block(t, a, h)
-		hh, hash, raw := a.committedSnapshot()
-		if err := a.snap.write(hh, hash, raw); err != nil {
+		hh, tt, hash, raw := a.committedSnapshot()
+		if err := a.snap.write(hh, tt, hash, raw); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -102,7 +102,7 @@ func TestSnapshotKeepsTwoAndShutdownWrite(t *testing.T) {
 	if fi.Mode().Perm() != 0o600 {
 		t.Fatalf("snapshot mode %v, want 0600", fi.Mode().Perm())
 	}
-	if err := a.snap.write(502, nil, []byte("{}")); err != nil || len(must(listSnapshots(dir))) != 2 {
+	if err := a.snap.write(502, 0, nil, []byte("{}")); err != nil || len(must(listSnapshots(dir))) != 2 {
 		t.Fatal("an older height must not be written over a newer one")
 	}
 }

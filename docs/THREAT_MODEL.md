@@ -1,4 +1,4 @@
-# Threat model: Plebeian Auctions arena (v0.2.0, status updated for v0.3.4)
+# Threat model: Plebeian Auctions arena (v0.2.0, status updated for v0.4.0)
 
 Status: draft, 2026-11-10. Covers `ChiefmonkeyArt/plebeian-arena-auctions` v0.2.0 as installed by Torii Suite v0.9.50-alpha at `auctions.<domain>`. Fake sats only. This document defines what must hold before real sats are used, and what an auditor should test.
 
@@ -43,7 +43,7 @@ Today all boxes below nginx run on one host under one operator. The intended tru
 | Actor | Wants to | Prevented by | Gap today |
 |---|---|---|---|
 | Anonymous visitor | Disrupt auctions, steal sats | Locks to group key; auth signatures checked by each validator; nginx rate limit | **Can stop validators** via `/api/admin/validator/N/stop` (F1). Can flood chat. |
-| Bidder | Bid without paying; get refunded while winning; reuse proofs | Bid needs DLEQ-valid proofs from the pinned keyset, summing to the amount, locked to the group key with `SIG_ALL`; proofs recorded in `UsedY`; refunds only for `outbid`/`lost` | **Winning bidder can reclaim after locktime** if the seller has not been paid (F2). |
+| Bidder | Bid without paying; get refunded while winning; reuse proofs | Bid needs DLEQ-valid proofs from the pinned keyset, summing to the amount, locked to the group key with `SIG_ALL`; proofs recorded in `UsedY`; refunds only for `outbid`/`lost`/`void` (a void bid never leads or wins) | **Winning bidder can reclaim after locktime** if the seller has not been paid (F2). |
 | Seller | Inflate price; keep sats without delivering | Seller's Nostr key cannot bid on its own lot | Shill bids from a second key (F6). No delivery or dispute step: payout releases at close (F5). |
 | One validator (malicious or compromised) | Sign alone; censor; corrupt state | 3-of-4 FROST; BFT consensus needs 3 of 4 votes; each validator checks policy and the exact message before signing | Can delay bids during its proposer turns. |
 | Gateway / release coordinator | Redirect a release | Each validator checks the bidder's or seller's authorisation over the exact outputs, and signs only the message it committed to | Can refuse to coordinate (bidder falls back to locktime). |
@@ -128,6 +128,15 @@ v0.3.3 (ADR 0003 §2) writes state snapshots to `vN/data/app-state/<height>.json
 
 v0.3.4 (ADR 0006) changes only the page. A one-tap bid (Next, Jump, Big move, the sticky Bid button, swipe) is priced against the view read just before the lock, so it can be up to two increments above the amount the button showed; anything higher is refused before any sats are locked, and the toast states the amount actually bid. A tap made while a bid is in flight is held (latest one wins) and dropped if you are leading when the first lands, so taps cannot stack bids. The demo bots in your own browser wait 5 s after your tap, which removes the most common cause of a stale-amount rejection (and its sats locked until locktime). Nothing changes on the chain or the gateway.
 
+v0.4.0 (ADR 0003 §1 and §4, ADR 0007, chain format 4) changes the chain:
+
+- **Void bids.** A fully locked bid that lost a race is recorded as `void` and refundable at once, instead of staying locked until locktime. The escrow checks run first, so a forged or badly locked bid is still refused and leaves no trace. A void bid marks its proofs used and never leads. Spam costs a real mint lock per bid, and each lot keeps at most 256 void bids (then late bids are refused as before). Nginx rate limits apply.
+- **Block time is the proposer's clock (PBTS).** Each honest validator prevotes a proposal only if its time is within 505 ms ahead of, or 2 s + 505 ms behind, its own clock. A dishonest proposer can therefore backdate a block by about 2.5 s, which could let a bid in just after the end (CometBFT widens the window by 10% for each failed round). Before v0.4.0, BFT time let a block after an idle minute carry a time up to a minute old. A validator whose clock drifts beyond the window stops voting for others' proposals, so separate servers must run NTP.
+- **Close transactions** (`close:<lot>:<endAt>:<seconds>`) are refused unless that lot is open, still ends at that time, the end has passed on the validator's own clock, and the transaction is under 30 s old. They change nothing in FinalizeBlock: the close itself runs from block time. The public `/api/tx` accepts only JSON events, so only a validator's own loopback RPC can submit one.
+- **The app hash leaves out height and time.** Both are still in the header of every block, which the commit signs, and snapshots are checked against the header's app hash as before.
+- **Pruning and the ledger archive.** Blocks more than `-retain-blocks` (100,000) below the newest snapshot are deleted. Every transaction is first written to `vN/data/ledger.jsonl` (0600) and synced. The archive is public data. It is now the history record, so it belongs in backups.
+- **`/api/events`** (Server-Sent Events) is capped at 512 open streams in total. Each stream lasts at most 15 min, and each write must finish within 10 s. One client can still take every stream; others then fall back to polling, so nothing breaks. On real sats, add a per-IP `limit_conn` in front.
+
 ## Already in place
 
 - Bids locked only to the FROST group key, `SIG_ALL`, refund key = bidder; validators reject any other lock (`checkLock`).
@@ -150,3 +159,4 @@ v0.3.4 (ADR 0006) changes only the page. A one-tap bid (Next, Jump, Big move, th
 - [ ] Fuzzing of bid and release checks; tests for a misbehaving validator.
 - [ ] Independent audit of the FROST flow, escrow rules and validator code, against this document.
 - [ ] Small per-auction caps and a bug bounty for the first real-sats trial.
+- [ ] NTP on every validator server (PBTS), and `limit_conn` for `/api/events` and `/mint/v1/ws`.

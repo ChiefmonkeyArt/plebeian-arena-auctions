@@ -50,6 +50,7 @@ type ClientView struct {
 	View       string              `json:"view"`
 	Height     int64               `json:"height"`
 	Time       int64               `json:"time"`
+	Now        int64               `json:"now"` // the validator's wall clock, ms (for the client's clock offset)
 	Params     Params              `json:"params"`
 	Auctions   map[string]*Auction `json:"auctions"`
 	Order      []string            `json:"order"`
@@ -69,7 +70,7 @@ type committedCache struct {
 
 func (c *committedCache) get(a *App) *State {
 	a.mu.RLock()
-	b, h := a.committed, a.committedH
+	b, h, t := a.committed, a.committedH, a.committedT
 	a.mu.RUnlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -78,6 +79,7 @@ func (c *committedCache) get(a *App) *State {
 		if json.Unmarshal(b, st) != nil {
 			return newState()
 		}
+		st.Height, st.Time = h, t
 		c.st, c.h = st, h
 	}
 	return c.st
@@ -130,7 +132,7 @@ func clientView(s *State, bidders map[string]bool, closed int) *ClientView {
 			if au == nil || keep[au.ID] || au.Status != "closed" || s.Time-au.ClosedAt > viewOwnWindowSec {
 				continue
 			}
-			mine := bidders[b.Bidder] && (b.Status == "outbid" || b.Status == "lost")
+			mine := bidders[b.Bidder] && (b.Status == "outbid" || b.Status == "lost" || b.Status == "void")
 			sale := bidders[au.Seller] && b.Status == "won"
 			if mine || sale {
 				keep[au.ID] = true
@@ -147,7 +149,13 @@ func clientView(s *State, bidders map[string]bool, closed int) *ClientView {
 		au := s.Auctions[id]
 		v.Auctions[id] = au
 		v.Order = append(v.Order, id)
-		for _, bid := range au.Bids {
+		ids := au.Bids
+		for _, vid := range au.Voids { // only the caller's own late bids
+			if b := s.Bids[vid]; b != nil && bidders[b.Bidder] {
+				ids = append(ids[:len(ids):len(ids)], vid)
+			}
+		}
+		for _, bid := range ids {
 			if b := s.Bids[bid]; b != nil {
 				v.Bids[bid] = &BidView{ID: b.ID, Auction: b.Auction, Bidder: b.Bidder, Name: b.Name, Wallet: b.Wallet,
 					Amount: b.Amount, ProofCount: len(b.Proofs), Locktime: b.Locktime, Height: b.Height, Time: b.Time,
@@ -164,10 +172,10 @@ func clientView(s *State, bidders map[string]bool, closed int) *ClientView {
 // encodeView returns the JSON body and an ETag that ignores height and time,
 // so the tag only moves when something the page shows has changed.
 func encodeView(v *ClientView) ([]byte, string) {
-	h, t := v.Height, v.Time
-	v.Height, v.Time = 0, 0
+	h, t, n := v.Height, v.Time, v.Now
+	v.Height, v.Time, v.Now = 0, 0, 0
 	stable, _ := json.Marshal(v)
-	v.Height, v.Time = h, t
+	v.Height, v.Time, v.Now = h, t, n
 	sum := sha256.Sum256(stable)
 	body, _ := json.Marshal(v)
 	return body, `"` + hex.EncodeToString(sum[:12]) + `"`

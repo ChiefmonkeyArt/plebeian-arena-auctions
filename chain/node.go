@@ -49,9 +49,17 @@ func nodeConfig(home string, i int, peers string) *cfg.Config {
 	c.P2P.AllowDuplicateIP = true
 	c.P2P.PexReactor = false
 	c.RPC.ListenAddress = fmt.Sprintf("tcp://127.0.0.1:%d", rpcPort(i))
-	c.Consensus.TimeoutCommit = 1000 * time.Millisecond
+	// v0.4.0 (ADR 0003 §1): blocks only when there is something to commit,
+	// plus a heartbeat every minute. Bids no longer wait for a 1 s slot,
+	// and the auction closes are driven by the validators' close txs.
+	c.Consensus.TimeoutCommit = 300 * time.Millisecond
 	c.Consensus.TimeoutPropose = 1500 * time.Millisecond
 	c.Consensus.CreateEmptyBlocks = true
+	c.Consensus.CreateEmptyBlocksInterval = 60 * time.Second
+	// ADR 0003 §4: nothing queries txs by hash or old ABCI results; the
+	// ledger archive keeps the history instead.
+	c.TxIndex.Indexer = "null"
+	c.Storage.DiscardABCIResponses = true
 	c.Instrumentation.Prometheus = false
 	c.LogLevel = "error"
 	return c
@@ -60,7 +68,8 @@ func nodeConfig(home string, i int, peers string) *cfg.Config {
 // chainFormat changes whenever stored state from an older release can no
 // longer be trusted by this one (v0.3.0: strict lock parser, SIG_ALL with
 // amounts, Nutshell 0.21 keysets). "arena init -if-needed" wipes on mismatch.
-const chainFormat = "3"
+// v0.4.0: "4" (hash excludes height/time, void bids, PBTS, close txs).
+const chainFormat = "4"
 
 func cmdInit(args []string) {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
@@ -134,7 +143,18 @@ func cmdInit(args []string) {
 		SoftCloseSec: 20, ExtendSec: 20, MaxExtendSec: 60, LockMarginSec: *margin, MinDurationSec: 20, MaxDurationSec: 7200,
 		MaxProofs: 64, Threshold: 3}
 	ab, _ := json.Marshal(params)
-	gen := &types.GenesisDoc{ChainID: "arena-auctions-fake-sats", GenesisTime: time.Now().UTC(), ConsensusParams: types.DefaultConsensusParams(),
+	// PBTS (v0.4.0): block time is the proposer's clock, checked by every
+	// validator against its own within 505 ms + message delay. Under the old
+	// BFT time a block after an idle minute could be stamped up to a minute
+	// in the past, which would close lots late and let late bids in.
+	cp := types.DefaultConsensusParams()
+	cp.Feature.PbtsEnableHeight = 1
+	// A proposer may stamp a block up to MessageDelay+Precision in the past
+	// and still be "timely". 2 s (CometBFT's default is 15 s) bounds how far
+	// a dishonest proposer can backdate a late bid; CometBFT widens it by
+	// 10% per failed round, so slow links cost a round, not liveness.
+	cp.Synchrony.MessageDelay = 2 * time.Second
+	gen := &types.GenesisDoc{ChainID: "arena-auctions-fake-sats", GenesisTime: time.Now().UTC(), ConsensusParams: cp,
 		Validators: vals, AppState: ab}
 	check(gen.ValidateAndComplete())
 	for i := 0; i < 4; i++ {
@@ -157,9 +177,10 @@ func cmdNode(args []string) {
 	root := fs.String("root", "run/chain", "chain root dir")
 	idx := fs.Int("i", 1, "validator number 1-4")
 	every := fs.Int64("snapshot-every", 1000, "write a state snapshot every N blocks (0: only on clean shutdown)")
+	retain := fs.Int64("retain-blocks", 100000, "prune blocks more than N below the newest snapshot (0: keep every block)")
 	fs.Parse(args)
-	if *every < 0 {
-		log.Fatal("-snapshot-every must be >= 0")
+	if *every < 0 || *retain < 0 {
+		log.Fatal("-snapshot-every and -retain-blocks must be >= 0")
 	}
 	i := *idx - 1
 	home := homeOf(*root, i)
@@ -190,12 +211,18 @@ func cmdNode(args []string) {
 		app.snap.last = snap.height
 		log.Printf("%s: restored state snapshot at height %d", names[i], snap.height)
 	}
+	app.ledger, err = openLedger(ledgerPath(home))
+	check(err)
+	defer app.ledger.close()
+	app.retain = *retain
 	logger := cmtlog.NewFilter(cmtlog.NewTMLogger(cmtlog.NewSyncWriter(os.Stdout)), cmtlog.AllowError())
 	n, err := node.NewNode(context.Background(), c, pv, nk, proxy.NewLocalClientCreator(app),
 		node.DefaultGenesisDocProviderFunc(c), cfg.DefaultDBProvider, node.DefaultMetricsProvider(c.Instrumentation), logger)
 	check(err)
 	check(n.Start())
 	log.Printf("%s up: p2p %d rpc %d http %d", names[i], p2pPort(i), rpcPort(i), httpPort(i))
+	stopCloser := make(chan struct{})
+	go runCloser(app, fmt.Sprintf("http://127.0.0.1:%d", rpcPort(i)), stopCloser)
 
 	mux := http.NewServeMux()
 	cache := &committedCache{}
@@ -206,7 +233,9 @@ func cmdNode(args []string) {
 			w.Write(app.Snapshot())
 			return
 		}
-		body, tag := encodeView(clientView(cache.get(app), parseBidders(q.Get("bidders")), parseClosed(q.Get("closed"))))
+		cv := clientView(cache.get(app), parseBidders(q.Get("bidders")), parseClosed(q.Get("closed")))
+		cv.Now = time.Now().UnixMilli()
+		body, tag := encodeView(cv)
 		w.Header().Set("ETag", tag)
 		w.Header().Set("Cache-Control", "no-cache")
 		if etagMatch(r.Header.Get("If-None-Match"), tag) {
@@ -229,6 +258,10 @@ func cmdNode(args []string) {
 			return
 		}
 		writeJSON(w, 200, b)
+	})
+	mux.HandleFunc("/height", func(w http.ResponseWriter, r *http.Request) {
+		h, _, _, _ := app.committedSnapshot()
+		writeJSON(w, 200, map[string]int64{"height": h})
 	})
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		bs := n.BlockStore()
@@ -259,12 +292,13 @@ func cmdNode(args []string) {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	srv.Close()
+	close(stopCloser)
 	n.Stop()
 	n.Wait()
 	// clean shutdown: snapshot the last committed state so the next start
 	// replays nothing
-	if h, hash, raw := app.committedSnapshot(); h > 0 {
-		if err := app.snap.write(h, hash, raw); err != nil {
+	if h, t, hash, raw := app.committedSnapshot(); h > 0 {
+		if err := app.snap.write(h, t, hash, raw); err != nil {
 			log.Printf("%s: shutdown snapshot %d: %v", names[i], h, err)
 		} else {
 			log.Printf("%s: wrote state snapshot at height %d", names[i], h)
@@ -315,7 +349,7 @@ func releasePolicy(app *App, req SignReq) (h [32]byte, code int, err error) {
 		au := s.Auctions[bid.Auction]
 		switch req.Purpose {
 		case "refund":
-			if bid.Status != "outbid" && bid.Status != "lost" {
+			if bid.Status != "outbid" && bid.Status != "lost" && bid.Status != "void" {
 				err = fmt.Errorf("bid is %s, not refundable", bid.Status)
 				return
 			}
@@ -450,5 +484,48 @@ func mustGetJSON(url string, v any) {
 func check(err error) {
 	if err != nil {
 		log.Fatal(err)
+	}
+}
+
+// runCloser sends this validator's close tx for every open auction that is
+// due by its own clock, at most once a second per auction, until the chain
+// closes it (ADR 0003 §1). With blocks on demand nothing else would make the
+// block that closes an idle lot.
+func runCloser(app *App, rpc string, stop <-chan struct{}) {
+	cl := &http.Client{Timeout: 2 * time.Second}
+	sent := map[string]int64{}
+	t := time.NewTicker(250 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+		}
+		now := time.Now().Unix()
+		var due [][2]any
+		app.Read(func(s *State) {
+			for id, au := range s.Auctions {
+				if au.Status == "open" && au.EndAt <= now {
+					due = append(due, [2]any{id, au.EndAt})
+				}
+			}
+		})
+		for _, d := range due {
+			id, end := d[0].(string), d[1].(int64)
+			if sent[id] == now {
+				continue
+			}
+			sent[id] = now
+			tx := makeClose(id, end, now)
+			resp, err := cl.Get(rpc + "/broadcast_tx_async?tx=0x" + hex.EncodeToString(tx)) // #nosec G107 -- own loopback RPC, hex payload
+			if err == nil {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+		}
+		if len(sent) > 1024 {
+			sent = map[string]int64{}
+		}
 	}
 }

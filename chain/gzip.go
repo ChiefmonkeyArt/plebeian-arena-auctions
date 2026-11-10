@@ -19,6 +19,9 @@ func gzippable(r *http.Request) bool {
 		return false
 	}
 	p := r.URL.Path
+	if p == "/api/events" {
+		return false // a stream: gzip would hold it in a buffer
+	}
 	if strings.HasPrefix(p, "/api/") {
 		return true
 	}
