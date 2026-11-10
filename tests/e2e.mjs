@@ -153,7 +153,8 @@ if (ws.sock) {
   ws.sock.destroy();
 }
 const bad = await upgrade('/mint/v1/info');
-ok(bad.status === 400, `upgrade refused off /v1/ws (${bad.status})`);
+// 400 from the gateway; behind nginx the headers are stripped first, so a plain answer
+ok(bad.status !== 101, `no upgrade off /v1/ws (${bad.status})`);
 
 step(8, 'Loser refunds; two validators cannot release, forged signatures fail');
 await c.j('/api/admin/validator/3/stop', { method: 'POST' });
