@@ -26,7 +26,7 @@ gateway :8080 ── static UI, /api/* (incl. /api/release), /mint/* proxy, supe
 - Live chain (v0.4.0, ADR 0003 §1 and §4, [ADR 0007](docs/adr/0007-live-chain-push-void-bids.md), chain format 4):
   - Blocks come only when there is something to commit, plus one a minute as a heartbeat. Each validator sends a `close` transaction when a lot is due, and block time is the proposer's clock (PBTS), so lots close on time.
   - A locked bid that lost a race is recorded as void and refunded at once.
-  - `/api/events` pushes "new block" to the page.
+  - `/api/events` pushes "new block" to the page. (v0.4.1: the first message after the stream was idle is the current height, not the one from the last listener.)
   - Each validator archives every transaction to `vN/data/ledger.jsonl` and prunes blocks 100,000 below its newest snapshot.
   - The Network drawer times your last 20 bids.
 - Wallet: the browser holds ecash in Coco (`@cashu/coco-core`, IndexedDB per identity); bids are Coco P2PK sends.
@@ -65,7 +65,7 @@ The Torii Suite installs a pinned release with `installers/install-auctions.sh` 
 Build a tarball locally:
 
 ```bash
-scripts/package.sh v0.4.0 dist-release
+scripts/package.sh v0.4.1 dist-release
 ```
 
 Design decisions: [ADR 0001](docs/adr/0001-frost-escrow-coco-wallet.md), [ADR 0002](docs/adr/0002-strict-locks-nutshell-021.md), [ADR 0003 (proposed)](docs/adr/0003-block-growth-snapshots-pruning.md). Threat model: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).

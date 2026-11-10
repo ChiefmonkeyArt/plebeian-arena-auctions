@@ -74,3 +74,53 @@ func TestEventStreamCap(t *testing.T) {
 		t.Fatalf("over the cap want 503, got %d", rec.Code)
 	}
 }
+
+// A listener arriving after an idle spell must not be told the old height.
+func TestEventStreamFirstEventIsFresh(t *testing.T) {
+	var h atomic.Int64
+	h.Store(5)
+	hub := newEventHub(func() (int64, bool) { return h.Load(), true })
+	c, _, _ := hub.subscribe()
+	deadline := time.After(3 * time.Second)
+	select {
+	case got := <-c:
+		if got != 5 {
+			t.Fatalf("first poll: %d", got)
+		}
+	case <-deadline:
+		t.Fatal("no first poll")
+	}
+	hub.unsubscribe(c)
+	time.Sleep(3 * ssePoll) // the hub goes idle
+	h.Store(9)
+	_, cur, ok := hub.subscribe()
+	if !ok || cur != 0 {
+		t.Fatalf("after idle the hub offered stale height %d", cur)
+	}
+	srv := httptest.NewServer(hub)
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/api/events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	rd := bufio.NewReader(resp.Body)
+	done := make(chan string, 1)
+	go func() {
+		for {
+			l, err := rd.ReadString('\n')
+			if err != nil || strings.HasPrefix(l, "data: ") {
+				done <- l
+				return
+			}
+		}
+	}()
+	select {
+	case l := <-done:
+		if !strings.Contains(l, `"h":9`) {
+			t.Fatalf("first event: %q", l)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout")
+	}
+}

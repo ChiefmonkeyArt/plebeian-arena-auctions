@@ -25,7 +25,7 @@ Blocks on demand (ADR 0003 §1) change the chain format anyway, so the rule chan
 
 ### Push
 
-- `GET /api/events` on the gateway is a Server-Sent Events stream. It sends `{"h": <height>, "now": <ms>}` when the first running validator's committed height changes, checked every 100 ms and only while someone listens. It also sends a ping every 15 s, `retry: 2000` and `X-Accel-Buffering: no`. It is not gzipped. Each write has a 10 s deadline. Each stream ends after 15 min (the browser reconnects), and 512 streams at most are allowed (then 503; polling still works).
+- `GET /api/events` on the gateway is a Server-Sent Events stream. It sends `{"h": <height>, "now": <ms>}` when the first running validator's committed height changes, checked every 100 ms and only while someone listens. The first listener after an idle spell gets its first height from the next check, not the height kept from before (fixed in v0.4.1). It also sends a ping every 15 s, `retry: 2000` and `X-Accel-Buffering: no`. It is not gzipped. Each write has a 10 s deadline. Each stream ends after 15 min (the browser reconnects), and 512 streams at most are allowed (then 503; polling still works).
 - The page opens one `EventSource`. On each new height it fetches the state at once, usually a small conditional request. While the stream is open the fallback poll slows from 1 s to 5 s and the after-bid burst is skipped.
 - The page's clock now follows the validators' wall clock (`now` in the view and the events), not the last block's time. With blocks on demand the last block can be a minute old.
 
