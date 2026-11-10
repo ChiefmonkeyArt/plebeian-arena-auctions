@@ -45,7 +45,7 @@ LOCK_MARGIN=30 ./scripts.sh reset && DEMO_CONTROLS=1 ./scripts.sh start && ./scr
 - All four FROST shares sit on one host, so that operator could sign alone; real security needs the validators on separate machines run by different people.
 - CometBFT p2p instead of FIPS.
 - Per-browser generated Nostr keys (no NIP-07 yet); chat is signed but held in gateway memory, not on chain.
-- App state is in memory and replays from genesis on restart.
+- App state is in memory and replays from genesis on restart; one block a second, never pruned. Plan: [ADR 0003](docs/adr/0003-block-growth-snapshots-pruning.md).
 
 ## Torii node install
 
@@ -59,4 +59,4 @@ Build a tarball locally:
 scripts/package.sh v0.3.0 dist-release
 ```
 
-Design decisions: [ADR 0001](docs/adr/0001-frost-escrow-coco-wallet.md), [ADR 0002](docs/adr/0002-strict-locks-nutshell-021.md). Threat model: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
+Design decisions: [ADR 0001](docs/adr/0001-frost-escrow-coco-wallet.md), [ADR 0002](docs/adr/0002-strict-locks-nutshell-021.md), [ADR 0003 (proposed)](docs/adr/0003-block-growth-snapshots-pruning.md). Threat model: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
