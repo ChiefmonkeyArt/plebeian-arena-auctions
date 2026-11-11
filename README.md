@@ -30,6 +30,7 @@ gateway :8080 ── static UI, /api/* (incl. /api/release), /mint/* proxy, supe
   - Each validator archives every transaction to `vN/data/ledger.jsonl` and prunes blocks 100,000 below its newest snapshot.
   - The Network drawer times your last 20 bids.
 - Wallet: the browser holds ecash in Coco (`@cashu/coco-core`, IndexedDB per identity); bids are Coco P2PK sends.
+- Light page (v0.4.2, [ADR 0008](docs/adr/0008-page-main-thread-budget.md)): the Coco wallets and all proof maths run in a Web Worker; the page redraws ten times a second (at once after a tap or a new block), derives each public key once and reuses its number and time formatters.
 
 ## Run
 
@@ -65,7 +66,7 @@ The Torii Suite installs a pinned release with `installers/install-auctions.sh` 
 Build a tarball locally:
 
 ```bash
-scripts/package.sh v0.4.1 dist-release
+scripts/package.sh v0.4.2 dist-release
 ```
 
 Design decisions: [ADR 0001](docs/adr/0001-frost-escrow-coco-wallet.md), [ADR 0002](docs/adr/0002-strict-locks-nutshell-021.md), [ADR 0003 (proposed)](docs/adr/0003-block-growth-snapshots-pruning.md). Threat model: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).

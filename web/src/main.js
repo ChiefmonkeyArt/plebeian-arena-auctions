@@ -1,21 +1,24 @@
 import './template.css';
 import './arena.css';
-import { ArenaClient, newIdentity, ensureSeed, idPub, walletPub, totalSats, lockOf } from './lib/arena.js';
+import { newIdentity, ensureSeed, idPub, walletPub, totalSats, lockOf } from './lib/arena.js';
+import { WalletClient } from './lib/wallet.js';
 
 // ---------- basics ----------
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
-const fmt = (n) => Math.round(n || 0).toLocaleString('en-GB');
+const NUM = new Intl.NumberFormat('en-GB', { maximumFractionDigits: 0 });
+const fmt = (n) => NUM.format(Math.round(n || 0));
 const esc = (t) => String(t ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 // Listing images: same-site paths only (matches the chain rule and the CSP); anything else shows the placeholder.
 const safeSrc = (s) => (/^(\.\/|\/(?!\/))[A-Za-z0-9._~\/-]*$/.test(String(s || '')) ? s : './assets/watch-1.jpg');
 const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
-const clock = (s) => new Date(s * 1000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const HMS = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const clock = (s) => HMS.format(new Date(s * 1000));
 const rawApi = window.__API_BASE__ || '';
 const base = (rawApi && !rawApi.startsWith('__PORT_'))
   ? new URL(rawApi, location.href).href.replace(/\/$/, '')
   : new URL('.', location.href).href.replace(/\/$/, '');
-const api = new ArenaClient(base);
+const api = new WalletClient(base); // wallet maths runs in a worker (v0.4.2)
 const LS = 'arena.v1.';
 // Hosted previews run in a sandboxed iframe without localStorage; fall back to memory.
 const store = (() => { try { const t = LS + 'probe'; localStorage.setItem(t, '1'); localStorage.removeItem(t); return localStorage; }
@@ -268,7 +271,7 @@ async function humanBid(intent, el) {
   timing.unshift(tm); timing.length = Math.min(timing.length, 20);
   pending = { lot: a.id, amount: shown, state: 'sending', at: Date.now(), tm };
   el?.classList.add('sending');
-  renderFeeds(currentLot());
+  renderFeeds(currentLot()); kick();
   requestAnimationFrame(() => { tm.shown = performance.now() - t0; renderTimings(); });
   const r = await placeBid(ui.me, a, intent.amount ?? 0, {
     steps: intent.amount == null ? intent.steps : null,
@@ -277,7 +280,7 @@ async function humanBid(intent, el) {
     onSent: (amt, res) => {
       tm.amount = amt; tm.accepted = performance.now() - t0; tm.late = res?.late; tm.id = res?.id;
       if (pending) Object.assign(pending, { amount: amt, state: 'sent', at: Date.now(), id: res?.id });
-      renderFeeds(currentLot()); renderTimings();
+      renderFeeds(currentLot()); renderTimings(); kick();
     },
   });
   if (!r.ok && !r.late) { tm.failed = r.reason; renderTimings(); }
@@ -378,8 +381,12 @@ async function botLoop() {
 }
 
 // ---------- rendering ----------
+// [data-v] slots are all in index.html, so each key's elements are looked up once.
+const slots = new Map();
 function setV(k, v, html = false) {
-  $$(`[data-v="${k}"]`).forEach((el) => {
+  let els = slots.get(k);
+  if (!els) { els = $$(`[data-v="${k}"]`); slots.set(k, els); }
+  els.forEach((el) => {
     if (el._v === v) return; el._v = v;
     if (k === 'ring') el.style.strokeDashoffset = v;
     else if (el.tagName === 'IMG') el.src = v;
@@ -417,9 +424,15 @@ function timerText(a) {
   return m + ':' + String(s % 60).padStart(2, '0');
 }
 
+// The frame renders ten times a second (the clocks show tenths), and at once
+// on the next animation frame after a tap, a key or a new state (kick).
+// v0.4.2: it used to run on every animation frame, 60 times a second.
+let frameReq = 0, frameTimer = 0;
+function kick() { if (!frameReq) frameReq = requestAnimationFrame(() => { frameReq = 0; renderFrame(); }); }
 function renderFrame() {
+  clearTimeout(frameTimer); frameTimer = setTimeout(kick, 100);
   const a = currentLot();
-  if (!S) return requestAnimationFrame(renderFrame);
+  if (!S) return;
   const live = a && a.status === 'open';
   setV('balance', fmt(bal(ui.me)));
   setV('held', fmt(heldBy(ui.me)));
@@ -467,7 +480,6 @@ function renderFrame() {
       if (st !== goingStage) { goingStage = st; if (st) going(st); }
     }
   }
-  requestAnimationFrame(renderFrame);
 }
 
 function renderMedia(a) {
@@ -690,7 +702,7 @@ async function pollState() {
     reconcilePending();
     const a = currentLot();
     document.body.classList.toggle('arena-loading', !a);
-    renderMedia(a); renderFeeds(a); renderChat(a); renderQueue(a); renderWallet();
+    renderMedia(a); renderFeeds(a); renderChat(a); renderQueue(a); renderWallet(); kick();
     if (!$('[data-modal=outcome]').hidden) $('[data-slot=outcome]').innerHTML = outcomeHTML(a, ui.otab);
   } catch (e) { /* gateway down */ } finally { polling = false; }
 }
@@ -796,7 +808,8 @@ for (const n of USERS) {
 saveW();
 await Promise.all(USERS.map((n) => refreshBal(n).catch(() => 0)));
 renderUsers();
-requestAnimationFrame(renderFrame);
+['pointerdown', 'click', 'input', 'keydown'].forEach((t) => addEventListener(t, kick, { capture: true, passive: true }));
+kick();
 await pollNet();
 await pollState();
 await seedIfEmpty();
