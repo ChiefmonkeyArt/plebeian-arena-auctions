@@ -24,7 +24,7 @@ rustup target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
 install -m 0755 frost/target/x86_64-unknown-linux-musl/release/arena-frost "$R/bin/arena-frost"
 
 # 2. Front end.
-(cd web && npm ci --no-audit --no-fund --silent && npm run build >/dev/null)
+(cd web && npm ci --no-audit --no-fund --silent && npm run build >/dev/null && node test/page-cost.mjs >/dev/null)
 cp -a web/dist "$R/web"
 
 # 3. Mint runtime: a private CPython (python-build-standalone via uv) with

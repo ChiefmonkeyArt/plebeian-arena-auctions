@@ -1,7 +1,6 @@
 // Arena client: Nostr identity, a Coco Cashu wallet per identity (fake sats),
 // escrow bids locked to the validators' FROST group key, and 3-of-4 releases.
 // Works in the browser (IndexedDB) and in Node 20 (in-memory, for tests).
-import { initializeCoco, MemoryRepositories } from '@cashu/coco-core';
 import { Amount, OutputData, getEncodedToken, hashToCurve } from '@cashu/cashu-ts';
 import { schnorr, secp256k1 } from '@noble/curves/secp256k1.js';
 import { sha256 } from '@noble/hashes/sha2.js';
@@ -21,8 +20,12 @@ export function newIdentity(name) {
 // Identities saved before v0.2 have no wallet seed; give them one.
 export function ensureSeed(id) { if (!id.seed) id.seed = bytesToHex(randomBytes(64)); return id; }
 
-export function idPub(id) { return getPublicKey(hexToBytes(id.nostrSk)); }
-export function walletPub(id) { return '02' + bytesToHex(schnorr.getPublicKey(hexToBytes(id.walletSk))); }
+// Public keys are derived once per secret key: the page asks for them on every
+// render, and each derivation is a full elliptic-curve multiplication (v0.4.2).
+const pubMemo = new Map();
+const memoPub = (tag, sk, f) => { const k = tag + sk; let v = pubMemo.get(k); if (v === undefined) { v = f(); pubMemo.set(k, v); } return v; };
+export function idPub(id) { return memoPub('n', id.nostrSk, () => getPublicKey(hexToBytes(id.nostrSk))); }
+export function walletPub(id) { return memoPub('w', id.walletSk, () => '02' + bytesToHex(schnorr.getPublicKey(hexToBytes(id.walletSk)))); }
 
 const num = (a) => (a && typeof a.toNumber === 'function' ? a.toNumber() : Number(a));
 const sum = (ps) => ps.reduce((a, p) => a + num(p.amount), 0);
@@ -77,6 +80,8 @@ export class ArenaClient {
     const key = walletPub(id);
     if (!this.cocos.has(key)) {
       this.cocos.set(key, (async () => {
+        // Loaded on first use: the page's main bundle leaves Coco to the wallet worker.
+        const { initializeCoco, MemoryRepositories } = await import('@cashu/coco-core');
         let repo;
         if (typeof indexedDB !== 'undefined') {
           const { IndexedDbRepositories } = await import('@cashu/coco-indexeddb');
