@@ -44,6 +44,8 @@ type BidView struct {
 	Time       int64  `json:"time"`
 	Status     string `json:"status"`
 	Extended   bool   `json:"extended"`
+	Settled    string `json:"settled,omitempty"` // refund | payout: pushed by the validators (ADR 0009)
+	Relocks    int    `json:"relocks,omitempty"`
 }
 
 type ClientView struct {
@@ -132,8 +134,8 @@ func clientView(s *State, bidders map[string]bool, closed int) *ClientView {
 			if au == nil || keep[au.ID] || au.Status != "closed" || s.Time-au.ClosedAt > viewOwnWindowSec {
 				continue
 			}
-			mine := bidders[b.Bidder] && (b.Status == "outbid" || b.Status == "lost" || b.Status == "void")
-			sale := bidders[au.Seller] && b.Status == "won"
+			mine := bidders[b.Bidder] && b.Settled == "" && (b.Status == "outbid" || b.Status == "lost" || b.Status == "void")
+			sale := bidders[au.Seller] && b.Settled == "" && b.Status == "won"
 			if mine || sale {
 				keep[au.ID] = true
 			}
@@ -159,7 +161,7 @@ func clientView(s *State, bidders map[string]bool, closed int) *ClientView {
 			if b := s.Bids[bid]; b != nil {
 				v.Bids[bid] = &BidView{ID: b.ID, Auction: b.Auction, Bidder: b.Bidder, Name: b.Name, Wallet: b.Wallet,
 					Amount: b.Amount, ProofCount: len(b.Proofs), Locktime: b.Locktime, Height: b.Height, Time: b.Time,
-					Status: b.Status, Extended: b.Extended}
+					Status: b.Status, Extended: b.Extended, Settled: b.Settled, Relocks: b.Relocks}
 			}
 		}
 	}

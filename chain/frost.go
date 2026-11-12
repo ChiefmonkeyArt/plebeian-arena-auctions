@@ -7,6 +7,7 @@ package main
 // arena-frost tool (Zcash Foundation frost-secp256k1-tr), called over stdin.
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -14,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,12 +35,26 @@ func frostBin() string {
 	return filepath.Join(filepath.Dir(exe), "arena-frost")
 }
 
-// frostCall runs one arena-frost command: JSON in on stdin, JSON out.
+// frostCall runs one arena-frost command: JSON in, JSON out. Signing
+// commands go to a long-lived "arena-frost serve" process (v0.5.0: no exec
+// per call); key generation and any serve failure use a one-shot exec.
 func frostCall(cmd string, in, out any) error {
 	b, err := json.Marshal(in)
 	if err != nil {
 		return err
 	}
+	if !strings.HasPrefix(cmd, "dkg") && os.Getenv("ARENA_FROST_SERVE") != "0" {
+		if raw, err, served := frostServed(cmd, b); served {
+			if err != nil {
+				return err
+			}
+			return json.Unmarshal(raw, out)
+		}
+	}
+	return frostExec(cmd, b, out)
+}
+
+func frostExec(cmd string, b []byte, out any) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	c := exec.CommandContext(ctx, frostBin(), cmd)
@@ -56,6 +72,99 @@ func frostCall(cmd string, in, out any) error {
 		return fmt.Errorf("arena-frost %s: %v %s", cmd, runErr, strings.TrimSpace(se.String()))
 	}
 	return json.Unmarshal(so.Bytes(), out)
+}
+
+// frostServer is one "arena-frost serve" process. It is stateless: every
+// request carries its own key package and nonces, and nonces live only in the
+// validator's memory (frostSessions), never on disk.
+type frostServer struct {
+	cmd *exec.Cmd
+	in  io.WriteCloser
+	out *bufio.Reader
+}
+
+const frostServers = 4
+
+var (
+	frostIdle  = make(chan *frostServer, frostServers)
+	frostSlots = make(chan struct{}, frostServers)
+)
+
+func startFrostServer() (*frostServer, error) {
+	c := exec.Command(frostBin(), "serve")
+	in, err := c.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	o, err := c.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := c.Start(); err != nil {
+		return nil, err
+	}
+	return &frostServer{cmd: c, in: in, out: bufio.NewReaderSize(o, 64<<10)}, nil
+}
+
+func (f *frostServer) kill() {
+	f.in.Close()
+	f.cmd.Process.Kill()
+	go f.cmd.Wait()
+}
+
+// frostServed sends one request to a pooled server. served=false means the
+// pool could not be used and the caller should exec instead.
+func frostServed(cmd string, in []byte) (raw json.RawMessage, err error, served bool) {
+	var f *frostServer
+	select {
+	case f = <-frostIdle:
+	default:
+		select {
+		case f = <-frostIdle:
+		case frostSlots <- struct{}{}:
+			if f, err = startFrostServer(); err != nil {
+				<-frostSlots
+				return nil, nil, false
+			}
+		}
+	}
+	line, _ := json.Marshal(map[string]any{"cmd": cmd, "input": json.RawMessage(in)})
+	type reply struct {
+		b   []byte
+		err error
+	}
+	ch := make(chan reply, 1)
+	go func() {
+		if _, err := f.in.Write(append(line, '\n')); err != nil {
+			ch <- reply{nil, err}
+			return
+		}
+		b, err := f.out.ReadBytes('\n')
+		ch <- reply{b, err}
+	}()
+	var r reply
+	select {
+	case r = <-ch:
+	case <-time.After(10 * time.Second):
+		r.err = errors.New("timeout")
+	}
+	if r.err != nil {
+		f.kill()
+		<-frostSlots
+		return nil, nil, false
+	}
+	frostIdle <- f
+	var res struct {
+		OK    json.RawMessage `json:"ok"`
+		Error string          `json:"error"`
+	}
+	if json.Unmarshal(r.b, &res) != nil {
+		return nil, errors.New("arena-frost serve: bad reply"), true
+	}
+	if res.Error != "" {
+		return nil, errors.New(res.Error), true
+	}
+	return res.OK, nil, true
 }
 
 type frostKeyFile struct {
@@ -208,6 +317,7 @@ type releaseCoordinator struct {
 	pkp      json.RawMessage
 	groupKey string
 	post     func(i int, path string, body any, out any) (int, error)
+	params   Params // genesis app state: keyset, lock margin (for the settler)
 }
 
 func loadCoordinator(root string, post func(int, string, any, any) (int, error)) (*releaseCoordinator, error) {
@@ -224,7 +334,7 @@ func loadCoordinator(root string, post func(int, string, any, any) (int, error))
 	if g.AppState.GroupKey == "" || len(g.AppState.FrostPublic) == 0 {
 		return nil, errors.New("genesis has no FROST group key: re-run arena init")
 	}
-	return &releaseCoordinator{pkp: g.AppState.FrostPublic, groupKey: g.AppState.GroupKey, post: post}, nil
+	return &releaseCoordinator{pkp: g.AppState.FrostPublic, groupKey: g.AppState.GroupKey, post: post, params: g.AppState}, nil
 }
 
 type releaseResult struct {
@@ -235,23 +345,82 @@ type releaseResult struct {
 	Error     string              `json:"error,omitempty"`
 }
 
+// release runs FROST signing for one escrow release. All four validators
+// are asked to commit; the three that agree on the same message (the one at
+// least three of them computed) sign. If a chosen signer fails in round 2,
+// a whole new round runs without it: nonces are never reused (each session
+// is deleted when taken), so a retry always means fresh commitments.
 func (rc *releaseCoordinator) release(req json.RawMessage) (int, releaseResult) {
-	type commit struct {
-		Validator   string          `json:"validator"`
-		Participant int             `json:"participant"`
-		Session     string          `json:"session"`
-		Message     string          `json:"message"`
-		Commitments json.RawMessage `json:"commitments"`
-		Error       string          `json:"error"`
-	}
 	res := releaseResult{GroupKey: rc.groupKey, Cosigners: []string{}, Refusals: []map[string]string{}}
-	commits := make([]commit, frostMax)
+	exclude := map[int]bool{}
+	var code int
+	for attempt := 0; attempt < 2; attempt++ {
+		var failed []int
+		code, failed = rc.round(req, exclude, &res)
+		if code == 200 || len(failed) == 0 {
+			return code, res
+		}
+		for _, f := range failed {
+			exclude[f] = true
+		}
+		if len(exclude) > frostMax-frostMin {
+			break
+		}
+		res.Cosigners, res.Error = []string{}, ""
+	}
+	return code, res
+}
+
+type frostCommit struct {
+	Validator   string          `json:"validator"`
+	Participant int             `json:"participant"`
+	Session     string          `json:"session"`
+	Message     string          `json:"message"`
+	Commitments json.RawMessage `json:"commitments"`
+	Error       string          `json:"error"`
+}
+
+// pickSigners groups the commitments by message and returns the first three
+// that share the message at least three validators agreed on.
+func pickSigners(commits []frostCommit) ([]frostCommit, string) {
+	count := map[string]int{}
+	for _, c := range commits {
+		if c.Error == "" {
+			count[c.Message]++
+		}
+	}
+	var msg string
+	for m, n := range count {
+		if n >= frostMin {
+			msg = m
+		}
+	}
+	if msg == "" {
+		return nil, ""
+	}
+	var chosen []frostCommit
+	for _, c := range commits {
+		if c.Error == "" && c.Message == msg && len(chosen) < frostMin {
+			chosen = append(chosen, c)
+		}
+	}
+	return chosen, msg
+}
+
+// round is one commit + sign round. failed lists validators (0-based) whose
+// round-2 share failed, so the caller can retry without them.
+func (rc *releaseCoordinator) round(req json.RawMessage, exclude map[int]bool, res *releaseResult) (int, []int) {
+	commits := make([]frostCommit, frostMax)
 	var wg sync.WaitGroup
 	for i := 0; i < frostMax; i++ {
+		if exclude[i] {
+			commits[i] = frostCommit{Validator: names[i], Error: "left out after a failed share"}
+			continue
+		}
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			c := commit{Validator: names[i]}
+			c := frostCommit{Validator: names[i]}
 			code, err := rc.post(i, "/frost/commit", req, &c)
 			if err != nil {
 				c.Error = "offline"
@@ -265,27 +434,27 @@ func (rc *releaseCoordinator) release(req json.RawMessage) (int, releaseResult) 
 		}(i)
 	}
 	wg.Wait()
-	// Use the first three validators that agreed on the same release hash.
-	var chosen []commit
-	var msg string
 	var reasons []string
+	res.Refusals = res.Refusals[:0]
 	for _, c := range commits {
 		if c.Error != "" {
 			res.Refusals = append(res.Refusals, map[string]string{"validator": c.Validator, "error": c.Error})
 			reasons = append(reasons, c.Validator+": "+c.Error)
-			continue
 		}
-		if msg == "" {
-			msg = c.Message
-		}
-		if c.Message != msg || len(chosen) == frostMin {
-			continue
-		}
-		chosen = append(chosen, c)
 	}
+	chosen, msg := pickSigners(commits)
 	if len(chosen) < frostMin {
+		n := 0
+		for _, c := range commits {
+			if c.Error == "" {
+				n++
+			}
+		}
+		if n >= frostMin {
+			reasons = append(reasons, "validators computed different release messages")
+		}
 		res.Error = fmt.Sprintf("only %d of 4 validators agreed: %s", len(chosen), strings.Join(reasons, "; "))
-		return 409, res
+		return 409, nil
 	}
 	cm := map[string]json.RawMessage{}
 	for _, c := range chosen {
@@ -296,14 +465,15 @@ func (rc *releaseCoordinator) release(req json.RawMessage) (int, releaseResult) 
 	}
 	if err := frostCall("package", map[string]any{"commitments": cm, "message": msg}, &sp); err != nil {
 		res.Error = "could not build signing package: " + err.Error()
-		return 500, res
+		return 500, nil
 	}
 	shares := map[string]json.RawMessage{}
 	var smu sync.Mutex
 	var failed []string
+	var failedIdx []int
 	for _, c := range chosen {
 		wg.Add(1)
-		go func(c commit) {
+		go func(c frostCommit) {
 			defer wg.Done()
 			var o struct {
 				Share json.RawMessage `json:"share"`
@@ -314,6 +484,7 @@ func (rc *releaseCoordinator) release(req json.RawMessage) (int, releaseResult) 
 			defer smu.Unlock()
 			if err != nil || code != 200 || len(o.Share) == 0 {
 				failed = append(failed, fmt.Sprintf("%s: %s", c.Validator, firstNonEmpty(o.Error, "no share")))
+				failedIdx = append(failedIdx, c.Participant-1)
 				return
 			}
 			shares[strconv.Itoa(c.Participant)] = o.Share
@@ -322,7 +493,7 @@ func (rc *releaseCoordinator) release(req json.RawMessage) (int, releaseResult) 
 	wg.Wait()
 	if len(failed) > 0 {
 		res.Error = "signing round failed: " + strings.Join(failed, "; ")
-		return 502, res
+		return 502, failedIdx
 	}
 	var agg struct {
 		Signature string `json:"signature"`
@@ -330,19 +501,19 @@ func (rc *releaseCoordinator) release(req json.RawMessage) (int, releaseResult) 
 	}
 	if err := frostCall("aggregate", map[string]any{"signing_package": sp.SigningPackage, "shares": shares, "public_key_package": rc.pkp}, &agg); err != nil {
 		res.Error = "aggregate failed: " + err.Error()
-		return 502, res
+		return 502, nil
 	}
 	// Independent check in Go before anything reaches the mint.
 	h, _ := hex.DecodeString(msg)
 	if agg.GroupKey != rc.groupKey || !schnorrVerifyHash(h, rc.groupKey, agg.Signature) {
 		res.Error = "aggregated signature does not verify"
-		return 502, res
+		return 502, nil
 	}
 	for _, c := range chosen {
 		res.Cosigners = append(res.Cosigners, c.Validator)
 	}
 	res.Signature = agg.Signature
-	return 200, res
+	return 200, nil
 }
 
 func firstNonEmpty(a, b string) string {

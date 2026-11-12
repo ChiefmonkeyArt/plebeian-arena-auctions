@@ -12,6 +12,10 @@
 //!   sign      {key_package, nonces, signing_package} -> {share}
 //!   aggregate {signing_package, shares, public_key_package} -> {signature, group_key}
 //!
+//!   serve     (no stdin object) newline-delimited {"cmd", "input"} requests,
+//!             one {"ok"} or {"error"} line back each, until stdin closes.
+//!             Still stateless: nothing is kept between lines (v0.5.0).
+//!
 //! `message` is hex. Signatures are BIP-340 Schnorr over the message bytes, so
 //! a Cashu mint verifies them like any single-key P2PK signature.
 
@@ -20,7 +24,7 @@ use frost::keys::dkg;
 use frost::Identifier;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 
 type Res = Result<Value, String>;
 
@@ -122,8 +126,44 @@ fn run(cmd: &str, v: &Value) -> Res {
     }
 }
 
+/// serve: one long-lived process instead of one exec per call. Each line is
+/// a self-contained request; key packages and nonces arrive with the request
+/// and are dropped when it is answered, exactly as in one-shot mode.
+fn serve() -> ! {
+    let stdin = std::io::stdin();
+    let mut out = std::io::stdout().lock();
+    let mut line = String::new();
+    let mut r = stdin.lock();
+    loop {
+        line.clear();
+        match r.by_ref().take(1 << 20).read_line(&mut line) {
+            Ok(0) | Err(_) => std::process::exit(0),
+            Ok(_) => {}
+        }
+        let res = serde_json::from_str::<Value>(&line)
+            .map_err(|e| format!("bad json: {e}"))
+            .and_then(|v| {
+                let cmd: String = field(&v, "cmd")?;
+                if cmd == "serve" || cmd.starts_with("dkg") {
+                    return Err("not allowed in serve mode".into());
+                }
+                run(&cmd, v.get("input").unwrap_or(&Value::Null))
+            });
+        let reply = match res {
+            Ok(v) => json!({ "ok": v }),
+            Err(e) => json!({ "error": e }),
+        };
+        if writeln!(out, "{reply}").and_then(|_| out.flush()).is_err() {
+            std::process::exit(0);
+        }
+    }
+}
+
 fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_default();
+    if cmd == "serve" {
+        serve();
+    }
     let mut input = String::new();
     let out = std::io::stdin()
         .take(1 << 20)

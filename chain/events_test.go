@@ -13,7 +13,7 @@ import (
 func TestEventStreamPushesHeights(t *testing.T) {
 	var h atomic.Int64
 	h.Store(5)
-	hub := newEventHub(func() (int64, bool) { return h.Load(), true })
+	hub := newEventHub(func(int64) (int64, bool) { return h.Load(), true })
 	srv := httptest.NewServer(gzipMiddleware(hub))
 	defer srv.Close()
 	req, _ := http.NewRequest("GET", srv.URL+"/api/events", nil)
@@ -62,7 +62,7 @@ func TestEventStreamPushesHeights(t *testing.T) {
 }
 
 func TestEventStreamCap(t *testing.T) {
-	hub := newEventHub(func() (int64, bool) { return 1, true })
+	hub := newEventHub(func(int64) (int64, bool) { return 1, true })
 	for i := 0; i < sseMaxSubs; i++ {
 		if _, _, ok := hub.subscribe(); !ok {
 			t.Fatal("under the cap")
@@ -79,7 +79,7 @@ func TestEventStreamCap(t *testing.T) {
 func TestEventStreamFirstEventIsFresh(t *testing.T) {
 	var h atomic.Int64
 	h.Store(5)
-	hub := newEventHub(func() (int64, bool) { return h.Load(), true })
+	hub := newEventHub(func(int64) (int64, bool) { return h.Load(), true })
 	c, _, _ := hub.subscribe()
 	deadline := time.After(3 * time.Second)
 	select {
