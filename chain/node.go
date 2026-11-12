@@ -178,6 +178,8 @@ func cmdNode(args []string) {
 	idx := fs.Int("i", 1, "validator number 1-4")
 	every := fs.Int64("snapshot-every", 1000, "write a state snapshot every N blocks (0: only on clean shutdown)")
 	retain := fs.Int64("retain-blocks", 100000, "prune blocks more than N below the newest snapshot (0: keep every block)")
+	var relays relayURLs
+	fs.Var(&relays, "relay", "relay websocket URL to ingest auction events from (repeatable)")
 	fs.Parse(args)
 	if *every < 0 || *retain < 0 {
 		log.Fatal("-snapshot-every and -retain-blocks must be >= 0")
@@ -288,9 +290,17 @@ func cmdNode(args []string) {
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() { log.Println(srv.ListenAndServe()) }()
 
+	// Relay ingest: subscribe to the configured relay(s) and submit every
+	// verified auction/bid event into THIS node's mempool.  One observer per
+	// relay, per validator; a client thus never has to know which node leads.
+	stopIngest, err := startRelayIngest(context.Background(), relays, fmt.Sprintf("http://127.0.0.1:%d", rpcPort(i)), log.Default())
+	check(err)
+	defer stopIngest()
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
+	stopIngest()
 	srv.Close()
 	close(stopCloser)
 	n.Stop()
