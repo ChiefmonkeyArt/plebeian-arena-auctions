@@ -24,7 +24,10 @@ export function ensureSeed(id) { if (!id.seed) id.seed = bytesToHex(randomBytes(
 // render, and each derivation is a full elliptic-curve multiplication (v0.4.2).
 const pubMemo = new Map();
 const memoPub = (tag, sk, f) => { const k = tag + sk; let v = pubMemo.get(k); if (v === undefined) { v = f(); pubMemo.set(k, v); } return v; };
-export function idPub(id) { return memoPub('n', id.nostrSk, () => getPublicKey(hexToBytes(id.nostrSk))); }
+// A logged-in Nostr user (ADR 0010) has no secret key here: `pubkey` comes
+// from their signer (NIP-07 extension or NIP-46 bunker), which signs events.
+// Their fake-sats wallet key is still local to this browser.
+export function idPub(id) { return id.pubkey || memoPub('n', id.nostrSk, () => getPublicKey(hexToBytes(id.nostrSk))); }
 export function walletPub(id) { return memoPub('w', id.walletSk, () => '02' + bytesToHex(schnorr.getPublicKey(hexToBytes(id.walletSk)))); }
 
 const num = (a) => (a && typeof a.toNumber === 'function' ? a.toNumber() : Number(a));
@@ -47,6 +50,7 @@ export class ArenaClient {
     this.base = base;
     this.mintUrl = (base || (typeof location !== 'undefined' ? location.origin : '')) + '/mint';
     this.cocos = new Map();
+    this.signers = new Map(); // pubkey -> async (template) => signed event, for remote signers
   }
 
   async j(path, opts) {
@@ -108,7 +112,9 @@ export class ArenaClient {
     return k ? num(b[k].spendable ?? b[k].total ?? 0) : 0;
   }
 
-  // Bring plain proofs (a release or a reclaim) into the identity's Coco wallet.
+  // Bring plain proofs (a release, a reclaim, or ecash the validators pushed:
+  // P2PK-locked to this wallet key, which Coco's keyring signs for) into the
+  // identity's Coco wallet.
   async receive(id, proofs) {
     const m = await this.coco(id);
     await m.wallet.receive(getEncodedToken({ mint: this.mintUrl, unit: 'sat', proofs }));
@@ -133,14 +139,24 @@ export class ArenaClient {
     return this.balance(id);
   }
 
+  // Sign a Nostr event as id: with its local key, or through its remote signer.
+  async signEvent(id, tmpl) {
+    if (id.nostrSk) return finalizeEvent(tmpl, hexToBytes(id.nostrSk));
+    const f = this.signers.get(id.pubkey);
+    if (!f) throw new Error('log in again: no signer for this Nostr key');
+    const ev = await f(tmpl);
+    if (!ev || ev.pubkey !== id.pubkey) throw new Error('the signer returned another key');
+    return ev;
+  }
+
   sign(id, kind, content, tags = []) {
-    return finalizeEvent({ kind, created_at: Math.floor(Date.now() / 1000), tags, content: JSON.stringify(content) }, hexToBytes(id.nostrSk));
+    return this.signEvent(id, { kind, created_at: Math.floor(Date.now() / 1000), tags, content: JSON.stringify(content) });
   }
 
   async submit(ev) { return this.j('/api/tx', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(ev) }); }
 
   async createAuction(id, lot) {
-    const ev = this.sign(id, KIND_CREATE, { ...lot, sellerWallet: walletPub(id), name: id.name });
+    const ev = await this.sign(id, KIND_CREATE, { ...lot, sellerWallet: walletPub(id), name: lot.name || id.name });
     const res = await this.submit(ev);
     return { ...res, id: ev.id };
   }
@@ -148,7 +164,11 @@ export class ArenaClient {
   // Coco locks `amount` to the validators' FROST group key (one key; 3 of the 4
   // validators must cooperate to sign for it), SIG_ALL, refundable to the
   // bidder's own wallet key after locktime.
-  async lockForBid(id, amount, params, auction, { force = false, state } = {}) {
+  // Locktime (ADR 0009): a fixed lot ends when it says, so its escrows stay
+  // locked until end + margin. An anti-snipe lot has no end in advance: the
+  // lock runs margin from now (chain time `now`) and the validators re-lock a
+  // leading escrow before it gets near.
+  async lockForBid(id, amount, params, auction, { force = false, state, now = Date.now() / 1000 } = {}) {
     if (!force) {
       const min = auction.highBid ? auction.highAmount + auction.minIncrement : auction.startPrice;
       if (auction.status !== 'open') throw new Error('auction closed');
@@ -157,7 +177,7 @@ export class ArenaClient {
       if ((await this.balance(id)) < amount) throw new Error('not enough sats in wallet');
     }
     const m = await this.coco(id);
-    const locktime = auction.hardEnd + params.lockMarginSec + 15;
+    const locktime = Math.ceil(auction.mode === 'antisnipe' ? now + params.lockMarginSec + 60 : auction.endAt + params.lockMarginSec + 15);
     const prep = await m.ops.send.prepare({
       mintUrl: this.mintUrl, amount,
       target: { type: 'p2pk', options: { kind: 'P2PK', data: params.groupKey, locktime, refundKeys: [walletPub(id)], sigFlag: 'SIG_ALL' } },
@@ -167,7 +187,7 @@ export class ArenaClient {
   }
 
   async bid(id, auction, amount, locked) {
-    const ev = this.sign(id, KIND_BID, { auction: auction.id, amount, wallet: walletPub(id), name: id.name, proofs: locked }, [['e', auction.id]]);
+    const ev = await this.sign(id, KIND_BID, { auction: auction.id, amount, wallet: walletPub(id), name: id.name, proofs: locked }, [['e', auction.id]]);
     const res = await this.submit(ev);
     return { ...res, id: ev.id };
   }
@@ -225,7 +245,7 @@ export class ArenaClient {
   async close() { for (const p of this.cocos.values()) (await p).dispose(); this.cocos.clear(); }
 
   async postChat(id, auctionId, text) {
-    const ev = finalizeEvent({ kind: KIND_CHAT, created_at: Math.floor(Date.now() / 1000), tags: [['e', auctionId], ['name', id.name]], content: text }, hexToBytes(id.nostrSk));
+    const ev = await this.signEvent(id, { kind: KIND_CHAT, created_at: Math.floor(Date.now() / 1000), tags: [['e', auctionId], ['name', id.name]], content: text });
     return this.j('/api/chat', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(ev) });
   }
 }

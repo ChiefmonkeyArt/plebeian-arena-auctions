@@ -69,7 +69,34 @@ func nodeConfig(home string, i int, peers string) *cfg.Config {
 // longer be trusted by this one (v0.3.0: strict lock parser, SIG_ALL with
 // amounts, Nutshell 0.21 keysets). "arena init -if-needed" wipes on mismatch.
 // v0.4.0: "4" (hash excludes height/time, void bids, PBTS, close txs).
-const chainFormat = "4"
+// v0.5.0: "5" (two auction modes, push settlement, settle txs).
+const chainFormat = "5"
+
+// archiveOldLedgers keeps each validator's tx ledger from a chain that is
+// about to be wiped, as run/chain-archive/<format>-<unix>/vN-ledger.jsonl.
+func archiveOldLedgers(root string) {
+	old := "unknown"
+	if b, err := os.ReadFile(filepath.Join(root, "FORMAT")); err == nil {
+		old = strings.TrimSpace(string(b))
+	}
+	dir := filepath.Join(filepath.Dir(root), "chain-archive", fmt.Sprintf("format%s-%d", old, time.Now().Unix()))
+	for i := 0; i < 4; i++ {
+		src := ledgerPath(homeOf(root, i))
+		if st, err := os.Stat(src); err != nil || st.Size() == 0 {
+			continue
+		}
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			log.Printf("archive: %v", err)
+			return
+		}
+		dst := filepath.Join(dir, fmt.Sprintf("v%d-ledger.jsonl", i+1))
+		if err := os.Rename(src, dst); err != nil {
+			log.Printf("archive %s: %v", src, err)
+			continue
+		}
+		fmt.Printf("archived %s to %s\n", src, dst)
+	}
+}
 
 func cmdInit(args []string) {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
@@ -113,6 +140,7 @@ func cmdInit(args []string) {
 	}
 	mustGetJSON(*mint+"/v1/keys/"+kid, &keys)
 
+	archiveOldLedgers(*root)
 	os.RemoveAll(*root)
 	var vals []types.GenesisValidator
 	var nodeIDs []string
@@ -140,7 +168,7 @@ func cmdInit(args []string) {
 		check(os.WriteFile(filepath.Join(homeOf(*root, i), "config", "frost_key.json"), kb, 0o600))
 	}
 	params := Params{MintURL: *mint, KeysetID: kid, Keys: keys.Keysets[0].Keys, GroupKey: groupKey, FrostPublic: pkp, ValidatorNames: names,
-		SoftCloseSec: 20, ExtendSec: 20, MaxExtendSec: 60, LockMarginSec: *margin, MinDurationSec: 20, MaxDurationSec: 7200,
+		MinWindowSec: 15, MaxWindowSec: 900, LockMarginSec: *margin, MinDurationSec: 20, MaxDurationSec: 7200,
 		MaxProofs: 64, Threshold: 3}
 	ab, _ := json.Marshal(params)
 	// PBTS (v0.4.0): block time is the proposer's clock, checked by every
@@ -259,9 +287,23 @@ func cmdNode(args []string) {
 		}
 		writeJSON(w, 200, b)
 	})
+	// /height?after=N waits (up to 20 s) until a block above N is committed:
+	// the gateway long-polls it instead of asking ten times a second (v0.5.0).
 	mux.HandleFunc("/height", func(w http.ResponseWriter, r *http.Request) {
 		h, _, _, _ := app.committedSnapshot()
+		if a := r.URL.Query().Get("after"); a != "" {
+			after, err := strconv.ParseInt(a, 10, 64)
+			if err == nil && after >= h {
+				h = app.waitCommit(r.Context(), after, 20*time.Second)
+			}
+		}
 		writeJSON(w, 200, map[string]int64{"height": h})
+	})
+	// escrows due to move now, with their proofs (push settlement, ADR 0009)
+	mux.HandleFunc("/due", func(w http.ResponseWriter, r *http.Request) {
+		st := cache.get(app)
+		w.Header().Set("X-Height", strconv.FormatInt(st.Height, 10))
+		writeJSON(w, 200, st.dueMoves(time.Now().Unix()))
 	})
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		bs := n.BlockStore()
@@ -328,11 +370,23 @@ type SignOutput struct {
 	B      string `json:"B_"`
 }
 
+// Reveal is one pushed output's secret and blinding factor, so a validator
+// can see what it is signing for: B_ = hash_to_curve(secret) + r*G.
+type Reveal struct {
+	Secret string `json:"secret"`
+	R      string `json:"r"`
+}
+
 type SignReq struct {
 	Bid     string       `json:"bid"`
-	Purpose string       `json:"purpose"` // refund | payout
+	Move    string       `json:"move,omitempty"`   // push: refund | payout | relock
+	Reveal  []Reveal     `json:"reveal,omitempty"` // push: one per output
+	Purpose string       `json:"purpose"` // refund | payout (pull, wallet-authorised) | push (validators' own settlement)
 	Outputs []SignOutput `json:"outputs"`
 	Auth    string       `json:"auth"` // BIP340 sig by the bidder (refund) or seller (payout) wallet over the SIG_ALL hash
+	// Height the asker read the state at: a validator a block behind waits
+	// for it (at most 2 s) before judging, instead of refusing (v0.5.0)
+	Height int64 `json:"height,omitempty"`
 }
 
 // releasePolicy: this validator agrees to a release of escrowed proofs only
@@ -347,6 +401,37 @@ func releasePolicy(app *App, req SignReq) (h [32]byte, code int, err error) {
 			return
 		}
 		au := s.Auctions[bid.Auction]
+		if bid.Settled != "" {
+			err = errors.New("escrow already settled")
+			return
+		}
+		if req.Purpose == "push" {
+			// no wallet authorises a push: the outputs themselves must be
+			// locked to the key the agreed state names (ADR 0009)
+			now := time.Now().Unix()
+			var to string
+			if to, err = s.moveDue(bid, req.Move, now, true); err != nil {
+				return
+			}
+			if len(req.Reveal) != len(req.Outputs) {
+				err = errors.New("every pushed output must be revealed")
+				return
+			}
+			secrets := make([]string, len(req.Reveal))
+			for k, rv := range req.Reveal {
+				b, e := blinded(rv.Secret, rv.R)
+				if e != nil || b != req.Outputs[k].B {
+					err = errors.New("output does not match its revealed secret")
+					return
+				}
+				secrets[k] = rv.Secret
+			}
+			if _, err = s.checkOutputs(bid, req.Move, to, req.Outputs, secrets, now+s.Params.LockMarginSec-2*lockGraceSec); err != nil {
+				return
+			}
+			msg = sigAllMessage(bid.Proofs, req.Outputs)
+			return
+		}
 		switch req.Purpose {
 		case "refund":
 			if bid.Status != "outbid" && bid.Status != "lost" && bid.Status != "void" {
@@ -394,6 +479,9 @@ func releasePolicy(app *App, req SignReq) (h [32]byte, code int, err error) {
 		return h, 409, err
 	}
 	h = sha256.Sum256([]byte(msg))
+	if req.Purpose == "push" {
+		return h, 200, nil
+	}
 	if !schnorrVerifyHash(h[:], authKey, req.Auth) {
 		return h, 403, errors.New("authorisation signature invalid")
 	}
@@ -411,6 +499,9 @@ func handleCommit(w http.ResponseWriter, r *http.Request, app *App, fk frostKeyF
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, 400, map[string]string{"error": "bad request"})
 		return
+	}
+	if req.Height > 0 {
+		app.waitCommit(r.Context(), req.Height-1, 2*time.Second)
 	}
 	h, code, err := releasePolicy(app, req)
 	if err != nil {
@@ -506,7 +597,7 @@ func runCloser(app *App, rpc string, stop <-chan struct{}) {
 		var due [][2]any
 		app.Read(func(s *State) {
 			for id, au := range s.Auctions {
-				if au.Status == "open" && au.EndAt <= now {
+				if au.Status == "open" && (au.EndAt <= now || s.expiring(au, now)) {
 					due = append(due, [2]any{id, au.EndAt})
 				}
 			}

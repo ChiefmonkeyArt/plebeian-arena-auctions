@@ -98,27 +98,31 @@ func signEvent(t *testing.T, sk *btcec.PrivateKey, kind int, content string, at 
 
 const tNow = int64(1_800_000_000)
 
-// liveApp: one open lot (start 100, +10) ending at tNow+100, hard end +160.
+// liveApp: one open fixed-time lot (start 100, +10) ending at tNow+100.
 func liveApp(t *testing.T) (*App, *testMint, string) {
 	m := newTestMint(t)
 	group := hex.EncodeToString(mulG(new(btcec.ModNScalar).SetInt(7)).SerializeCompressed())
 	a := NewApp()
 	a.st.Params = Params{KeysetID: m.id, Keys: map[string]string{}, GroupKey: group, LockMarginSec: 30, MaxProofs: 64,
-		SoftCloseSec: 20, ExtendSec: 20, MaxExtendSec: 60}
+		MinWindowSec: 15, MaxWindowSec: 900}
 	for _, amt := range []int64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512} {
 		a.st.Params.Keys[fmt.Sprint(amt)] = hex.EncodeToString(m.A.SerializeCompressed())
 	}
 	a.st.Height, a.st.Time = 10, tNow
 	id := hx(42)
 	a.st.Auctions[id] = &Auction{ID: id, Seller: hx(7), Status: "open", StartPrice: 100, MinIncrement: 10,
-		EndAt: tNow + 100, HardEnd: tNow + 160}
+		EndAt: tNow + 100, Mode: "fixed"}
 	a.st.Order = []string{id}
 	return a, m, id
 }
 
 func (m *testMint) bidTx(t *testing.T, a *App, b bidder, auction string, amount int64, nonce string) (*Event, []byte) {
 	var proofs []Proof
-	lt := a.st.Auctions[auction].HardEnd + a.st.Params.LockMarginSec
+	au := a.st.Auctions[auction]
+	lt := au.EndAt + a.st.Params.LockMarginSec
+	if au.Mode == "antisnipe" {
+		lt = a.st.Time + a.st.Params.LockMarginSec
+	}
 	left, i := amount, 0
 	for d := int64(512); d >= 1; d /= 2 {
 		for left >= d {

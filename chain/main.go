@@ -181,17 +181,19 @@ func cmdGateway(args []string) {
 	})
 
 	// push: "a block was committed" as Server-Sent Events (events.go)
-	evCl := &http.Client{Timeout: 500 * time.Millisecond}
-	mu.Handle("/api/events", newEventHub(func() (int64, bool) {
+	// the validator long-polls (/height?after=N waits up to 20 s for a block)
+	evCl := &http.Client{Timeout: 25 * time.Second}
+	hub := newEventHub(func(after int64) (int64, bool) {
 		for i := 0; i < 4; i++ {
 			if sup.running(i) {
-				if h, ok := heightFrom(evCl, fmt.Sprintf("http://127.0.0.1:%d/height", httpPort(i))); ok {
+				if h, ok := heightFrom(evCl, fmt.Sprintf("http://127.0.0.1:%d/height?after=%d", httpPort(i), after)); ok {
 					return h, true
 				}
 			}
 		}
 		return 0, false
-	}))
+	})
+	mu.Handle("/api/events", hub)
 
 	// one bid with its proofs, for releasing it
 	mu.HandleFunc("/api/bid", func(w http.ResponseWriter, r *http.Request) {
@@ -321,6 +323,11 @@ func cmdGateway(args []string) {
 		return resp.StatusCode, nil
 	})
 	check(err)
+	// push settlement (ADR 0009): refunds, payouts and relocks the moment
+	// they are due. ARENA_PUSH=0 turns it off (pull release only).
+	if os.Getenv("ARENA_PUSH") != "0" {
+		go newSettler(rc, *mint, sup.running, hub, filepath.Join(filepath.Dir(*root), "settle-journal.jsonl")).run()
+	}
 	mu.HandleFunc("/api/release", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, 405, map[string]string{"error": "POST only"})

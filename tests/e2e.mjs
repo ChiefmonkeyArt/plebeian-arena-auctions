@@ -61,14 +61,47 @@ function pingPong(sock) {
   });
 }
 
+// Push settlement (ADR 0009): the gateway pushes every refund and payout
+// over /api/events the moment the validators have signed it. Listen from the
+// start and keep every "settled" message.
+const settledMsgs = new Map();
+const events = new AbortController();
+(async () => {
+  const res = await fetch(BASE + '/api/events', { signal: events.signal });
+  const rd = res.body.getReader();
+  let buf = '';
+  for (;;) {
+    const { value, done } = await rd.read();
+    if (done) return;
+    buf += new TextDecoder().decode(value);
+    let i;
+    while ((i = buf.indexOf('\n\n')) >= 0) {
+      const line = buf.slice(0, i); buf = buf.slice(i + 2);
+      if (!line.startsWith('data: ')) continue;
+      try { const d = JSON.parse(line.slice(6)); if (d.type === 'settled') settledMsgs.set(d.bid, { ...d, at: Date.now() }); } catch {}
+    }
+  }
+})().catch(() => {});
+// Wait for a pushed settlement, take the ecash into u's wallet and return the
+// message (with the gateway's timings).
+async function pushed(u, bidId, label, since = Date.now()) {
+  const m = await until(async () => settledMsgs.get(bidId), 20000, label + ' pushed');
+  await c.receive(u, m.proofs);
+  m.wait = m.at - since;
+  return m;
+}
+const msTxt = (m) => `pushed ${m.wait} ms after the block · FROST ${m.ms?.frost} ms, mint ${m.ms?.mint} ms`;
+
 const net0 = await c.network();
 ok(net0.filter((v) => v.up).length === 4, 'all four validators up');
 
-step(1, 'Seller creates an auction');
-const cr = await c.createAuction(seller, { title: 'Test lot: 1-of-1 print', description: 'e2e', image: '', category: 'Art', startPrice: 100, minIncrement: 10, durationSec: 30 });
+step(1, 'Seller creates a fixed-time auction');
+const cr = await c.createAuction(seller, { title: 'Test lot: 1-of-1 print', description: 'e2e', image: '', category: 'Art', startPrice: 100, minIncrement: 10, durationSec: 30, mode: 'fixed' });
 let s = await until(async () => { const st = await c.state(); return st.auctions[cr.id] && st; }, 15000, 'create');
 const A = cr.id;
-ok(s.auctions[A].status === 'open' && s.auctions[A].hardEnd === s.auctions[A].endAt + s.params.maxExtendSec, 'auction open with hard end');
+ok(s.auctions[A].status === 'open' && s.auctions[A].mode === 'fixed' && !('hardEnd' in s.auctions[A]), 'fixed-time lot open, no hard end');
+await expectReject(c.createAuction(seller, { title: 'x', description: '', image: '', category: '', startPrice: 100, minIncrement: 10, durationSec: 30, mode: 'antisnipe', windowSec: 5 }), /window/, 'anti-snipe window below the minimum refused');
+await expectReject(c.createAuction(seller, { title: 'x', description: '', image: '', category: '', startPrice: 100, minIncrement: 10, durationSec: 30, mode: 'dutch' }), /mode/, 'unknown auction mode refused');
 
 step(2, 'Fund wallets from the fake-sats faucet and place the first bid');
 for (const u of [alice, bob, carol]) await c.faucet(u, 1000);
@@ -79,78 +112,81 @@ const b1 = await placeBid(alice, A, 100);
 ok(b1.state.auctions[A].highBid === b1.id, 'Alice leads at 100');
 const lock0 = JSON.parse(b1.state.bids[b1.id].proofs[0].secret)[1];
 ok(lock0.data === s.params.groupKey && !lock0.tags.some((t) => t[0] === 'pubkeys' || t[0] === 'n_sigs'), 'escrow is locked to the single FROST group key (no multisig list)');
+ok(Number(lock0.tags.find((t) => t[0] === 'locktime')[1]) >= s.auctions[A].endAt + s.params.lockMarginSec, 'fixed lot: escrow locked until end + margin');
 ok(await bal(alice) === 900, 'Coco wallet shows 900 after locking 100');
 await expectReject(c.claim(alice, b1.state.bids[b1.id], 'refund', s.params), /validators agreed/, 'validators refuse to refund the leading bid');
 
-step(3, 'Outbid -> instant refund co-signed by validators');
+step(3, 'Outbid -> the refund is pushed to the wallet, nobody asks for it');
+let t = Date.now();
 const b2 = await placeBid(bob, A, 110);
 s = b2.state;
 ok(s.bids[b1.id].status === 'outbid', 'Alice marked outbid');
-const r1 = await c.claim(alice, s.bids[b1.id], 'refund', s.params);
-ok(await bal(alice) === 1000 && r1.cosigners.length === 3, `Alice refunded 100 instantly by a FROST signature from ${r1.cosigners.join(', ')}`);
-ok(/^[0-9a-f]{128}$/.test(r1.signature), 'release is one 64-byte BIP-340 signature');
-await expectReject(c.claim(alice, s.bids[b1.id], 'refund', s.params), /already spent|spent/i, 'second refund of the same escrow rejected by mint');
+const p1 = await pushed(alice, b1.id, "Alice's refund", t);
+ok(await bal(alice) === 1000 && p1.move === 'refund' && p1.cosigners?.length === 3, `Alice's 100 back in her wallet, signed by ${p1.cosigners?.join(', ')} · ${msTxt(p1)}`);
+ok(p1.proofs.every((p) => JSON.parse(p.secret)[1].data === s.bids[b1.id].wallet), "the pushed ecash is locked to Alice's wallet key");
+await until(async () => (await c.bidWithProofs(b1.id)).settled === 'refund', 10000, 'settle tx on chain');
+ok(true, 'settle tx recorded on chain');
+await expectReject(c.claim(alice, s.bids[b1.id], 'refund', s.params), /settled|spent/i, 'a pull release of the pushed escrow is refused');
 await expectReject(placeBid(carol, A, 115), /at least 120/, 'under-increment bid stopped by the client before locking');
 {
-  // v0.4.0 (ADR 0007): a locked bid that lost the race is recorded as void
-  // and refunded at once, instead of staying locked until locktime
+  // ADR 0007: a locked bid that lost the race is recorded as void and
+  // (v0.5.0) its refund is pushed straight back
   const st = await c.state();
   const { locked } = await c.lockForBid(carol, 115, st.params, st.auctions[A], { force: true, state: st });
+  t = Date.now();
   const r = await c.bid(carol, st.auctions[A], 115, locked);
   ok(r.ok && /at least 120/.test(r.late || ''), `under-increment locked bid answered at once as late -> "${r.late}"`);
   const sv = await until(async () => { const x = await c.state(); return x.bids[r.id] && x; }, 15000, 'void bid commit');
   ok(sv.bids[r.id].status === 'void' && !sv.auctions[A].bids.includes(r.id) && sv.auctions[A].highBid === b2.id, 'recorded on chain as void; Bob still leads');
-  await until(async () => (await c.network()).filter((v) => v.up).every((v) => v.height >= sv.bids[r.id].height), 15000, 'all validators at the void block');
-  const rv = await c.claim(carol, sv.bids[r.id], 'refund', sv.params);
-  ok(await bal(carol) === 1000 && rv.cosigners.length === 3, `Carol's late 115 refunded at once by ${rv.cosigners.join(', ')}`);
+  const pv = await pushed(carol, r.id, "Carol's late bid", t);
+  ok(await bal(carol) === 1000, `Carol's late 115 pushed back · ${msTxt(pv)}`);
   const v = await c.view([idPub(carol)]);
-  ok(v.state.bids[r.id]?.status === 'void' && !(await c.view([idPub(alice)])).state.bids[r.id], "the void bid is in Carol's view only");
+  ok(v.state.bids[r.id]?.status === 'void' && v.state.bids[r.id]?.settled === 'refund' && !(await c.view([idPub(alice)])).state.bids[r.id], "the void bid is in Carol's view only, marked settled");
 }
 await expectReject((async () => { const st = await c.state(); return c.bid(seller, st.auctions[A], 500, []); })(), /proof count/, 'a bid without an escrow is refused outright');
 
-step(4, 'Late bid extends the clock (anti-sniping)');
-s = await c.state();
-// wall clock: with blocks on demand the last block's time can be old
-await until(async () => { const st = await c.state(); return st.auctions[A].endAt - Date.now() / 1000 < st.params.softCloseSec - 2; }, 30000, 'soft-close window');
+step(4, 'Fixed time: a last-seconds bid does not move the end');
+await until(async () => { const st = await c.state(); return st.auctions[A].endAt - Date.now() / 1000 < 12; }, 30000, 'last seconds');
 const endBefore = (await c.state()).auctions[A].endAt;
+t = Date.now();
 const b3 = await placeBid(carol, A, 200);
-ok(b3.state.bids[b3.id].extended && b3.state.auctions[A].endAt > endBefore, `end moved ${endBefore} -> ${b3.state.auctions[A].endAt}`);
-ok(b3.state.auctions[A].endAt <= b3.state.auctions[A].hardEnd, 'extension capped by hard end');
+ok(!b3.state.bids[b3.id].extended && b3.state.auctions[A].endAt === endBefore && b3.state.auctions[A].extensions === 0, `end stays at ${endBefore}`);
+const pb = await pushed(bob, b2.id, "Bob's refund", t);
+ok(await bal(bob) === 1000, `Bob's 110 pushed back · ${msTxt(pb)}`);
 
-step(5, 'Stop Validator 4; bidding continues on 3 of 4');
+step(5, 'Stop Validator 4; bidding and push refunds continue on 3 of 4');
 await c.j('/api/admin/validator/4/stop', { method: 'POST' });
 const h0 = (await c.state()).height;
 await until(async () => { const n = await c.network(); return !n[3].up && n; }, 10000, 'V4 down');
+t = Date.now();
 const b4 = await placeBid(alice, A, 250);
 const net1 = await c.network();
 ok(!net1[3].up && net1.slice(0, 3).every((v) => v.up && v.height >= b4.state.bids[b4.id].height), 'V4 down, V1-V3 commit the next bid');
 ok(b4.state.auctions[A].highBid === b4.id, 'Alice leads at 250 with only 3 validators');
-s = b4.state;
-const r3 = await c.claim(carol, s.bids[b3.id], 'refund', s.params);
-ok(!r3.cosigners.includes('Validator 4') && r3.cosigners.length === 3, 'Carol refunded by V1-V3 while V4 is offline');
+const p3 = await pushed(carol, b3.id, "Carol's refund", t);
+ok(!p3.cosigners.includes('Validator 4') && p3.cosigners.length === 3 && await bal(carol) === 1000, `Carol refunded by ${p3.cosigners.join(', ')} while V4 is offline · ${msTxt(p3)}`);
 
-step(6, 'Auction auto-closes; validators agree on the winner');
+step(6, 'Auction closes at the end; the payout is pushed to the seller');
 s = await until(async () => { const st = await c.state(); return st.auctions[A].status === 'closed' && st; }, 200000, 'close');
+const closedSeen = Date.now();
 const lateBy = Date.now() / 1000 - s.auctions[A].endAt;
 ok(s.auctions[A].winner === b4.id && s.bids[b4.id].status === 'won', 'Alice wins at 250');
 ok(lateBy < 4 && s.auctions[A].closedAt - s.auctions[A].endAt <= 2, `closed by the validators' close txs ${lateBy.toFixed(1)} s after the end (block time +${s.auctions[A].closedAt - s.auctions[A].endAt} s)`);
-// compare app hashes at one height (validators can be a block apart for a moment)
 const net2 = await until(async () => { const n = (await c.network()).filter((v) => v.up); return n.every((v) => v.height === n[0].height) && n; }, 20000, 'validators at one height');
-const hashes = new Set(net2.map((v) => v.appHash));
-ok(hashes.size === 1, `running validators report the same app hash at height ${net2[0].height}`);
+ok(new Set(net2.map((v) => v.appHash)).size === 1, `running validators report the same app hash at height ${net2[0].height}`);
+const pay = await pushed(seller, b4.id, 'payout', closedSeen);
+ok(pay.move === 'payout' && await bal(seller) === 250, `seller's 250 pushed ${Math.round(pay.at / 1000 - s.auctions[A].endAt * 1)} s after the end · ${msTxt(pay)}`);
 
-step(7, 'Seller payout (needs 3 of 4, seller-authorised)');
-await expectReject(c.claim(alice, s.bids[b4.id], 'payout', s.params), /validators agreed/, 'winner cannot redirect the payout');
-await expectReject(c.claim(seller, s.bids[b2.id], 'payout', s.params), /validators agreed/, 'losing bid cannot be paid to seller');
-const pay = await c.claim(seller, s.bids[b4.id], 'payout', s.params);
-ok(await bal(seller) === 250 && pay.amount === 250, 'seller received 250 in Coco');
+step(7, 'Nobody can redirect a settled escrow');
+await expectReject(c.claim(alice, s.bids[b4.id], 'payout', s.params), /validators agreed|settled/, 'winner cannot take the payout');
+await expectReject(c.claim(seller, s.bids[b2.id], 'payout', s.params), /validators agreed|settled/, 'losing bid cannot be paid to seller');
 
 step('V', 'Slim client view (v0.3.1): no proofs, 304 when unchanged, gzip, proofs on demand');
 const v1 = await c.view([idPub(bob)]);
 const vb = Object.values(v1.state.bids);
 ok(v1.state.view === 'client' && !('usedY' in v1.state) && typeof v1.state.usedCount === 'number', 'view drops the used-token list (count only)');
 ok(vb.length > 0 && vb.every((b) => !('proofs' in b) && b.proofCount > 0), 'bids carry proofCount, not proofs');
-ok(v1.state.bids[b2.id] && v1.state.bids[b2.id].status === 'lost', "Bob's unsettled losing bid is in his view");
+ok(v1.state.bids[b2.id] && v1.state.bids[b2.id].status === 'lost' && v1.state.bids[b2.id].settled === 'refund', "Bob's losing bid is in his view, marked settled");
 ok(JSON.stringify(v1.state).length < JSON.stringify(await c.state()).length, 'view is smaller than the full state');
 ok(/^"[0-9a-f]{24}"$/.test(v1.etag), 'view has an ETag');
 ok((await c.view([idPub(bob)], v1.etag)) === null, 'unchanged view answers 304 Not Modified');
@@ -204,21 +240,33 @@ const bad = await upgrade('/mint/v1/info');
 // 400 from the gateway; behind nginx the headers are stripped first, so a plain answer
 ok(bad.status !== 101, `no upgrade off /v1/ws (${bad.status})`);
 
-step(8, 'Loser refunds; two validators cannot release, forged signatures fail');
-await c.j('/api/admin/validator/3/stop', { method: 'POST' });
-await c.j('/api/admin/validator/4/stop', { method: 'POST' });
-await expectReject(c.claim(bob, s.bids[b2.id], 'refund', s.params), /only 2 of 4 validators agreed/, 'with two validators offline no release signature can be made');
-await c.j('/api/admin/validator/3/start', { method: 'POST' });
-await until(async () => (await c.network())[2].up, 30000, 'V3 back');
-const forged = bytesToHex(schnorr.sign(new Uint8Array(32).fill(1), hexToBytes(bob.walletSk)));
-const fx = await c.rawRelease(s.bids[b2.id], [forged], s.params);
-ok(!fx.body.signatures, `mint rejects a signature not made by the group key -> "${String(fx.body.detail).slice(0, 60)}"`);
-const r2 = await c.claim(bob, v1.state.bids[b2.id], 'refund', s.params); // lite bid: claim fetches its proofs
-ok(await bal(bob) === 1000 && r2.cosigners.length === 3, `Bob refunded 110 by ${r2.cosigners.join(', ')}`);
-await expectReject(c.claim(alice, s.bids[b4.id], 'refund', s.params), /validators agreed/, 'winning escrow cannot be refunded');
-
-step(9, 'Restart Validator 4; it catches up from its peers');
+step(8, 'Anti-snipe lot: every bid in the last 15 s puts the clock back to 15 s');
 await c.j('/api/admin/validator/4/start', { method: 'POST' });
+const cb = await c.createAuction(seller, { title: 'Anti-snipe probe', description: '', image: '', category: 'Art', startPrice: 100, minIncrement: 10, durationSec: 20, mode: 'antisnipe', windowSec: 15 });
+let sb = await until(async () => { const st = await c.state(); return st.auctions[cb.id] && st; }, 15000, 'create anti-snipe');
+const B = cb.id, endB0 = sb.auctions[B].endAt;
+ok(sb.auctions[B].mode === 'antisnipe' && sb.auctions[B].windowSec === 15, 'anti-snipe lot open, window 15 s');
+await until(async () => endB0 - Date.now() / 1000 < 12, 30000, 'inside the window');
+const x1 = await placeBid(bob, B, 100);
+const ltB = Number(JSON.parse(x1.state.bids[x1.id].proofs[0].secret)[1].tags.find((tg) => tg[0] === 'locktime')[1]);
+ok(x1.state.bids[x1.id].extended && Math.abs(x1.state.auctions[B].endAt - (x1.state.bids[x1.id].time + 15)) <= 0, `bid with ${(endB0 - x1.state.bids[x1.id].time)} s left reset the clock to 15 s`);
+ok(ltB >= Date.now() / 1000 + sb.params.lockMarginSec - 120 && ltB < endB0 + sb.params.lockMarginSec + 120, 'anti-snipe escrow locked margin from now (validators re-lock it while the lot runs)');
+await sleep(6000);
+t = Date.now();
+const x2 = await placeBid(alice, B, 110);
+ok(x2.state.auctions[B].extensions === 2 && x2.state.auctions[B].endAt > endB0 + 5, `second reset: end ${endB0} -> ${x2.state.auctions[B].endAt}, no cap`);
+const px = await pushed(bob, x1.id, "Bob's anti-snipe refund", t);
+ok(await bal(bob) === 1000, `Bob's 100 pushed back · ${msTxt(px)}`);
+// forged signatures still fail at the mint on a live escrow
+const forged = bytesToHex(schnorr.sign(new Uint8Array(32).fill(1), hexToBytes(alice.walletSk)));
+const fx = await c.rawRelease((await c.bidWithProofs(x2.id)), [forged], sb.params);
+ok(!fx.body.signatures, `mint rejects a signature not made by the group key -> "${String(fx.body.detail).slice(0, 60)}"`);
+sb = await until(async () => { const st = await c.state(); return st.auctions[B].status === 'closed' && st; }, 60000, 'anti-snipe close');
+ok(sb.auctions[B].winner === x2.id && !sb.auctions[B].expired, 'closed 15 s after the last bid; Alice wins');
+const pay2 = await pushed(seller, x2.id, 'anti-snipe payout', Date.now());
+ok(await bal(seller) === 360, `seller's 110 pushed · ${msTxt(pay2)}`);
+
+step(9, 'Validator 4 (restarted in step 8) caught up from its peers');
 const caught = await until(async () => {
   const n = await c.network();
   return n.every((v) => v.up) && Math.abs(n[3].height - n[0].height) <= 1 && n[3].height > h0 && n;
@@ -250,10 +298,18 @@ step('C', 'Conservation of fake sats');
 const [bs, ba, bb, bc] = await Promise.all([seller, alice, bob, carol].map(bal));
 const total = bs + ba + bb + bc + pendingReclaim;
 ok(total === 3000, `seller ${bs} + alice ${ba} + bob ${bb} + carol ${bc}${pendingReclaim ? ` + ${pendingReclaim} awaiting locktime` : ''} = ${total} (3000 minted)`);
-const st = await c.state();
-const escrows = st.auctions[A].bids.map((b) => st.bids[b]);
+// the settle tx lands one block after the push: give it a few seconds
+let st, escrows;
+for (let i = 0; i < 20; i++) {
+  st = await c.state();
+  escrows = [...st.auctions[A].bids, ...st.auctions[A].voids || [], ...st.auctions[B].bids].map((b) => st.bids[b]);
+  if (escrows.every((b) => b.settled)) break;
+  await sleep(250);
+}
 const spent = await Promise.all(escrows.map((b) => c.spent(b.proofs).then((x) => x.every(Boolean))));
 ok(spent.every(Boolean), 'every escrow is settled at the mint (nothing stranded)');
+ok(escrows.every((b) => b.settled), 'every escrow is recorded as settled on chain');
+events.abort();
 await c.close();
 console.log(`\nRESULT: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

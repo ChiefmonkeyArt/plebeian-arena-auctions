@@ -80,3 +80,20 @@
   .net-dots i { width: 5px; height: 5px; }
 }
 .arena-loading .c-ladder, .arena-loading .c-custom, .arena-loading .swipe, .arena-loading .c-sticky { opacity: .35; pointer-events: none; }
+
+/* v0.5.0: login, quick lots, parody label */
+.tag.parody:empty { display: none; }
+.tag.parody { background: #FFF1D6; color: #8A4B00; }
+.switch .you .av { width: 22px; height: 22px; }
+.switch .av img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
+.login-chip { padding: 6px 12px; border-radius: 99px; font-weight: 700; font-size: 13px; background: var(--accent); color: var(--accent-ink); }
+.quick-lots { margin: 10px 0 4px; padding: 12px; border: 1px dashed #E2D3C4; border-radius: 12px; font-size: 13px; }
+.quick-lots .ql-row { display: flex; gap: 8px; margin-top: 8px; }
+.quick-lots .ql-row button { flex: 1; }
+.login-card { display: grid; gap: 10px; }
+.login-card .lg-label { display: grid; gap: 5px; font-size: 12.5px; font-weight: 700; color: #6E625A; }
+.login-card input { font: inherit; padding: 10px 12px; border: 1px solid #E2D3C4; border-radius: 10px; }
+.connect-uri { display: grid; gap: 6px; }
+.connect-uri code { font-size: 11px; word-break: break-all; max-height: 4.5em; overflow: auto; background: #F6EFE8; padding: 6px; border-radius: 8px; }
+.login-status:empty { display: none; }
+.login-status { color: #B3261E; font-size: 13px; }

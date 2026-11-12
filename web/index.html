@@ -34,10 +34,10 @@
   <div class="arena-ticker" aria-hidden="true"><div class="arena-ticker-track" data-ticker></div></div>
   <header class="c-head">
     <div>
-      <div class="c-tags"><span class="live-badge" data-v="livebadge"><i></i>LIVE</span><span class="tag">Lot <span data-v="lotno"></span></span><span class="tag" data-v="closemode"></span><span class="tag" data-v="consensus"></span></div>
+      <div class="c-tags"><span class="live-badge" data-v="livebadge"><i></i>LIVE</span><span class="tag">Lot <span data-v="lotno"></span></span><span class="tag" data-v="closemode"></span><span class="tag parody" data-v="parody"></span><span class="tag" data-v="consensus"></span></div>
       <h1 data-v="title">Loading the arena…</h1>
     </div>
-    <button class="c-seller" data-act="seller-sheet"><img src="./assets/live-frame.jpg" alt=""><span><b data-v="sellername">Seller</b><small data-v="sellermeta"></small></span></button>
+    <button class="c-seller" data-act="seller-sheet"><img data-v="sellerimg" src="./assets/live-frame.jpg" alt=""><span><b data-v="sellername">Seller</b><small data-v="sellermeta"></small></span></button>
   </header>
 
   <div class="c-grid">
@@ -118,7 +118,7 @@
     <div class="c-stats">
       <div><b data-v="bidcountn"></b><span>bids</span></div>
       <div><b data-v="bidders"></b><span>bidders</span></div>
-      <div><b data-v="extensionsn"></b><span>time extensions</span></div>
+      <div><b data-v="extensionsn"></b><span>clock resets</span></div>
       <div><b data-v="held"></b><span>sats you have held</span></div>
     </div>
     <div class="v-strip" data-slot="vstrip"></div>
@@ -191,12 +191,16 @@
   <aside class="drawer-card" role="dialog" aria-label="List a lot">
     <header><h2>List a lot</h2><button class="x" data-act="close-drawer" aria-label="Close">×</button></header>
     <p class="w-note">Listing as <b data-v="username"></b>. The clock starts when validators include it in a block.</p>
+    <div class="quick-lots"><b>One click:</b> a random parody lot, Bitcoin merch “sold” by a leader of the past.
+      <div class="ql-row"><button class="btn-primary" data-act="quick-lot" data-mode="fixed">Fixed time</button><button class="btn-primary" data-act="quick-lot" data-mode="antisnipe">Anti-snipe</button></div></div>
     <form class="lot-form" data-act="lot-form">
       <label>Title<input name="title" required maxlength="120" value="Leica M3 rangefinder, 1957"></label>
       <label>Description<textarea name="description" rows="3" maxlength="2000">Clean glass, recent service, original strap.</textarea></label>
-      <label>Photo<select name="image"><option value="./assets/lot-camera.jpg">Camera</option><option value="./assets/lot-keyboard.jpg">Keyboard</option><option value="./assets/watch-1.jpg">Watch</option></select></label>
+      <label>Photo<select name="image"><option value="./assets/lot-camera.jpg">Camera</option><option value="./assets/lot-keyboard.jpg">Keyboard</option><option value="./assets/watch-1.jpg">Watch</option><option value="./assets/merch/hoodie.webp">Hoodie</option><option value="./assets/merch/mug.webp">Mug</option><option value="./assets/merch/coin.webp">Coin</option><option value="./assets/merch/hwwallet.webp">Hardware wallet</option></select></label>
       <div class="lf-row"><label>Start (sats)<input name="startPrice" type="number" min="1" value="1000"></label><label>Step (sats)<input name="minIncrement" type="number" min="1" value="100"></label></div>
       <label>Duration<select name="durationSec"><option value="60">1 minute</option><option value="120" selected>2 minutes</option><option value="300">5 minutes</option><option value="900">15 minutes</option></select></label>
+      <div class="lf-row"><label>Close<select name="mode"><option value="fixed">Fixed time</option><option value="antisnipe">Anti-snipe</option></select></label><label>Window (s)<input name="windowSec" type="number" min="15" max="900" value="30"></label></div>
+      <p class="w-note">Fixed time ends on the clock, never later. Anti-snipe: a bid with less than the window left puts the clock back to the window, until nobody bids for that long.</p>
       <button class="btn-primary block">Sign and list</button>
     </form>
   </aside>
@@ -220,6 +224,22 @@
   <div class="modal-card narrow" role="dialog" aria-label="Seller">
     <button class="x" data-act="close-modal" aria-label="Close">×</button>
     <div data-slot="seller-full"></div>
+  </div>
+</div>
+
+<div class="modal" data-modal="login" hidden>
+  <div class="drawer-bg" data-act="close-modal"></div>
+  <div class="modal-card narrow login-card" role="dialog" aria-label="Log in with Nostr">
+    <button class="x" data-act="close-modal" aria-label="Close">×</button>
+    <h2>Log in with Nostr</h2>
+    <p class="w-note">Your key signs your bids and listings. The fake-sats wallet stays in this browser. Bots keep bidding against you.</p>
+    <button class="btn-primary block" data-act="login-ext">Browser extension</button>
+    <label class="lg-label">Signer app (bunker link)<input data-in="bunker" placeholder="bunker://…" autocomplete="off" spellcheck="false"></label>
+    <button class="btn-ghost block" data-act="login-bunker">Connect bunker</button>
+    <button class="btn-ghost block" data-act="login-connect">Show a nostrconnect link</button>
+    <div class="connect-uri" data-slot="connect-uri" hidden><a target="_blank" rel="noopener noreferrer">Open in signer app</a><code></code><button class="btn-ghost sm" data-act="copy-uri">Copy</button></div>
+    <p class="login-status" data-slot="login-status" role="status"></p>
+    <p class="w-note" data-slot="you-row" hidden>Logged in as <b data-v="youname"></b> <button class="btn-ghost sm" data-act="logout">Log out</button></p>
   </div>
 </div>
 

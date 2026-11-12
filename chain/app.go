@@ -28,9 +28,8 @@ type Params struct {
 	GroupKey       string            `json:"groupKey"`    // FROST 3-of-4 escrow key (compressed hex); no single validator holds it
 	FrostPublic    json.RawMessage   `json:"frostPublic"` // FROST public key package: group key + each validator's verifying share
 	ValidatorNames []string          `json:"validatorNames"`
-	SoftCloseSec   int64             `json:"softCloseSec"`
-	ExtendSec      int64             `json:"extendSec"`
-	MaxExtendSec   int64             `json:"maxExtendSec"`
+	MinWindowSec   int64             `json:"minWindowSec"` // anti-snipe window bounds (ADR 0009)
+	MaxWindowSec   int64             `json:"maxWindowSec"`
 	LockMarginSec  int64             `json:"lockMarginSec"`
 	MinDurationSec int64             `json:"minDurationSec"`
 	MaxDurationSec int64             `json:"maxDurationSec"`
@@ -52,13 +51,15 @@ type Auction struct {
 	CreatedAt    int64    `json:"createdAt"`
 	CreatedH     int64    `json:"createdHeight"`
 	EndAt        int64    `json:"endAt"`
-	HardEnd      int64    `json:"hardEnd"`
+	Mode         string   `json:"mode"`      // fixed | antisnipe (ADR 0009)
+	WindowSec    int64    `json:"windowSec"` // antisnipe: a bid with less than this left resets the clock to it
 	Status       string   `json:"status"` // open | closed
 	HighBid      string   `json:"highBid"`
 	HighAmount   int64    `json:"highAmount"`
 	Bids         []string `json:"bids"`
 	Extensions   int      `json:"extensions"`
 	Winner       string   `json:"winner"`          // bid id
+	Expired      bool     `json:"expired,omitempty"` // antisnipe ran so long the leading escrow neared its locktime: no sale
 	Voids        []string `json:"voids,omitempty"` // late bids, refundable at once (ADR 0007)
 	ClosedAt     int64    `json:"closedAt"`
 	ClosedH      int64    `json:"closedHeight"`
@@ -77,6 +78,10 @@ type Bid struct {
 	Time     int64   `json:"time"`
 	Status   string  `json:"status"` // leading | outbid | won | lost | void
 	Extended bool    `json:"extended"`
+	// Push settlement (ADR 0009): the validators moved the escrow themselves.
+	Settled string  `json:"settled,omitempty"` // refund | payout, once the new ecash is minted
+	Out     []Proof `json:"out,omitempty"`     // that ecash, P2PK-locked to the recipient
+	Relocks int     `json:"relocks,omitempty"` // antisnipe: escrow re-locked with a later locktime
 }
 
 type Rejection struct {
@@ -154,6 +159,33 @@ type App struct {
 	// hash of committed; Info reports it with committedH (ADR 0003 §2)
 	committedHash []byte
 	snap          *snapshotter // nil: no snapshots (tests)
+	commitCh      chan struct{} // closed and replaced at every Commit (for /height?after=)
+}
+
+// waitCommit blocks until the committed height is above after, the context
+// ends or max passes; it returns the committed height then.
+func (a *App) waitCommit(ctx context.Context, after int64, max time.Duration) int64 {
+	t := time.NewTimer(max)
+	defer t.Stop()
+	for {
+		a.mu.Lock()
+		h := a.committedH
+		if a.commitCh == nil {
+			a.commitCh = make(chan struct{})
+		}
+		ch := a.commitCh
+		a.mu.Unlock()
+		if h > after {
+			return h
+		}
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return h
+		case <-t.C:
+			return h
+		}
+	}
 }
 
 func NewApp() *App { return &App{st: newState()} }
@@ -176,7 +208,7 @@ func (a *App) Info(context.Context, *abci.InfoRequest) (*abci.InfoResponse, erro
 	defer a.mu.RUnlock()
 	// The committed height and hash: 0 on a fresh start (CometBFT replays
 	// from genesis), or a restored snapshot's (it replays only what follows).
-	return &abci.InfoResponse{Data: "arena-auctions", Version: "0.4.2", AppVersion: 1,
+	return &abci.InfoResponse{Data: "arena-auctions", Version: "0.5.0", AppVersion: 1,
 		LastBlockHeight: a.committedH, LastBlockAppHash: a.committedHash}, nil
 }
 
@@ -199,6 +231,8 @@ type CreateContent struct {
 	StartPrice   int64  `json:"startPrice"`
 	MinIncrement int64  `json:"minIncrement"`
 	DurationSec  int64  `json:"durationSec"`
+	Mode         string `json:"mode"`
+	WindowSec    int64  `json:"windowSec"`
 	SellerWallet string `json:"sellerWallet"`
 	Name         string `json:"name"`
 }
@@ -319,6 +353,16 @@ func (s *State) applyCreate(ev *Event, now, height int64, apply bool) error {
 		return fmt.Errorf("duration must be %d-%d seconds", p.MinDurationSec, p.MaxDurationSec)
 	case !isPubHex(strings.ToLower(c.SellerWallet)):
 		return errors.New("seller wallet pubkey invalid")
+	case c.Mode != "" && c.Mode != "fixed" && c.Mode != "antisnipe":
+		return errors.New("mode must be fixed or antisnipe")
+	case c.Mode == "antisnipe" && (c.WindowSec < p.MinWindowSec || c.WindowSec > p.MaxWindowSec):
+		return fmt.Errorf("anti-snipe window must be %d-%d seconds", p.MinWindowSec, p.MaxWindowSec)
+	case c.Mode != "antisnipe" && c.WindowSec != 0:
+		return errors.New("a fixed-time lot has no anti-snipe window")
+	}
+	mode := c.Mode
+	if mode == "" {
+		mode = "fixed"
 	}
 	if !apply {
 		return nil
@@ -328,14 +372,29 @@ func (s *State) applyCreate(ev *Event, now, height int64, apply bool) error {
 		ID: ev.ID, Seller: ev.Pubkey, SellerWallet: strings.ToLower(c.SellerWallet), SellerName: c.Name,
 		Title: c.Title, Description: c.Description, Image: c.Image, Category: c.Category,
 		StartPrice: c.StartPrice, MinIncrement: c.MinIncrement, CreatedAt: now, CreatedH: height,
-		EndAt: end, HardEnd: end + p.MaxExtendSec, Status: "open", Bids: []string{},
+		EndAt: end, Mode: mode, WindowSec: c.WindowSec, Status: "open", Bids: []string{},
 	}
 	s.Order = append(s.Order, ev.ID)
 	return nil
 }
 
+// lockGraceSec: an anti-snipe bid's locktime is checked against the block
+// time, which the bidder can only estimate, so it may fall this short.
+const lockGraceSec = 30
+
+// minLocktime is the earliest refund locktime a bid on au may carry at block
+// time now. Fixed lots never move their end, so the lock covers end+margin.
+// Anti-snipe lots have no end in advance: the lock covers margin from now and
+// the validators re-lock a leading escrow before it gets close (ADR 0009).
+func (s *State) minLocktime(au *Auction, now int64) int64 {
+	if au.Mode == "antisnipe" {
+		return now + s.Params.LockMarginSec - lockGraceSec
+	}
+	return au.EndAt + s.Params.LockMarginSec
+}
+
 // checkLock enforces the 3-of-4 validator lock with the bidder's refund path.
-func (s *State) checkLock(proofs []Proof, wallet string, hardEnd int64) (int64, error) {
+func (s *State) checkLock(proofs []Proof, wallet string, minLock int64) (int64, error) {
 	p := s.Params
 	var firstTags string
 	var lt int64
@@ -353,7 +412,7 @@ func (s *State) checkLock(proofs []Proof, wallet string, hardEnd int64) (int64, 
 		if len(l.Refund) != 1 || l.Refund[0] != wallet {
 			return 0, errors.New("refund path must be the bidder's wallet key only")
 		}
-		if l.Locktime < hardEnd+p.LockMarginSec {
+		if l.Locktime < minLock {
 			return 0, errors.New("locktime too early: validators need time to settle")
 		}
 		if i == 0 {
@@ -432,7 +491,7 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 	if sum != b.Amount {
 		return fmt.Errorf("proofs total %d but bid is %d", sum, b.Amount)
 	}
-	lt, err := s.checkLock(b.Proofs, wallet, au.HardEnd)
+	lt, err := s.checkLock(b.Proofs, wallet, s.minLocktime(au, now))
 	if err != nil {
 		return err
 	}
@@ -472,20 +531,23 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 	if au.HighBid != "" {
 		s.Bids[au.HighBid].Status = "outbid"
 	}
-	if au.EndAt-now < s.Params.SoftCloseSec {
-		ne := now + s.Params.ExtendSec
-		if ne > au.HardEnd {
-			ne = au.HardEnd
-		}
-		if ne > au.EndAt {
-			au.EndAt = ne
-			au.Extensions++
-			bid.Extended = true
-		}
+	// Anti-snipe (ADR 0009): a bid with less than the window left puts the
+	// clock back to the window. No cap: the lot ends when the bidding stops.
+	// Fixed lots end at their set time, whatever happens.
+	if au.Mode == "antisnipe" && au.EndAt-now < au.WindowSec {
+		au.EndAt = now + au.WindowSec
+		au.Extensions++
+		bid.Extended = true
 	}
 	au.HighBid, au.HighAmount = ev.ID, b.Amount
 	au.Bids = append(au.Bids, ev.ID)
 	return nil
+}
+
+// expiring: an anti-snipe lot's leading escrow is within a quarter of the
+// lock margin of its locktime, so no relock has landed in time.
+func (s *State) expiring(au *Auction, now int64) bool {
+	return au.Mode == "antisnipe" && au.HighBid != "" && s.Bids[au.HighBid].Locktime-now < s.Params.LockMarginSec/4
 }
 
 func (s *State) closeDue(now, height int64) {
@@ -493,6 +555,15 @@ func (s *State) closeDue(now, height int64) {
 	sort.Strings(ids)
 	for _, id := range ids {
 		au := s.Auctions[id]
+		if au.Status == "open" && now < au.EndAt && s.expiring(au, now) {
+			// the leading escrow is near the point where its bidder could take
+			// it back alone (no relock landed): close with no sale, refund all
+			au.Status, au.ClosedAt, au.ClosedH, au.Expired = "closed", now, height, true
+			for _, bid := range au.Bids {
+				s.Bids[bid].Status = "lost"
+			}
+			continue
+		}
 		if au.Status == "open" && now >= au.EndAt {
 			au.Status, au.ClosedAt, au.ClosedH = "closed", now, height
 			if au.HighBid != "" {
@@ -511,6 +582,14 @@ func (s *State) closeDue(now, height int64) {
 func (a *App) CheckTx(_ context.Context, req *abci.CheckTxRequest) (*abci.CheckTxResponse, error) {
 	if c, ok := parseClose(req.Tx); ok {
 		return a.checkClose(c, time.Now().Unix()), nil
+	}
+	if st, ok := parseSettle(req.Tx); ok {
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+		if _, err := a.st.verifySettle(st, a.st.Time); err != nil {
+			return &abci.CheckTxResponse{Code: 4, Log: err.Error()}, nil
+		}
+		return &abci.CheckTxResponse{Code: 0}, nil
 	}
 	ev, err := decodeTx(req.Tx)
 	if err != nil {
@@ -545,7 +624,7 @@ func (a *App) checkClose(c *closeTx, now int64) *abci.CheckTxResponse {
 	switch {
 	case au == nil || au.Status != "open" || au.EndAt != c.EndAt:
 		return &abci.CheckTxResponse{Code: 3, Log: "nothing to close"}
-	case c.EndAt > now:
+	case c.EndAt > now && !a.st.expiring(au, now):
 		return &abci.CheckTxResponse{Code: 3, Log: "not due yet"}
 	case c.Sent < now-30 || c.Sent > now+5:
 		return &abci.CheckTxResponse{Code: 3, Log: "stale close"}
@@ -566,6 +645,19 @@ func (a *App) FinalizeBlock(_ context.Context, req *abci.FinalizeBlockRequest) (
 		if _, ok := parseClose(tx); ok {
 			// closeDue above already did the work; the tx only made the block
 			res[i] = &abci.ExecTxResult{Code: 0}
+			continue
+		}
+		if st, ok := parseSettle(tx); ok {
+			v, err := s.verifySettle(st, now)
+			if err != nil {
+				// not a rejection a user caused: just not recorded
+				res[i] = &abci.ExecTxResult{Code: 4, Log: err.Error()}
+				continue
+			}
+			s.applySettle(st, v)
+			s.TxCount++
+			res[i] = &abci.ExecTxResult{Code: 0}
+			lines = append(lines, ledgerLine{Height: req.Height, Time: now, Event: st.Bid, Result: "settled", Reason: st.Move, Tx: json.RawMessage(tx[len(settlePrefix):])})
 			continue
 		}
 		ev, err := decodeTx(tx)
@@ -626,6 +718,10 @@ func (a *App) Commit(context.Context, *abci.CommitRequest) (*abci.CommitResponse
 		a.committedHash = h[:]
 	}
 	a.committedH, a.committedT = a.st.Height, a.st.Time
+	if a.commitCh != nil {
+		close(a.commitCh)
+		a.commitCh = nil
+	}
 	// the ledger line goes to disk before any block it covers can be pruned
 	if a.ledger != nil {
 		if err := a.ledger.append(a.committedH, a.pendLines); err != nil {

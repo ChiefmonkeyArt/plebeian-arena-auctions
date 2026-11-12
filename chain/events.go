@@ -25,37 +25,77 @@ const (
 
 type eventHub struct {
 	mu     sync.Mutex
-	subs   map[chan int64]struct{}
+	subs   map[chan int64]chan []byte // height channel -> message channel
 	height int64
 	wake   chan struct{}
-	src    func() (int64, bool) // committed height from the first running validator
+	// committed height from the first running validator; after is the
+	// height already seen, so a source may long-poll until it moves (v0.5.0)
+	src     func(after int64) (int64, bool)
+	onBlock func(int64) // the settler: told about every new height, listeners or not
 }
 
-func newEventHub(src func() (int64, bool)) *eventHub {
-	h := &eventHub{subs: map[chan int64]struct{}{}, wake: make(chan struct{}, 1), src: src}
+func newEventHub(src func(after int64) (int64, bool)) *eventHub {
+	h := &eventHub{subs: map[chan int64]chan []byte{}, wake: make(chan struct{}, 1), src: src}
 	go h.run()
 	return h
 }
 
-// run polls the validators only while someone is listening.
+// watch makes the hub follow the chain even with no listeners and call f on
+// every new height.
+func (h *eventHub) watch(f func(int64)) {
+	h.mu.Lock()
+	h.onBlock = f
+	h.mu.Unlock()
+	select {
+	case h.wake <- struct{}{}:
+	default:
+	}
+}
+
+// broadcast sends one message (a JSON object) to every listener; a listener
+// too slow to take it misses it and falls back to polling.
+func (h *eventHub) broadcast(msg []byte) {
+	b := []byte("data: " + string(msg) + "\n\n")
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, m := range h.subs {
+		select {
+		case m <- b:
+		default:
+		}
+	}
+}
+
+// run follows the validators only while someone is listening (or the
+// settler watches). The source long-polls, so this is one waiting request,
+// not ten a second; a source that answers at once is paced at ssePoll.
 func (h *eventHub) run() {
-	t := time.NewTicker(ssePoll)
-	defer t.Stop()
 	for {
 		h.mu.Lock()
 		n := len(h.subs)
+		watched := h.onBlock != nil
+		last := h.height
 		h.mu.Unlock()
-		if n == 0 {
+		if n == 0 && !watched {
 			<-h.wake
 			continue
 		}
-		<-t.C
-		ht, ok := h.src()
-		if !ok {
-			continue
+		t0 := time.Now()
+		ht, ok := h.src(last)
+		if !ok || ht == last {
+			if d := ssePoll - time.Since(t0); d > 0 {
+				time.Sleep(d)
+			}
+			if !ok {
+				continue
+			}
 		}
 		h.mu.Lock()
+		f := h.onBlock
 		if ht != h.height {
+			if f != nil && ht > h.height {
+				go f(ht)
+			}
 			h.height = ht
 			for c := range h.subs {
 				select { // latest wins: drop a stale value a slow reader has not taken
@@ -75,13 +115,13 @@ func (h *eventHub) subscribe() (chan int64, int64, bool) {
 	if len(h.subs) >= sseMaxSubs {
 		return nil, 0, false
 	}
-	if len(h.subs) == 0 {
+	if len(h.subs) == 0 && h.onBlock == nil {
 		// The hub stops polling while nobody listens, so the height it kept is
 		// stale: the first listener waits for the next poll (100 ms) instead.
 		h.height = 0
 	}
 	c := make(chan int64, 1)
-	h.subs[c] = struct{}{}
+	h.subs[c] = make(chan []byte, 32)
 	select {
 	case h.wake <- struct{}{}:
 	default:
@@ -112,6 +152,9 @@ func (h *eventHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer h.unsubscribe(c)
+	h.mu.Lock()
+	msgs := h.subs[c]
+	h.mu.Unlock()
 	rc := http.NewResponseController(w)
 	hd := w.Header()
 	hd.Set("Content-Type", "text/event-stream")
@@ -144,6 +187,10 @@ func (h *eventHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		case ht := <-c:
 			if !send(sseMessage(ht)) {
+				return
+			}
+		case m := <-msgs:
+			if !send(m) {
 				return
 			}
 		}
