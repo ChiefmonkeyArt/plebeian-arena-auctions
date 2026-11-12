@@ -153,25 +153,26 @@ func (s *settler) validator() int {
 	return -1
 }
 
-func (s *settler) due() ([]dueMove, error) {
+func (s *settler) due() ([]dueMove, int64, error) {
 	i := s.validator()
 	if i < 0 {
-		return nil, errors.New("no validator running")
+		return nil, 0, errors.New("no validator running")
 	}
 	resp, err := s.hc.Get(fmt.Sprintf("http://127.0.0.1:%d/due", httpPort(i)))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
+	h, _ := strconv.ParseInt(resp.Header.Get("X-Height"), 10, 64)
 	var out []dueMove
 	err = json.NewDecoder(io.LimitReader(resp.Body, 32<<20)).Decode(&out)
-	return out, err
+	return out, h, err
 }
 
 var settleSem = make(chan struct{}, settleWorkers)
 
 func (s *settler) sweep() {
-	items, err := s.due()
+	items, height, err := s.due()
 	if err != nil {
 		return
 	}
@@ -189,11 +190,11 @@ func (s *settler) sweep() {
 		settleSem <- struct{}{}
 		go func() {
 			defer func() { <-settleSem; s.mu.Lock(); delete(s.inflight, it.Bid.ID); s.mu.Unlock() }()
-			err := s.settle(it)
+			err := s.settle(it, height)
 			s.mu.Lock()
 			if err != nil {
 				b := s.backoff[it.Bid.ID]
-				d := 5 * time.Second << min(b.n, 7)
+				d := time.Second << min(b.n, 10)
 				if d > 10*time.Minute {
 					d = 10 * time.Minute
 				}
@@ -210,7 +211,7 @@ func (s *settler) sweep() {
 }
 
 // settle moves one due escrow end to end.
-func (s *settler) settle(it dueMove) error {
+func (s *settler) settle(it dueMove, height int64) error {
 	t0 := time.Now()
 	s.mu.Lock()
 	d := s.done[it.Bid.ID]
@@ -234,7 +235,7 @@ func (s *settler) settle(it dueMove) error {
 	s.mu.Lock()
 	s.tries[a.Bid] = append(s.tries[a.Bid], a)
 	s.mu.Unlock()
-	req, _ := json.Marshal(SignReq{Bid: a.Bid, Purpose: "push", Move: a.Move, Outputs: a.Outputs, Reveal: a.Reveal})
+	req, _ := json.Marshal(SignReq{Bid: a.Bid, Purpose: "push", Move: a.Move, Outputs: a.Outputs, Reveal: a.Reveal, Height: height})
 	code, res := s.rc.release(req)
 	tFrost := time.Since(t0)
 	if code != 200 || res.Signature == "" {
@@ -252,7 +253,7 @@ func (s *settler) settle(it dueMove) error {
 	if err := s.finish(a, sigs); err != nil {
 		return err
 	}
-	s.announce(a, map[string]int64{"frost": tFrost.Milliseconds(), "mint": tMint.Milliseconds(), "total": time.Since(t0).Milliseconds()})
+	s.announce(a, map[string]int64{"frost": tFrost.Milliseconds(), "mint": tMint.Milliseconds(), "total": time.Since(t0).Milliseconds()}, res.Cosigners)
 	return s.submit(a)
 }
 
@@ -432,7 +433,7 @@ func (s *settler) recover(it dueMove) error {
 		if err := s.finish(a, r.Signatures); err != nil {
 			continue
 		}
-		s.announce(a, map[string]int64{"recovered": 1})
+		s.announce(a, map[string]int64{"recovered": 1}, nil)
 		return s.submit(a)
 	}
 	return errors.New("escrow already spent and no journalled attempt matches")
@@ -479,11 +480,11 @@ func (s *settler) finish(a *settleAttempt, sigs []blindSig) error {
 
 // announce pushes refunds and payouts to every open page at once; the ecash
 // is locked to the recipient's wallet key, so only they can spend it.
-func (s *settler) announce(a *settleAttempt, ms map[string]int64) {
+func (s *settler) announce(a *settleAttempt, ms map[string]int64, cosigners []string) {
 	if a.Move == "relock" || s.hub == nil {
 		return
 	}
-	b, _ := json.Marshal(map[string]any{"type": "settled", "bid": a.Bid, "auction": a.Auction, "move": a.Move, "to": a.To, "proofs": a.Proofs, "ms": ms})
+	b, _ := json.Marshal(map[string]any{"type": "settled", "bid": a.Bid, "auction": a.Auction, "move": a.Move, "to": a.To, "proofs": a.Proofs, "ms": ms, "cosigners": cosigners})
 	s.hub.broadcast(b)
 }
 

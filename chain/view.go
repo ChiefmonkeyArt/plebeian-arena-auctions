@@ -134,8 +134,8 @@ func clientView(s *State, bidders map[string]bool, closed int) *ClientView {
 			if au == nil || keep[au.ID] || au.Status != "closed" || s.Time-au.ClosedAt > viewOwnWindowSec {
 				continue
 			}
-			mine := bidders[b.Bidder] && b.Settled == "" && (b.Status == "outbid" || b.Status == "lost" || b.Status == "void")
-			sale := bidders[au.Seller] && b.Settled == "" && b.Status == "won"
+			mine := bidders[b.Bidder] && (b.Status == "outbid" || b.Status == "lost" || b.Status == "void")
+			sale := bidders[au.Seller] && b.Status == "won"
 			if mine || sale {
 				keep[au.ID] = true
 			}

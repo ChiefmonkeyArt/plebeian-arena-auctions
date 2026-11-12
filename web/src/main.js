@@ -2,6 +2,8 @@ import './template.css';
 import './arena.css';
 import { newIdentity, ensureSeed, idPub, walletPub, totalSats, lockOf } from './lib/arena.js';
 import { WalletClient } from './lib/wallet.js';
+import { CATALOGUE, PARODY, randomLot } from './lib/catalogue.js';
+import { loginExtension, loginBunker, loginNostrConnect, signerFor, logoutSigner, fetchProfile } from './lib/login.js';
 
 // ---------- basics ----------
 const $ = (s, r = document) => r.querySelector(s);
@@ -27,9 +29,10 @@ const load = (k, d) => { try { return JSON.parse(store.getItem(LS + k)) ?? d; } 
 const short = (t, n) => { if (t.length <= n) return t; const c = t.slice(0, n); const sp = c.lastIndexOf(' '); return (sp > 8 ? c.slice(0, sp) : c).replace(/[,·\s]+$/, '') + '…'; };
 const save = (k, v) => { try { store.setItem(LS + k, JSON.stringify(v)); } catch {} };
 
-const USERS = ['Seller', 'Alice', 'Bob', 'Carol'];
-const COLORS = { Seller: '#FF3EB5', Alice: '#16A35A', Bob: '#F7931A', Carol: '#6C5CE7' };
+const USERS = ['Seller', 'Alice', 'Bob', 'Carol']; // the demo characters (the bots bid as these)
+const COLORS = { Seller: '#FF3EB5', Alice: '#16A35A', Bob: '#F7931A', Carol: '#6C5CE7', You: '#C6FF3D' };
 const ids = load('ids', null) || Object.fromEntries(USERS.map((n) => [n, newIdentity(n)]));
+delete ids.You;
 USERS.forEach((n) => ensureSeed(ids[n]));
 save('ids', ids);
 const pubToUser = {};
@@ -39,8 +42,24 @@ USERS.forEach((n) => { pubToUser[idPub(ids[n])] = n; });
 // (`proofs` is only read once, to move a pre-Coco v0.1 wallet into Coco.)
 const W = load('wallets', {});
 USERS.forEach((n) => { W[n] = W[n] || { proofs: [], ledger: [], stranded: [] }; });
+
+// ---------- You: a Nostr login (ADR 0010) ----------
+// The login signs events only; the wallet key and Coco seed are made here
+// and kept per npub, so logging out and back in keeps the fake sats.
+const youKeys = load('youkeys', {}); // pubkey -> { walletSk, seed, ledger, stranded }
+let you = load('you', null);         // { signer, pubkey, clientSk?, bunker?, relays, profile? }
+const people = () => (ids.You ? [...USERS, 'You'] : USERS);
+function adoptYou(login) {
+  you = login;
+  const k = youKeys[you.pubkey] || (youKeys[you.pubkey] = (({ walletSk, seed }) => ({ walletSk, seed, ledger: [], stranded: [] }))(newIdentity('You')));
+  ids.You = { name: you.profile?.name || 'npub ' + you.pubkey.slice(0, 8), pubkey: you.pubkey, walletSk: k.walletSk, seed: k.seed };
+  W.You = k; // same object: history saved with the keys
+  pubToUser[you.pubkey] = 'You';
+  api.signers.set(you.pubkey, signerFor(you, (url) => toast(`Your signer asks you to approve: <a href="${esc(url)}" target="_blank" rel="noopener noreferrer">open</a>`, 'info')));
+  save('you', you); save('youkeys', youKeys);
+}
 const claimed = new Set(load('claimed', []));
-const saveW = () => { save('wallets', W); save('claimed', [...claimed]); };
+const saveW = () => { const { You, ...rest } = W; save('wallets', rest); if (You) save('youkeys', youKeys); save('claimed', [...claimed]); };
 
 const ui = {
   me: load('me', 'Alice'), lot: null, mode: 'bid', ctab: 'bids', img: 0, showLive: true, bots: load('bots', 'chill'),
@@ -66,9 +85,10 @@ async function refreshBal(n) { BAL[n] = await api.balance(ids[n]); return BAL[n]
 const ledger = (n, type, amount, note) => { W[n].ledger.unshift({ type, amount, note, ts: Date.now() / 1000 }); W[n].ledger = W[n].ledger.slice(0, 60); };
 
 function avatar(name, size = 28) {
+  if (name === 'You' && you?.profile?.picture) return `<span class="av" style="width:${size}px;height:${size}px;background:${COLORS.You};color:#1B1718"><img src="${esc(you.profile.picture)}" alt="" referrerpolicy="no-referrer" loading="lazy" onerror="this.remove()"></span>`;
   if (name === 'Seller') return `<span class="av" style="width:${size}px;height:${size}px"><img src="./assets/live-frame.jpg" alt=""></span>`;
   const c = COLORS[name] || '#7a6f66';
-  return `<span class="av" style="width:${size}px;height:${size}px;background:${c}">${esc((name || '?')[0].toUpperCase())}</span>`;
+  return `<span class="av" style="width:${size}px;height:${size}px;background:${c}${name === 'You' ? ';color:#1B1718' : ''}">${esc((name || '?')[0].toUpperCase())}</span>`;
 }
 
 // ---------- toasts / fx (from the template) ----------
@@ -209,7 +229,7 @@ async function placeBid(n, a, amount, { quiet = false, auto = false, steps = nul
       if (n !== ui.me || ui.autotopup) await topup(n, Math.max(amount - bal(n) + 1000, 5000), true);
       else throw new Error('Not enough fake sats. Top up in the wallet.');
     }
-    const { locked } = await api.lockForBid(id, amount, fresh.params, fa, { state: fresh });
+    const { locked } = await api.lockForBid(id, amount, fresh.params, fa, { state: fresh, now: chainNow() });
     try {
       const r = await api.bid(id, fa, amount, locked);
       onSent?.(amount, r);
@@ -307,13 +327,14 @@ function reconcilePending() {
 }
 
 // refunds, payouts and expired-lock reclaims for every local user
+const firstRefundable = new Map(); // bid id -> when this page first saw it refundable
 async function settleLoop() {
   if (!S) return;
   const cur = currentLot();
   if (ui.autotopup && cur && cur.status === 'open' && !topping[ui.me] && !busy.has('bid:' + ui.me) && role(cur) !== 'seller' && bal(ui.me) < 2 * stepAmt(cur, 5)) {
     topup(ui.me, Math.max(5000, 3 * stepAmt(cur, 5)), true).catch(() => {});
   }
-  for (const n of USERS) {
+  for (const n of people()) {
     const pk = idPub(ids[n]);
     for (const b of Object.values(S.bids)) {
       if (claimed.has(b.id) || busy.has('c:' + b.id)) continue;
@@ -322,8 +343,23 @@ async function settleLoop() {
       if (b.bidder === pk && refundable(b)) purpose = 'refund';
       if (au.seller === pk && b.status === 'won' && au.sellerWallet === walletPub(ids[n])) purpose = 'payout';
       if (!purpose) continue;
+      // ADR 0009: the validators push refunds and payouts. A settled bid's new
+      // ecash is collected from the chain if the push was missed; the old
+      // pull claim is only the backstop, after 10 s without a push.
+      if (!b.settled) {
+        const since = firstRefundable.get(b.id) || (firstRefundable.set(b.id, Date.now()), Date.now());
+        if (Date.now() - since < 10000) continue;
+      }
       busy.add('c:' + b.id);
       try {
+        if (b.settled) {
+          const full = await api.bidWithProofs(b.id);
+          if (claimed.has(b.id) || !full.out?.length) continue;
+          await api.receive(ids[n], full.out);
+          claimed.add(b.id); await refreshBal(n);
+          ledger(n, b.settled === 'payout' ? 'pay' : 'refund', b.amount, `${b.settled === 'payout' ? 'Payout' : 'Refund'} · pushed by the validators (collected)`);
+          saveW(); continue;
+        }
         const r = await api.claim(ids[n], b, purpose, S.params);
         claimed.add(b.id); await refreshBal(n);
         const who = r.cosigners.map((v) => v.replace('Validator ', 'V')).join(', ');
@@ -340,8 +376,8 @@ async function settleLoop() {
         }
         saveW();
       } catch (e) {
-        if (/spent/i.test(e.message)) { claimed.add(b.id); saveW(); }
-        else console.warn('claim', b.id, e.message);
+        // spent: the validators pushed it meanwhile; the next state says settled
+        if (!/spent|settled/i.test(e.message)) console.warn('claim', b.id, e.message);
       } finally { busy.delete('c:' + b.id); }
     }
     // stranded locks (bid rejected after locking): reclaim alone after locktime
@@ -395,7 +431,12 @@ function setV(k, v, html = false) {
 }
 
 function renderUsers() {
-  $('[data-users]').innerHTML = USERS.map((n) => `<button role="tab" aria-selected="${n === ui.me}" data-act="user" data-u="${n}"><b>${n[0]}</b><span>${n}</span></button>`).join('');
+  $('[data-users]').innerHTML = people().map((n) => n === 'You'
+    ? `<button role="tab" class="you" aria-selected="${n === ui.me}" data-act="user" data-u="You" title="${esc(ids.You.name)}">${avatar('You', 22)}<span>You</span></button>`
+    : `<button role="tab" aria-selected="${n === ui.me}" data-act="user" data-u="${n}"><b>${n[0]}</b><span>${n}</span></button>`).join('')
+    + (you ? '' : '<button class="login-chip" data-act="login">Log in</button>');
+  setV('youname', you ? ids.You.name : '');
+  $('[data-slot=you-row]').hidden = !you;
 }
 
 function myStatusHTML(a) {
@@ -410,7 +451,7 @@ function myStatusHTML(a) {
     return `<div class="ms neutral">${a.winner ? `Sold to ${esc(nameOfBid(S.bids[a.winner]))} for ${fmt(a.highAmount)}` : 'Ended without bids'} <button data-act="outcome">See outcome →</button></div>`;
   }
   if (r === 'winning') return `<div class="ms win"><span class="pulse"></span>You're the top bidder${ui.max[a.id] ? ' · max ' + fmt(ui.max[a.id]) : ''}</div>`;
-  if (r === 'outbid') return `<div class="ms lose">You've been outbid · refund signed instantly. Bid again?</div>`;
+  if (r === 'outbid') return `<div class="ms lose">You've been outbid · refund pushed instantly. Bid again?</div>`;
   return '';
 }
 
@@ -436,7 +477,7 @@ function renderFrame() {
   const live = a && a.status === 'open';
   setV('balance', fmt(bal(ui.me)));
   setV('held', fmt(heldBy(ui.me)));
-  setV('username', ui.me);
+  setV('username', ui.me === 'You' ? ids.You.name : ui.me);
   const up = NET.filter((v) => v.up).length;
   setV('netdots', NET.map((v) => `<i class="${v.up ? 'on' : ''}"></i>`).join(''), true);
   setV('consensus', `${up}/4 validators · needs 3`);
@@ -444,12 +485,15 @@ function renderFrame() {
     setV('lotno', a.id.slice(0, 4).toUpperCase());
     setV('title', a.title);
     setV('sellername', a.sellerName || nameOfPub(a.seller));
+    // parody lots: show the product, never a face beside a real leader's name
+    setV('sellerimg', /^\.\/assets\/merch\//.test(a.image || '') ? safeSrc(a.image) : './assets/live-frame.jpg');
     setV('sellermeta', `npub ${a.seller.slice(0, 8)}… · signed listing`);
-    setV('closemode', `Soft close · late bids add ${S.params.extendSec}s`);
+    setV('closemode', a.mode === 'antisnipe' ? `Anti-snipe · ${a.windowSec}s` : 'Fixed time');
+    setV('parody', /^\.\/assets\/merch\//.test(a.image || '') ? PARODY : '');
     setV('timer', timerText(a));
     const total = Math.max(1, (a.endAt - a.createdAt));
     setV('ring', String(553 * (1 - Math.min(1, remaining(a) / Math.min(total, 120)))));
-    setV('ringlabel', a.extensions ? `+${a.extensions} ext` : a.status === 'open' ? 'soft close' : 'ended');
+    setV('ringlabel', a.status !== 'open' ? 'ended' : a.mode === 'antisnipe' ? (a.extensions ? `${a.extensions} reset${a.extensions > 1 ? 's' : ''}` : 'anti-snipe') : 'fixed');
     const pend = live && pendingFor(a) && (!a.highBid || pendingFor(a).amount > a.highAmount) ? pendingFor(a) : null;
     document.body.classList.toggle('is-pending', !!pend);
     setV('pricelabel', pend ? (pend.state === 'sending' ? 'Your bid · sending' : 'Your bid · sent, next block') : live ? (a.highBid ? 'Current bid' : 'Starting bid') : a.winner ? 'Sold for' : 'Final');
@@ -463,7 +507,7 @@ function renderFrame() {
     setV('bidcountn', String(bs.length));
     setV('bidders', String(new Set(bs.map((b) => b.bidder)).size));
     setV('extensionsn', String(a.extensions));
-    setV('escrownote', `Bids lock ecash to one FROST key the 4 validators share; any 3 can sign. Outbid? 3 validators sign your refund at once. Fallback: you can reclaim alone after ${clock(a.hardEnd + S.params.lockMarginSec + 15)}.`);
+    setV('escrownote', `Bids lock ecash to one FROST key the 4 validators share; any 3 can sign. Outbid? The validators sign and push your refund at once; the winner's sats go to the seller the moment the clock hits zero. Fallback: ${a.mode === 'antisnipe' ? 'while the clock keeps resetting the validators re-lock the leading bid, and you can reclaim alone after its locktime' : `you can reclaim alone after ${clock(a.endAt + S.params.lockMarginSec + 15)}`}.`);
     const r = remaining(a);
     $$('[data-urgent]').forEach((el) => { el.classList.toggle('urgent', live && r < 10); el.classList.toggle('ended', !live); });
     document.body.classList.toggle('is-ended', !live);
@@ -502,7 +546,7 @@ function renderFeeds(a) {
   if (ol._k !== key) {
     const fresh = ol._lot === (a && a.id);
     const prow = pend ? `<li class="bid-item top mine pending">${avatar(ui.me)}<span class="bi-name">You<em class="tag-auto">${pend.state === 'sending' ? 'sending' : 'next block'}</em></span><span class="bi-amt">${fmt(pend.amount)}</span><time>now</time></li>` : '';
-    ol.innerHTML = prow + (bs.length || pend ? '' : '<li class="empty">The arena is quiet…</li>') + (!bs.length ? '' : bs.map((b, i) => `<li class="bid-item ${i === 0 && !pend ? 'top' : ''} ${b.bidder === mePub() ? 'mine' : ''} ${fresh && !ol._seen?.has(b.id) ? 'enter' : ''}">${avatar(nameOfBid(b))}<span class="bi-name">${esc(nameOfBid(b))}${b.extended ? '<em class="tag-jump">+time</em>' : ''}${b.status === 'outbid' || b.status === 'lost' ? `<em class="tag-auto">${claimed.has(b.id) ? 'refunded' : 'refunding'}</em>` : ''}</span><span class="bi-amt">${fmt(b.amount)}</span><time>${clock(b.time)}</time></li>`).join(''));
+    ol.innerHTML = prow + (bs.length || pend ? '' : '<li class="empty">The arena is quiet…</li>') + (!bs.length ? '' : bs.map((b, i) => `<li class="bid-item ${i === 0 && !pend ? 'top' : ''} ${b.bidder === mePub() ? 'mine' : ''} ${fresh && !ol._seen?.has(b.id) ? 'enter' : ''}">${avatar(nameOfBid(b))}<span class="bi-name">${esc(nameOfBid(b))}${b.extended ? '<em class="tag-jump">reset</em>' : ''}${b.status === 'outbid' || b.status === 'lost' ? `<em class="tag-auto">${claimed.has(b.id) || b.settled ? 'refunded' : 'refunding'}</em>` : ''}</span><span class="bi-amt">${fmt(b.amount)}</span><time>${clock(b.time)}</time></li>`).join(''));
     ol._k = key; ol._lot = a && a.id; ol._seen = new Set(bs.map((b) => b.id));
   }
   // leaderboard
@@ -586,13 +630,13 @@ function outcomeHTML(a, tab) {
       ${facts([['Paid from escrow', price], ['Closed at block', a.closedHeight], ['Payout to seller', claimed.has(a.winner) ? 'Released' : 'Settling']])}</div>`;
   }
   if (tab === 'seller') {
-    return `<div class="o-hero sell"><span class="o-eyebrow">Seller view · ${esc(a.sellerName || 'Seller')}</span><h2>Sold for ${price} sats</h2><p>to <b>${wn}</b> · ${a.bids.length} bids from ${new Set(bidsOf(a).map((b) => b.bidder)).size} bidders · ${a.extensions} time extensions</p>
+    return `<div class="o-hero sell"><span class="o-eyebrow">Seller view · ${esc(a.sellerName || 'Seller')}${/^\.\/assets\/merch\//.test(a.image || '') ? ' · ' + PARODY : ''}</span><h2>Sold for ${price} sats</h2><p>to <b>${wn}</b> · ${a.bids.length} bids from ${new Set(bidsOf(a).map((b) => b.bidder)).size} bidders · ${a.mode === 'antisnipe' ? a.extensions + ' clock resets' : 'fixed time'}</p>
       ${facts([['Hammer price', price], ['Escrow release', 'FROST, 3 of 4'], ['Payout', claimed.has(a.winner) || role(a) !== 'seller' ? 'Released to wallet' : 'Settling…']])}</div>`;
   }
   const refunded = losers.filter((b) => claimed.has(b.id)).reduce((s, b) => s + b.amount, 0);
   const total = losers.reduce((s, b) => s + b.amount, 0);
   return `<div class="o-hero lose"><h2>Outbid this time</h2><p>${wn} won at <b>${price} sats</b>. ${losers.length} losing bids.</p>
-    <div class="refund-card"><span class="rf-ico">↩</span><div><b>${fmt(total)} sats in losing escrows · ${fmt(refunded)} returned by this browser's users</b><small>Each refund is one FROST signature made by 3 of the 4 validators the moment a bid is beaten. If validators vanish, bidders reclaim alone after locktime.</small></div></div></div>`;
+    <div class="refund-card"><span class="rf-ico">↩</span><div><b>${fmt(total)} sats in losing escrows · ${fmt(refunded)} returned by this browser's users</b><small>Each refund is one FROST signature made by 3 of the 4 validators and pushed to the bidder's wallet the moment a bid is beaten. If validators vanish, bidders reclaim alone after locktime.</small></div></div></div>`;
 }
 function openOutcome(tab) {
   const a = currentLot();
@@ -636,7 +680,7 @@ function onNewState(prev) {
     seenBids.add(b.id);
     if (firstState) continue;
     if (b.auction === (a && a.id)) {
-      if (b.extended) { toast(`Late bid! <b>+${S.params.extendSec}s</b> on the clock`, 'info'); $$('[data-v=timer]').forEach((el) => pulse(el, 'extend')); }
+      if (b.extended) { toast(`Late bid! Clock back to <b>${S.auctions[b.auction].windowSec}s</b>`, 'info'); $$('[data-v=timer]').forEach((el) => pulse(el, 'extend')); }
       if (b.bidder === mePub()) pulse($('.c-price'), 'bump');
     }
   }
@@ -666,9 +710,38 @@ function startPush() {
   es.onerror = () => { push.open = false; renderTimings(); }; // the browser retries by itself
   es.onmessage = (m) => {
     let d; try { d = JSON.parse(m.data); } catch { return; }
+    if (d.type === 'settled') return onSettled(d);
     if (d.now) offsetMs = d.now - Date.now();
     if (d.h > push.h) { push.h = d.h; if (S) S.height = Math.max(S.height, d.h); pollState(); }
   };
+}
+
+// ADR 0009: the validators pushed new ecash (a refund or a payout) to a
+// wallet key. If it is one of this browser's people, take it into Coco.
+async function onSettled(d) {
+  const n = people().find((x) => walletPub(ids[x]) === d.to);
+  if (!n || claimed.has(d.bid) || busy.has('c:' + d.bid)) return;
+  busy.add('c:' + d.bid);
+  try {
+    await api.receive(ids[n], d.proofs);
+    claimed.add(d.bid); await refreshBal(n);
+    const who = (d.cosigners || []).map((v) => v.replace('Validator ', 'V')).join(', ');
+    const ms = d.ms ? ` · ${d.ms.total} ms` : '';
+    const amt = (d.proofs || []).reduce((s, p) => s + p.amount, 0);
+    const b = S?.bids[d.bid], au = S?.auctions[d.auction];
+    if (d.move === 'payout') {
+      ledger(n, 'pay', amt, `Payout for “${short(au?.title || '', 26)}” · pushed, FROST ${who}${ms}`);
+      if (n === ui.me) { toast(`Payout <b>${fmt(amt)}</b> sats pushed to your wallet · ${who}${ms}`, 'good'); flyCoins($('.c-price'), 10); }
+    } else {
+      ledger(n, 'refund', amt, `Refund pushed · FROST ${who}${ms}`);
+      if (n === ui.me) {
+        const by = au?.highBid && S.bids[au.highBid] ? nameOfBid(S.bids[au.highBid]) : 'the winner';
+        toast(b?.status === 'void' ? `Late bid · ${fmt(amt)} sats pushed back${ms}` : b?.status === 'outbid' ? `Outbid by <b>${esc(by)}</b> · ${fmt(amt)} sats pushed back${ms}` : `${fmt(amt)} sats returned${ms}`, 'danger', b?.status === 'outbid' && au?.status === 'open' ? ['Bid again', 'bid-next'] : null);
+        flyCoins($('.c-price'));
+      }
+    }
+    saveW(); renderWallet(); kick();
+  } catch (e) { console.warn('pushed ecash', d.bid, e.message); } finally { busy.delete('c:' + d.bid); }
 }
 
 // ---------- polling ----------
@@ -689,7 +762,7 @@ async function pollState() {
   try {
     const prev = S;
     const q0 = performance.now();
-    const r = await api.view(USERS.map((n) => idPub(ids[n])), stateTag);
+    const r = await api.view(people().map((n) => idPub(ids[n])), stateTag);
     rtt = rtt ? rtt * 0.7 + (performance.now() - q0) * 0.3 : performance.now() - q0;
     if (!r) { renderFeeds(currentLot()); return; } // unchanged: the frame loop keeps the clocks moving
     S = r.state; stateTag = r.etag;
@@ -710,16 +783,12 @@ async function pollNet() { try { NET = await api.network(); if (S) S.height = Ma
 async function pollChat() { try { CHAT = await api.chat(); renderChat(currentLot()); } catch {} }
 
 // ---------- seeding ----------
-const DEMO = [
-  { title: '1970s Steel Chronograph, Burnt-Orange Dial', description: 'Pre-owned · serviced 2025 · light patina', image: './assets/watch-1.jpg', category: 'Watches', startPrice: 2100, minIncrement: 100, durationSec: 180 },
-  { title: 'Rangefinder camera, 1957, recent service', description: 'Clean glass, original strap', image: './assets/lot-camera.jpg', category: 'Cameras', startPrice: 1500, minIncrement: 100, durationSec: 360 },
-  { title: 'Hand-built mechanical keyboard, brass plate', description: 'Lubed switches, PBT caps', image: './assets/lot-keyboard.jpg', category: 'Electronics', startPrice: 800, minIncrement: 50, durationSec: 600 },
-];
 async function seedIfEmpty() {
   if (!S) return;
   const open = Object.values(S.auctions).filter((a) => a.status === 'open');
   if (open.length) return;
-  for (const lot of DEMO) await api.createAuction(ids.Seller, lot).catch(() => {});
+  const pool = [...CATALOGUE].sort(() => Math.random() - 0.5).slice(0, 3);
+  for (const [i, item] of pool.entries()) await api.createAuction(ids.Seller, randomLot(i % 2 ? 'antisnipe' : 'fixed', item)).catch(() => {});
   setTimeout(pollState, 1500);
 }
 
@@ -728,13 +797,41 @@ document.addEventListener('click', async (e) => {
   const el = e.target.closest('[data-act]'); if (!el) return;
   const act = el.dataset.act; const a = currentLot();
   switch (act) {
-    case 'user': ui.me = el.dataset.u; save('me', ui.me); renderUsers(); renderWallet(); pollState(); toast(`Now acting as <b>${ui.me}</b>`, 'info'); break;
+    case 'user': if (el.dataset.u === 'You' && ui.me === 'You') { $('[data-modal=login]').hidden = false; break; } ui.me = el.dataset.u; save('me', ui.me); renderUsers(); renderWallet(); pollState(); toast(`Now acting as <b>${ui.me}</b>`, 'info'); break;
     case 'wallet': renderWallet(); $('[data-drawer=wallet]').hidden = false; break;
     case 'network': renderNetwork(); $('[data-drawer=network]').hidden = false; break;
     case 'new-lot': $('[data-drawer=newlot]').hidden = false; break;
+    case 'quick-lot': {
+      if (Date.now() - quickAt < 30000) { toast(`One quick lot every 30 s · next in ${Math.ceil((30000 - Date.now() + quickAt) / 1000)}s`, 'info'); break; }
+      quickAt = Date.now();
+      const lot = randomLot(el.dataset.mode);
+      try {
+        const r = await api.createAuction(meId(), lot);
+        toast(`Listed <b>${esc(short(lot.title, 30))}</b> as ${esc(lot.name)} · ${lot.mode === 'antisnipe' ? `anti-snipe ${lot.windowSec}s` : 'fixed time'}`, 'good');
+        $$('.drawer').forEach((x) => { x.hidden = true; });
+        ui.lot = r.id; ui.pinned = true; burst();
+      } catch (err) { quickAt = 0; toast(esc(String(err.message).replace(/^.*log='([^']+)'.*$/, '$1')), 'danger'); }
+      break;
+    }
+    case 'login': $('[data-modal=login]').hidden = false; break;
+    case 'login-ext': doLogin(() => loginExtension()); break;
+    case 'login-bunker': doLogin(() => loginBunker($('[data-in=bunker]').value, authUrl)); break;
+    case 'login-connect': {
+      connectAbort?.abort(); connectAbort = new AbortController();
+      doLogin(() => loginNostrConnect((uri) => { const l = $('[data-slot=connect-uri]'); l.hidden = false; $('a', l).href = uri; $('code', l).textContent = uri; }, connectAbort.signal));
+      break;
+    }
+    case 'copy-uri': navigator.clipboard?.writeText($('[data-slot=connect-uri] code').textContent).then(() => toast('Copied', 'info')); break;
+    case 'logout': {
+      await logoutSigner(you); api.signers.delete(you.pubkey);
+      delete pubToUser[you.pubkey]; delete ids.You; delete W.You; you = null; store.removeItem(LS + 'you');
+      if (ui.me === 'You') { ui.me = 'Alice'; save('me', ui.me); }
+      $$('.modal').forEach((d) => { d.hidden = true; }); renderUsers(); renderWallet(); pollState(); toast('Logged out · your wallet stays in this browser for next time', 'info');
+      break;
+    }
     case 'close-drawer': $$('.drawer').forEach((d) => { d.hidden = true; }); break;
     case 'close-modal': $$('.modal').forEach((d) => { d.hidden = true; }); break;
-    case 'seller-sheet': if (a) { $('[data-slot=seller-full]').innerHTML = `<div class="sc-top"><img class="sc-av" src="./assets/live-frame.jpg" alt=""><div><b>${esc(a.sellerName || 'Seller')}</b><small>npub hex ${esc(a.seller.slice(0, 24))}…</small></div></div><p class="sc-foot">Listing is a signed Nostr event (kind 1440). Payouts go only to the wallet key declared in it: ${esc(a.sellerWallet.slice(0, 20))}…</p>`; $('[data-modal=seller]').hidden = false; } break;
+    case 'seller-sheet': if (a) { $('[data-slot=seller-full]').innerHTML = `<div class="sc-top"><img class="sc-av" src="${/^\.\/assets\/merch\//.test(a.image || '') ? esc(safeSrc(a.image)) : './assets/live-frame.jpg'}" alt=""><div><b>${esc(a.sellerName || 'Seller')}</b><small>npub hex ${esc(a.seller.slice(0, 24))}…</small></div></div><p class="sc-foot">Listing is a signed Nostr event (kind 1440). Payouts go only to the wallet key declared in it: ${esc(a.sellerWallet.slice(0, 20))}…</p>`; $('[data-modal=seller]').hidden = false; } break;
     case 'topup': el.classList.add('disabled'); try { await topup(ui.me, +el.dataset.amt); } catch (err) { toast(esc(err.message), 'danger'); } el.classList.remove('disabled'); renderWallet(); break;
     case 'bid-step': case 'bid-next': tapBid({ steps: +(el.dataset.steps || 0) }, act === 'bid-step' ? el : null); break;
     case 'bid-custom': {
@@ -777,13 +874,44 @@ document.addEventListener('submit', async (e) => {
   if (f.matches('[data-act=lot-form]')) {
     const d = Object.fromEntries(new FormData(f));
     try {
-      const r = await api.createAuction(meId(), { title: d.title, description: d.description, image: d.image, category: '', startPrice: +d.startPrice, minIncrement: +d.minIncrement, durationSec: +d.durationSec });
+      const lot = { title: d.title, description: d.description, image: d.image, category: '', startPrice: +d.startPrice, minIncrement: +d.minIncrement, durationSec: +d.durationSec, mode: d.mode };
+      if (d.mode === 'antisnipe') lot.windowSec = +d.windowSec;
+      const r = await api.createAuction(meId(), lot);
       toast(`Listed <b>${esc(d.title.slice(0, 30))}</b> · signed and accepted by ${esc(r.via)}`, 'good');
       $$('.drawer').forEach((x) => { x.hidden = true; });
       ui.lot = r.id; ui.pinned = true; burst();
     } catch (err) { toast(esc(String(err.message).replace(/^.*log='([^']+)'.*$/, '$1')), 'danger'); }
   }
 });
+
+// ---------- login (ADR 0010) ----------
+let quickAt = 0, connectAbort = null;
+const authUrl = (url) => toast(`Your signer asks you to approve: <a href="${esc(url)}" target="_blank" rel="noopener noreferrer">open</a>`, 'info');
+async function doLogin(fn) {
+  const st = $('[data-slot=login-status]'); st.textContent = 'Connecting…';
+  try {
+    const login = await fn();
+    connectAbort = null;
+    adoptYou(login);
+    ui.me = 'You'; save('me', ui.me);
+    await refreshBal('You').catch(() => 0);
+    $$('.modal').forEach((d) => { d.hidden = true; }); st.textContent = '';
+    renderUsers(); renderWallet(); pollState();
+    toast(`Logged in as <b>${esc(ids.You.name)}</b> · same fake sats, your own bids`, 'good');
+    loadProfile(true);
+  } catch (e) { st.textContent = e.message || 'Login failed'; }
+}
+async function loadProfile(force) {
+  if (!you) return;
+  if (!force && you.profile && Date.now() - (you.profile.fetched || 0) < 3600e3) return;
+  try {
+    const p = await fetchProfile(you.pubkey, you.relays || []);
+    if (!p || !you) return;
+    you.profile = { ...p, fetched: Date.now() }; save('you', you);
+    if (p.name) ids.You.name = p.name;
+    renderUsers(); kick();
+  } catch {}
+}
 
 // swipe to bid (template interaction)
 (function swipe() {
@@ -800,13 +928,14 @@ document.addEventListener('submit', async (e) => {
 })();
 
 // ---------- boot ----------
+if (you) { adoptYou(you); loadProfile(false); } else if (ui.me === 'You') ui.me = 'Alice';
 // Move any pre-Coco (v0.1) local proofs into each user's Coco wallet, then read balances.
 for (const n of USERS) {
   if (W[n].proofs?.length) { try { await api.receive(ids[n], W[n].proofs); } catch (e) { console.warn('migrate', n, e.message); } }
   delete W[n].proofs;
 }
 saveW();
-await Promise.all(USERS.map((n) => refreshBal(n).catch(() => 0)));
+await Promise.all(people().map((n) => refreshBal(n).catch(() => 0)));
 renderUsers();
 ['pointerdown', 'click', 'input', 'keydown'].forEach((t) => addEventListener(t, kick, { capture: true, passive: true }));
 kick();

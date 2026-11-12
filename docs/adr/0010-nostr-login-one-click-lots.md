@@ -1,6 +1,6 @@
 # ADR 0010: Nostr login, one-click lots and the world-leader merch catalogue
 
-Status: proposed (target v0.5.0, with ADR 0009)
+Status: accepted (approved by the owner 2026-11-12; shipped in v0.5.0, with ADR 0009)
 
 ## Context
 
@@ -80,3 +80,13 @@ The demo gives every browser four local characters: Seller, Alice, Bob and Carol
   - the bots bid on it;
   - it settles by push (ADR 0009).
 - **Catalogue:** every entry passes the chain's listing checks (title, image path, price ranges).
+
+## As built (v0.5.0)
+
+- **Leaders of the past only.** The catalogue has 24 entries, all historical leaders (from Ramesses II to Ronald Reagan). No living leader is used, to keep the parody clearly a joke.
+- **Images:** 16 product-only studio photos (generated, no people, no faces, no logos), 640 × 640 WebP, 10–38 KB each, 362 KB in total. On a parody lot the seller chip shows the product, not a face.
+- **NIP-46:** `bunker://` links and `nostrconnect://` links (relays `wss://relay.chiefmonkey.art` and `wss://nos.lol`, shown as a link and as copyable text; no QR image). NIP-05 names (`name@domain`) are not resolved, because the page's CSP allows no fetches to other sites. The NIP-46 code is loaded only when used (36 KB, 12 KB gzipped).
+- **Profile cache:** kept in `localStorage` with the login, refreshed at most once an hour; IndexedDB is used for the wallet only. Simpler, and the profile is a few hundred bytes.
+- **CSP:** the Suite's policy for the auctions site adds `connect-src wss:` (relays) and `img-src https:` (profile pictures). Scripts, styles, fonts and workers stay same-site.
+- **Tests:** `web/test/login.mjs` covers remote signing (a wrong-key answer is refused), the profile reader against a stand-in relay (signature check, write relays from kind 10002, wss only, at most 6 relays, name cleaned and capped, https-only picture) and the catalogue against the chain's listing rules. The UI was checked in headless Chromium with a stand-in NIP-07 extension: log in, You chip, one-click anti-snipe lot, bidding against the bots, pushed refunds.
+

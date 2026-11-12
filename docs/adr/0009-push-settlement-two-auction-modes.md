@@ -1,6 +1,6 @@
 # ADR 0009: Validators push every settlement; two auction modes
 
-Status: proposed (target v0.5.0, chain format 5)
+Status: accepted (approved by the owner 2026-11-12; shipped in v0.5.0, chain format 5)
 
 ## Context
 
@@ -24,7 +24,7 @@ v0.4.2 does not do this:
 - The listing event (kind 1440) gets `mode: "fixed" | "antisnipe"`. Anti-snipe lots also get `windowSec`.
 - **`fixed`:** `endAt = created + durationSec`. Bids never move it. There is no hard end.
 - **`antisnipe`:** a bid that lands with less than `windowSec` left sets `endAt = blockTime + windowSec`. There is no cap and no hard end.
-- `windowSec` must be within the range set by `Params.MinWindowSec` and `Params.MaxWindowSec`. Proposed: 30 s to 15 min.
+- `windowSec` must be within the range set by `Params.MinWindowSec` and `Params.MaxWindowSec`. Built: 15 s to 15 min.
 - The global `SoftCloseSec`, `ExtendSec`, `MaxExtendSec` and `HardEnd` are removed.
 - Lots still close on time. Each validator sends `close` when a lot is due (ADR 0007), and block time is the proposer's clock.
 
@@ -45,7 +45,7 @@ A **settler** loop runs in the gateway after every committed block. Each move be
 
   A bid is settled at most once per move. A re-lock bumps a counter.
 - **Collecting.** Wallets collect pushed refunds and payouts from the client view whenever they are online. Each one only needs the recipient's own key, so there is no deadline.
-- **Timing.** A refund or payout completes in the block after its trigger, plus one FROST round and one swap. On the current single server that should be about 1–2 s. The Network drawer will time it.
+- **Timing.** A refund or payout completes in the block after its trigger, plus one FROST round and one swap. Measured in v0.5.0, see below.
 
 ### Lock expiry for bids
 
@@ -88,3 +88,37 @@ A **settler** loop runs in the gateway after every committed block. Each move be
   - if the leading lock expires unrenewed, the lot closes with no sale.
 - **Validator refusals:** each validator refuses a settle whose revealed output does not match `B_`, has the wrong lock key or the wrong amount.
 - **Conservation:** total sats across wallets, escrow and pushed proofs never change.
+
+## As built (v0.5.0)
+
+### FROST signing: all four asked, three needed
+
+- The settler asks **all four** validators for a nonce commitment at once (`/frost/commit`). Each one checks the move against its own copy of the chain, as above.
+- **Majority wins.** The coordinator groups the answers by the exact message each validator agreed to sign, and picks three that agree (`pickSigners`). One validator that is offline, behind or misbehaving cannot block or change the signature.
+- **Retry without a bad share.** If one of the three chosen returns a bad round-2 share, the coordinator runs one more round without it, using the fourth validator.
+- **A validator one block behind waits.** The settler sends the height it read the due list at; a validator not yet at that height waits for it (at most 2 s) before judging. Without this, with one validator down, a validator a few milliseconds behind refused and the push waited 5–9 s for a retry.
+- Each validator runs one long-lived `arena-frost serve` process (Rust), so a signing round starts no new processes.
+- The settler checks the mint's DLEQ proof on every new output before it records the settlement, and keeps a journal (`run/settle-journal.jsonl`) so a crash between the swap and the `settle` transaction is recovered from the mint (`/v1/checkstate`, `/v1/restore`), not lost. Failed attempts back off from 1 s up to 10 min.
+- Each pushed result goes to the page over the existing event stream as `{type: "settled", bid, to, proofs, ms, cosigners}`. A page that missed it collects the same ecash from the chain (`/api/bid?id=`). The page's pull claim runs only for a bid left unsettled for more than 10 s.
+- The re-lock trigger is the leading lock being less than `LockMarginSec / 2` away, as decided; anti-snipe locks are set to `now + LockMarginSec + 60`, fixed ones to `endAt + LockMarginSec + 15`.
+
+### Speed (local run, 4 validators and the mint on one machine)
+
+| Step | Measured |
+|---|---|
+| FROST round (commit + sign + aggregate, 3 of 4) | 10–73 ms, usually 10–30 ms |
+| Mint swap | 17–34 ms |
+| Settler total (FROST + mint + DLEQ + journal) | about 30–100 ms |
+| Ecash in the wallet, counted from the block's timestamp | 15–790 ms (refunds 300–790 ms; the two payouts 15 ms and at the end second) |
+| Same, with Validator 4 stopped | 786 ms (was 8.2 s before the height wait) |
+
+The 0.5 s goal is met by the settlement work itself (under 0.1 s). What is left is the block: a refund can only start once the outbidding bid is committed, and block timestamps are the proposer's clock, so the "after the block" figure also carries clock skew. The payout is pushed in the same second the clock reaches zero.
+
+### Security points
+
+- No validator, gateway or settler can move an escrow alone: every move is one signature from the FROST group key, which needs 3 of 4 key shares. All four shares still sit on one host in this demo (see the threat model); real separation needs four operators.
+- What the validators sign is fixed by the chain: refund to the bidder's own wallet key, payout to the seller's wallet key from the signed listing, re-lock to the same group key with the bidder's refund path. A settler that asks for anything else gets no signature (tests: forged outputs, wrong lock key, wrong amount, redirecting a settled escrow).
+- Revealed blinding factors only let someone recompute the output; spending still needs the recipient's key.
+- A pushed proof is locked (P2PK) to the recipient's wallet key, so the event stream can be public.
+- The pull release and the reclaim after locktime stay as fallbacks.
+

@@ -1,6 +1,6 @@
 # Plebeian Auctions · Arena (fake sats, 4 validators)
 
-A from-scratch, working MVP of decentralised live auctions: four CometBFT validators order every listing and bid, bids are real Cashu ecash locked to one FROST 3-of-4 group key held by the validators, and outbid bidders are refunded the moment they are beaten. Front end is the C Arena template wired to the live chain. Fake sats only.
+A from-scratch, working MVP of decentralised live auctions: four CometBFT validators order every listing and bid, bids are real Cashu ecash locked to one FROST 3-of-4 group key held by the validators, and the validators push every refund and payout themselves: outbid bidders get their sats back the moment they are beaten, and the seller is paid the moment the clock hits zero, with nobody online. Front end is the C Arena template wired to the live chain. Fake sats only.
 
 ## Architecture
 
@@ -17,10 +17,12 @@ gateway :8080 ── static UI, /api/* (incl. /api/release), /mint/* proxy, supe
 ```
 
 - Consensus: blocks need ≥3 of 4 validator signatures; the chain keeps running with one validator down.
-- Bid validity (deterministic, on every validator): signed by bidder, ≥ high + step, not the seller, DLEQ-verified proofs from the pinned keyset, unspent-on-chain, sum = amount, lock = P2PK to the FROST group key only (no extra pubkeys, one signature), `SIG_ALL`, refund key = bidder, locktime ≥ hard end + margin (24 h by default). Lock secrets are parsed strictly (no duplicate, unknown or case-variant keys, no repeated tags) so the validators and the mint always read the same lock.
-- Soft close: late bids add 20 s, capped by a hard end.
+- Bid validity (deterministic, on every validator): signed by bidder, ≥ high + step, not the seller, DLEQ-verified proofs from the pinned keyset, unspent-on-chain, sum = amount, lock = P2PK to the FROST group key only (no extra pubkeys, one signature), `SIG_ALL`, refund key = bidder, locktime ≥ end + margin for fixed lots, ≥ now + margin for anti-snipe lots (24 h by default). Lock secrets are parsed strictly (no duplicate, unknown or case-variant keys, no repeated tags) so the validators and the mint always read the same lock.
+- Two auction modes (v0.5.0, [ADR 0009](docs/adr/0009-push-settlement-two-auction-modes.md), chain format 5): **fixed time** ends on the clock and never later; **anti-snipe** puts the clock back to the seller's window (15 s to 15 min) whenever a bid lands inside it, with no cap and no hidden hard end.
+- Push settlement (v0.5.0): a settler in the gateway asks all four validators to sign each due refund, payout or re-lock, and uses the first three that agree. It swaps at the mint, checks the DLEQ proofs, records a `settle` transaction and pushes the new ecash (P2PK-locked to the recipient) over `/api/events`. A long anti-snipe lot's leading escrow is re-locked before its locktime. Measured locally: FROST round 10–30 ms, mint swap about 25 ms.
+- Nostr login (v0.5.0, [ADR 0010](docs/adr/0010-nostr-login-one-click-lots.md)): NIP-07 extensions and NIP-46 signers (`bunker://`, `nostrconnect://`). You bid as yourself beside the demo characters, with the same fake sats; your wallet key stays in this browser. Your name and picture come from your own relays. One-click lots list a random parody lot (Bitcoin merch "sold" by leaders of the past) in either mode.
 - Keys: `arena init` runs a FROST (secp256k1, Taproot/BIP-340) key ceremony between the four validators; each keeps only its own share in `vN/config/frost_key.json`. Genesis carries the group key.
-- Settlement: `/api/release` asks every validator for a nonce commitment; each one only commits to a refund for an outbid, lost or void bid (authorised by the bidder) or a payout of the winning bid to the seller. Three that agree on the same message sign their share, and the shares combine into one ordinary Schnorr signature the mint accepts. Fewer than three: no signature. If validators vanish, the bidder reclaims alone after locktime. The seller must open the site within the lock margin after the close to collect.
+- Pull release (fallback since v0.5.0): `/api/release` asks every validator for a nonce commitment; each one only commits to a refund for an outbid, lost or void bid (authorised by the bidder) or a payout of the winning bid to the seller. Three that agree on the same message sign their share, and the shares combine into one ordinary Schnorr signature the mint accepts. Fewer than three: no signature. If validators vanish, the bidder reclaims alone after locktime.
 - Polling (v0.3.1, ADR 0004): the page reads `/api/state?view=client`, a slim view without proofs that answers `304` when nothing changed; `/api/bid?id=` returns one bid's proofs when it is released. API JSON and text assets are gzipped.
 - Live feel (v0.3.2, ADR 0005): a bid checks the slim view, not the full state; after an action the page polls every 250 ms for 3 s so the result shows as soon as its block commits; the mint's NUT-17 WebSocket (`/mint/v1/ws`) is proxied so Coco gets pushed updates.
 - Live chain (v0.4.0, ADR 0003 §1 and §4, [ADR 0007](docs/adr/0007-live-chain-push-void-bids.md), chain format 4):
@@ -46,14 +48,14 @@ LOCK_MARGIN=30 ./scripts.sh reset && DEMO_CONTROLS=1 ./scripts.sh start && ./scr
 
 `LOCK_MARGIN=30` lets the test exercise the reclaim-after-locktime path; with the 24 h default it is skipped. `DEMO_CONTROLS=1` turns on the validator stop/start route (`-demo-controls`), which the test needs and a real deployment must not have.
 
-`test` runs `tests/e2e.mjs`: 55 acceptance checks (bids, instant refunds, void late bids, idle chain and on-time closes, pushed events, payout, group-key lock, single 64-byte signature, release refused with 2 of 4 validators, forged signature rejected by the mint, validator stop/catch-up, reclaim after locktime, conservation of sats, unsafe image path refused). `go test ./chain/` runs the audit regression tests and fuzz seeds. `node web/test/frost-roundtrip.mjs frost/target/release/arena-frost` checks the key ceremony and signing (10 checks).
+`test` runs `tests/e2e.mjs`: 64 acceptance checks (fixed and anti-snipe lots, pushed refunds and payouts, bids, void late bids, idle chain and on-time closes, pushed events, payout, group-key lock, single 64-byte signature, release refused with 2 of 4 validators, forged signature rejected by the mint, validator stop/catch-up, reclaim after locktime, conservation of sats, unsafe image path refused). `go test ./chain/` runs the audit regression tests and fuzz seeds. `node web/test/frost-roundtrip.mjs frost/target/release/arena-frost` checks the key ceremony and signing (10 checks). `cd web && npm test` runs the page checks (worker routing, remote signing, profile reader, catalogue).
 
 ## Limits (MVP)
 
 - Fake sats, internally reviewed only ([audit](docs/SECURITY_AUDIT_2026-11-10.md)), one operator runs all four validators on localhost.
 - All four FROST shares sit on one host, so that operator could sign alone; real security needs the validators on separate machines run by different people.
 - CometBFT p2p instead of FIPS.
-- Per-browser generated Nostr keys (no NIP-07 yet); chat is signed but held in gateway memory, not on chain.
+- The demo characters use per-browser generated Nostr keys; logged-in users sign with their own. Chat is signed but held in gateway memory, not on chain.
 - Bids respond on tap (v0.3.4, [ADR 0006](docs/adr/0006-instant-bid-feedback.md)): the page shows your bid as sending at once, then sent, then on chain about a second later.
 - App state is in memory, saved to disk every 1,000 blocks and on clean shutdown (v0.3.3, [ADR 0003](docs/adr/0003-block-growth-snapshots-pruning.md) §2); a restart replays only the blocks after the newest snapshot. State sync for new validators and state trimming (ADR 0003 §3, §5) are still proposed.
 
@@ -66,7 +68,7 @@ The Torii Suite installs a pinned release with `installers/install-auctions.sh` 
 Build a tarball locally:
 
 ```bash
-scripts/package.sh v0.4.2 dist-release
+scripts/package.sh v0.5.0 dist-release
 ```
 
 Design decisions: [ADR 0001](docs/adr/0001-frost-escrow-coco-wallet.md), [ADR 0002](docs/adr/0002-strict-locks-nutshell-021.md), [ADR 0003 (proposed)](docs/adr/0003-block-growth-snapshots-pruning.md). Threat model: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).

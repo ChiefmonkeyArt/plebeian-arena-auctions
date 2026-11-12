@@ -302,6 +302,7 @@ func cmdNode(args []string) {
 	// escrows due to move now, with their proofs (push settlement, ADR 0009)
 	mux.HandleFunc("/due", func(w http.ResponseWriter, r *http.Request) {
 		st := cache.get(app)
+		w.Header().Set("X-Height", strconv.FormatInt(st.Height, 10))
 		writeJSON(w, 200, st.dueMoves(time.Now().Unix()))
 	})
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
@@ -383,6 +384,9 @@ type SignReq struct {
 	Purpose string       `json:"purpose"` // refund | payout (pull, wallet-authorised) | push (validators' own settlement)
 	Outputs []SignOutput `json:"outputs"`
 	Auth    string       `json:"auth"` // BIP340 sig by the bidder (refund) or seller (payout) wallet over the SIG_ALL hash
+	// Height the asker read the state at: a validator a block behind waits
+	// for it (at most 2 s) before judging, instead of refusing (v0.5.0)
+	Height int64 `json:"height,omitempty"`
 }
 
 // releasePolicy: this validator agrees to a release of escrowed proofs only
@@ -495,6 +499,9 @@ func handleCommit(w http.ResponseWriter, r *http.Request, app *App, fk frostKeyF
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, 400, map[string]string{"error": "bad request"})
 		return
+	}
+	if req.Height > 0 {
+		app.waitCommit(r.Context(), req.Height-1, 2*time.Second)
 	}
 	h, code, err := releasePolicy(app, req)
 	if err != nil {
