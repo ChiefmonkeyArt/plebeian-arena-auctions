@@ -1,8 +1,9 @@
 package main
 
-// v0.5.0 tests (ADR 0009): anti-snipe resets with no cap, fixed lots never
-// move, expiry, push settlement (settle txs and the push signing policy),
-// and the coordinator's majority pick.
+// v0.5.0 + 2-of-2 tests (ADR 0009, spec §4/§5): anti-snipe resets with no cap,
+// fixed lots never move, push settlement through the bidder's COMMITTED
+// outcome templates (the settler is an executor), the push signing policy
+// over committed outputs, and the coordinator's majority pick.
 
 import (
 	"context"
@@ -55,23 +56,27 @@ func testSettler(t *testing.T, a *App) *settler {
 	return &settler{p: a.st.Params, journal: filepath.Join(t.TempDir(), "j.jsonl"), done: map[string]*settleAttempt{}, tries: map[string][]*settleAttempt{}}
 }
 
-// mintMove builds, "swaps" and unblinds one move the way the settler does.
-func mintMove(t *testing.T, a *App, m *testMint, bidID, move, to string, now int64) *settleTx {
+// mintMove submits one committed outcome the way the settler does: it derives
+// the template's outputs from committed state, "swaps" them at the fake mint,
+// unblinds, and builds the settle tx with the committee group signature over
+// exactly the committed outputs.
+func mintMove(t *testing.T, a *App, m *testMint, bidID, outcome, to string, now int64) *settleTx {
 	t.Helper()
 	st := testSettler(t, a)
 	bid := a.st.Bids[bidID]
-	at, err := st.build(dueMove{Bid: bid, Move: move, To: to}, now)
+	outs, reveal, _, err := st.templateMaterial(bid, outcome)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sigs := make([]blindSig, len(at.Outputs))
-	for i, o := range at.Outputs {
+	sigs := make([]blindSig, len(outs))
+	for i, o := range outs {
 		sigs[i] = m.blindSign(t, o)
 	}
+	at := &settleAttempt{Bid: bidID, Outcome: outcome, To: to, Outputs: outs, Reveal: reveal}
 	if err := st.finish(at, sigs); err != nil {
 		t.Fatal(err)
 	}
-	return &settleTx{Bid: bidID, Move: move, Proofs: at.Proofs, Sig: groupSign(t, sigAllMessage(bid.Proofs, at.Outputs))}
+	return &settleTx{Bid: bidID, Outcome: outcome, Proofs: at.Proofs, Sig: groupSign(t, sigAllMessage(bid.Proofs, outs))}
 }
 
 func outputsOf(proofs []Proof) []SignOutput {
@@ -112,7 +117,7 @@ func TestAntiSnipeResetsWithNoCap(t *testing.T) {
 		t.Fatal("a bid with more than the window left must not move the end")
 	}
 	finalize(t, a, 41, end)
-	if au.Status != "closed" || au.Winner == "" || au.Expired {
+	if au.Status != "closed" || au.Winner == "" {
 		t.Fatalf("the lot closes when the bidding stops: %+v", au)
 	}
 }
@@ -130,18 +135,20 @@ func TestFixedLotNeverExtends(t *testing.T) {
 	}
 }
 
-func TestAntiSnipeExpiresWithNoRelock(t *testing.T) {
+// An anti-snipe lot whose leading escrow is far from its locktime is not
+// closed early any more: there is no expiry and no no-sale path (spec §11).
+func TestAntiSnipeHasNoExpiryPath(t *testing.T) {
 	a, m, id := liveApp(t)
 	au := a.st.Auctions[id]
 	au.Mode, au.WindowSec, au.EndAt = "antisnipe", 20, tNow+1000
-	ev, tx := m.bidTx(t, a, newBidder(t), id, 100, "aa") // locktime tNow+30
+	ev, tx := m.bidTx(t, a, newBidder(t), id, 100, "aa")
 	finalize(t, a, 11, tNow+1, tx)
-	if c := a.checkClose(&closeTx{Auction: id, EndAt: au.EndAt}, tNow+10); c.Code == 0 {
-		t.Fatal("no close while the escrow is far from its locktime")
+	if c := a.checkClose(&closeTx{Auction: id, EndAt: au.EndAt}, tNow+24); c.Code == 0 {
+		t.Fatal("no early close: a lot ends only when the bidding stops")
 	}
-	finalize(t, a, 12, tNow+24) // 6 s left on a 30 s margin: below margin/4
-	if au.Status != "closed" || !au.Expired || au.Winner != "" || a.st.Bids[ev.ID].Status != "lost" {
-		t.Fatalf("an unrelocked anti-snipe lot must close with no sale: %+v", au)
+	finalize(t, a, 12, tNow+24)
+	if au.Status != "open" || a.st.Bids[ev.ID].Status != "leading" {
+		t.Fatalf("an anti-snipe lot with a long lock must stay open: %+v", au)
 	}
 }
 
@@ -154,7 +161,7 @@ func TestPushRefundSettles(t *testing.T) {
 	if a.st.Bids[ev1.ID].Status != "outbid" {
 		t.Fatal("setup")
 	}
-	if items := a.st.dueMoves(tNow + 2); len(items) != 1 || items[0].Move != "refund" || items[0].To != alice.wallet {
+	if items := a.st.dueMoves(tNow + 2); len(items) != 1 || items[0].Outcome != "refund" || items[0].To != alice.wallet {
 		t.Fatalf("the outbid escrow must be due for a refund: %+v", items)
 	}
 	st := mintMove(t, a, m, ev1.ID, "refund", alice.wallet, tNow+2)
@@ -175,10 +182,10 @@ func TestPushRefundSettles(t *testing.T) {
 	if r := finalize(t, a, 13, tNow+3, tx); r.TxResults[0].Code == 0 {
 		t.Fatal("a settle tx must not apply twice")
 	}
-	if _, code, _ := releasePolicy(a, SignReq{Bid: ev1.ID, Purpose: "refund"}); code != 409 {
+	if _, code, _ := releasePolicy(a, SignReq{Bid: ev1.ID, Outcome: "refund"}); code != 409 {
 		t.Fatal("a settled escrow must not be released again")
 	}
-	// the client view: not "mine to claim" any more, but shows settled
+	// the client view shows it settled
 	v := clientView(a.st, map[string]bool{alice.pub: true}, 5)
 	if bv := v.Bids[ev1.ID]; bv != nil && bv.Settled != "refund" {
 		t.Fatalf("view: %+v", bv)
@@ -187,7 +194,7 @@ func TestPushRefundSettles(t *testing.T) {
 
 func TestPushSettleRefusesForgeries(t *testing.T) {
 	a, m, id := liveApp(t)
-	alice, bob, eve := newBidder(t), newBidder(t), newBidder(t)
+	alice, bob := newBidder(t), newBidder(t)
 	ev1, tx1 := m.bidTx(t, a, alice, id, 150, "aa")
 	ev2, tx2 := m.bidTx(t, a, bob, id, 200, "bb")
 	finalize(t, a, 11, tNow+1, tx1, tx2)
@@ -198,15 +205,13 @@ func TestPushSettleRefusesForgeries(t *testing.T) {
 	f.Sig = groupSign(t, "something else")
 	bad["forged signature"] = &f
 
-	// eve's key as the recipient, signed by the group: still refused,
-	// because the chain says the refund goes to alice
-	bad["wrong recipient"] = mintMove(t, a, m, ev1.ID, "refund", eve.wallet, tNow+2)
-
+	// a different output set than the committed template (a redirected refund)
 	short := *good
 	short.Proofs = good.Proofs[1:]
 	short.Sig = groupSign(t, sigAllMessage(a.st.Bids[ev1.ID].Proofs, outputsOf(short.Proofs)))
 	bad["wrong amount"] = &short
 
+	// a tampered DLEQ on one new proof
 	dl := *good
 	dl.Proofs = append([]Proof(nil), good.Proofs...)
 	d0 := *dl.Proofs[0].DLEQ
@@ -214,8 +219,14 @@ func TestPushSettleRefusesForgeries(t *testing.T) {
 	dl.Proofs[0].DLEQ = &d0
 	bad["bad DLEQ"] = &dl
 
+	// a new proof whose secret is not the committed template's output
+	th := *good
+	th.Proofs = append([]Proof(nil), good.Proofs...)
+	th.Proofs[0] = a.st.Bids[ev1.ID].Proofs[0] // the OLD proof secret, re-used
+	bad["foreign output"] = &th
+
 	bad["leading bid"] = mintMove(t, a, m, ev2.ID, "refund", bob.wallet, tNow+2)
-	bad["payout of an open lot"] = mintMove(t, a, m, ev2.ID, "payout", alice.wallet, tNow+2)
+	bad["settle of an open lot"] = mintMove(t, a, m, ev2.ID, "settle", a.st.Auctions[id].SellerWallet, tNow+2)
 
 	for name, st := range bad {
 		if ck, _ := a.CheckTx(context.Background(), &abci.CheckTxRequest{Tx: makeSettle(st)}); ck.Code == 0 {
@@ -229,93 +240,65 @@ func TestPushSettleRefusesForgeries(t *testing.T) {
 	}
 }
 
-func TestPushPayoutAndRelock(t *testing.T) {
+func TestPushSettleAndRefund(t *testing.T) {
 	a, m, id := liveApp(t)
 	au := a.st.Auctions[id]
-	au.Mode, au.WindowSec, au.EndAt = "antisnipe", 20, tNow+1000
+	au.Mode, au.WindowSec, au.EndAt = "antisnipe", 60, tNow+1000
 	seller := newBidder(t)
 	au.SellerWallet = seller.wallet
 	alice := newBidder(t)
-	ev, tx := m.bidTx(t, a, alice, id, 150, "aa") // locktime tNow+30
+	ev, tx := m.bidTx(t, a, alice, id, 150, "aa")
 	finalize(t, a, 11, tNow+1, tx)
 	b := a.st.Bids[ev.ID]
 	if len(a.st.dueMoves(tNow+5)) != 0 {
-		t.Fatal("relock not due while the lock is far off")
+		t.Fatal("nothing is due while the lot is open and the bid leads")
 	}
-	items := a.st.dueMoves(tNow + 16) // 14 s left: below margin/2
-	if len(items) != 1 || items[0].Move != "relock" {
-		t.Fatalf("relock must be due: %+v", items)
-	}
-	old := b.Locktime
-	st := mintMove(t, a, m, ev.ID, "relock", strings.ToLower(a.st.Params.GroupKey), tNow+16)
-	if r := finalize(t, a, 12, tNow+16, makeSettle(st)); r.TxResults[0].Code != 0 {
-		t.Fatalf("relock: %s", r.TxResults[0].Log)
-	}
-	if b.Settled != "" || b.Relocks != 1 || b.Locktime <= old || b.Status != "leading" {
-		t.Fatalf("relock must keep the escrow with a later lock: %+v", b)
-	}
-	if _, err := a.st.checkLock(b.Proofs, alice.wallet, 0); err != nil {
-		t.Fatalf("relocked escrow keeps the escrow lock: %v", err)
-	}
-	finalize(t, a, 13, tNow+24)
-	if au.Status != "open" {
-		t.Fatal("a relocked lot must not expire")
-	}
-	// relock to anyone but the group is refused
-	if _, err := a.st.verifySettle(mintMove(t, a, m, ev.ID, "relock", alice.wallet, tNow+40), tNow+40); err == nil {
-		t.Fatal("relock to a bidder key accepted")
-	}
-	// close and pay the seller
+	// close and pay the seller via the committed settle template
 	au.EndAt = tNow + 50
-	finalize(t, a, 14, tNow+50)
+	finalize(t, a, 12, tNow+50)
 	if au.Winner != ev.ID {
 		t.Fatalf("winner: %+v", au)
 	}
-	items = a.st.dueMoves(tNow + 51)
-	if len(items) != 1 || items[0].Move != "payout" || items[0].To != seller.wallet {
-		t.Fatalf("payout must be due to the seller: %+v", items)
+	items := a.st.dueMoves(tNow + 51)
+	if len(items) != 1 || items[0].Outcome != "settle" || items[0].To != seller.wallet {
+		t.Fatalf("settle must be due to the seller: %+v", items)
 	}
-	pay := mintMove(t, a, m, ev.ID, "payout", seller.wallet, tNow+51)
-	if r := finalize(t, a, 15, tNow+51, makeSettle(pay)); r.TxResults[0].Code != 0 {
-		t.Fatalf("payout: %s", r.TxResults[0].Log)
+	pay := mintMove(t, a, m, ev.ID, "settle", seller.wallet, tNow+51)
+	if r := finalize(t, a, 13, tNow+51, makeSettle(pay)); r.TxResults[0].Code != 0 {
+		t.Fatalf("settle: %s", r.TxResults[0].Log)
 	}
-	if b.Settled != "payout" {
-		t.Fatal("payout not recorded")
+	if b.Settled != "settle" {
+		t.Fatal("settle not recorded")
+	}
+	// a settled escrow cannot also be refunded
+	if _, code, _ := releasePolicy(a, SignReq{Bid: ev.ID, Outcome: "refund"}); code != 409 {
+		t.Fatal("a settled escrow must not be refundable")
 	}
 }
 
-func TestPushPolicyChecksRevealedOutputs(t *testing.T) {
+// The push signing policy signs the COMMITTED template's outputs and nothing
+// else: a refund of a leading bid is refused, and an unknown outcome name is
+// refused. There is no caller-supplied output any more (spec §4/§5).
+func TestPushPolicySignsCommittedTemplate(t *testing.T) {
 	a, m, id := liveApp(t)
 	alice, bob := newBidder(t), newBidder(t)
 	ev1, tx1 := m.bidTx(t, a, alice, id, 150, "aa")
 	ev2, tx2 := m.bidTx(t, a, bob, id, 200, "bb")
 	finalize(t, a, 11, tNow+1, tx1, tx2)
-	st := testSettler(t, a)
-	at, _ := st.build(dueMove{Bid: a.st.Bids[ev1.ID], Move: "refund", To: alice.wallet}, tNow)
-	req := SignReq{Bid: ev1.ID, Purpose: "push", Move: "refund", Outputs: at.Outputs, Reveal: at.Reveal}
-	if _, code, err := releasePolicy(a, req); code != 200 {
-		t.Fatalf("valid push refused: %d %v", code, err)
-	}
-	// hide the real recipient behind a different blinded message
-	bad := req
-	bad.Outputs = append([]SignOutput(nil), req.Outputs...)
-	bad.Outputs[0].B = "02" + strings.Repeat("ab", 32)
-	if _, code, _ := releasePolicy(a, bad); code == 200 {
-		t.Fatal("output not matching its revealed secret accepted")
-	}
-	eveAt, _ := st.build(dueMove{Bid: a.st.Bids[ev1.ID], Move: "refund", To: bob.wallet}, tNow)
-	if _, code, _ := releasePolicy(a, SignReq{Bid: ev1.ID, Purpose: "push", Move: "refund", Outputs: eveAt.Outputs, Reveal: eveAt.Reveal}); code == 200 {
-		t.Fatal("push to the wrong key accepted")
-	}
-	if _, code, _ := releasePolicy(a, SignReq{Bid: ev2.ID, Purpose: "push", Move: "refund", Outputs: at.Outputs, Reveal: at.Reveal}); code == 200 {
-		t.Fatal("push refund of the leading bid accepted")
-	}
-	noReveal := req
-	noReveal.Reveal = nil
-	if _, code, _ := releasePolicy(a, noReveal); code == 200 {
-		t.Fatal("push without reveals accepted")
-	}
 	_ = m
+
+	if _, code, err := releasePolicy(a, SignReq{Bid: ev1.ID, Outcome: "refund"}); code != 200 {
+		t.Fatalf("valid refund refused: %d %v", code, err)
+	}
+	if _, code, _ := releasePolicy(a, SignReq{Bid: ev2.ID, Outcome: "refund"}); code == 200 {
+		t.Fatal("refund of the leading bid accepted")
+	}
+	if _, code, _ := releasePolicy(a, SignReq{Bid: ev1.ID, Outcome: "payout"}); code == 200 {
+		t.Fatal("an unknown outcome must be refused")
+	}
+	if _, code, _ := releasePolicy(a, SignReq{Bid: ev1.ID, Outcome: "nonsense"}); code == 200 {
+		t.Fatal("a nonsense outcome must be refused")
+	}
 }
 
 func TestPickSignersMajority(t *testing.T) {

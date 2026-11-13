@@ -68,24 +68,88 @@ func (m *testMint) sign(t *testing.T, amount int64, secret string) Proof {
 		DLEQ: &DLEQ{E: scalarHex(&e), S: scalarHex(&s), R: scalarHex(&r)}}
 }
 
+// lockForSigAll builds the canonical 2-of-2 [bidder, committee] SIG_ALL lock
+// (spec §1): data = the bidder's wallet key, pubkeys = [committee], n_sigs = 2,
+// refund = the bidder alone, SIG_ALL, and exactly five tags in canonical order.
+// The nonce is a full 32 bytes (64 hex chars), as the strict parser requires.
+func lockForSigAll(committee, wallet string, locktime int64, nonce string) string {
+	n := nonce
+	if len(n) > 64 {
+		n = n[:64]
+	}
+	if len(n) < 64 {
+		n = n + strings.Repeat("0", 64-len(n))
+	}
+	return fmt.Sprintf(`["P2PK",{"nonce":"%s","data":"%s","tags":[["locktime","%d"],["pubkeys","%s"],["n_sigs","2"],["refund","%s"],["sigflag","SIG_ALL"]]}]`,
+		n, wallet, locktime, committee, wallet)
+}
+
+// lockFor builds the OLD 1-of-1 lock (group key alone, n_sigs=1) so a test can
+// prove it is refused by name under the 2-of-2 rule.
 func lockFor(group, wallet string, locktime int64, nonce string) string {
 	return fmt.Sprintf(`["P2PK",{"nonce":"%s","data":"%s","tags":[["locktime","%d"],["refund","%s"],["sigflag","SIG_ALL"]]}]`, nonce, group, locktime, wallet)
 }
 
+// p2pkOut is one plain P2PK output secret locked to recipient (SIG_INPUTS).
+func p2pkOut(recipient, nonce string) string {
+	return fmt.Sprintf(`["P2PK",{"nonce":"%s","data":"%s","tags":[["sigflag","SIG_INPUTS"]]}]`, nonce, recipient)
+}
+
+// templates builds the bidder's two pre-signed outcome templates for proofs:
+// settle -> sellerKey, refund -> the bidder's own wallet key. One output per
+// input, same amounts, same keyset (spec §1.2). The bidder signs each
+// template's layout-B digest with the wallet spend key it locked to.
+func (m *testMint) templates(t *testing.T, b bidder, sellerKey string, proofs []Proof) *sigAllOutcomeTemplates {
+	t.Helper()
+	build := func(recipient string) sigAllSignedTemplate {
+		var inputs []sigAllTemplateInput
+		var outputs []sigAllTemplateOutput
+		for i, p := range proofs {
+			inputs = append(inputs, sigAllTemplateInput{Amount: p.Amount, ID: p.ID, Secret: p.Secret, C: p.C})
+			outputs = append(outputs, sigAllTemplateOutput{Amount: p.Amount, ID: p.ID,
+				Secret: p2pkOut(recipient, fmt.Sprintf("%064x", 0x2000+i+1)),
+				R:      fmt.Sprintf("%064x", 0x100000+i+1)})
+		}
+		tpl := sigAllSignedTemplate{Inputs: inputs, Outputs: outputs}
+		digest, err := sigAllTemplateDigest(tpl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sig, err := schnorr.Sign(b.walletSk, mustHex(digest))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tpl.Digest, tpl.BidderSignature = digest, hex.EncodeToString(sig.Serialize())
+		return tpl
+	}
+	return &sigAllOutcomeTemplates{Settle: build(sellerKey), Refund: build(b.wallet)}
+}
+
 type bidder struct {
-	sk     *btcec.PrivateKey
-	pub    string // x-only nostr key
-	wallet string // compressed wallet key
+	sk       *btcec.PrivateKey
+	pub      string // x-only nostr key
+	wallet   string // compressed wallet key
+	walletSk *btcec.PrivateKey
 }
 
 func newBidder(t *testing.T) bidder {
 	sk, _ := btcec.NewPrivateKey()
 	w, _ := btcec.NewPrivateKey()
-	return bidder{sk: sk, pub: hex.EncodeToString(schnorr.SerializePubKey(sk.PubKey())), wallet: hex.EncodeToString(w.PubKey().SerializeCompressed())}
+	return bidder{sk: sk, pub: hex.EncodeToString(schnorr.SerializePubKey(sk.PubKey())), wallet: hex.EncodeToString(w.PubKey().SerializeCompressed()), walletSk: w}
 }
 
 func signEvent(t *testing.T, sk *btcec.PrivateKey, kind int, content string, at int64) *Event {
-	ev := &Event{Pubkey: hex.EncodeToString(schnorr.SerializePubKey(sk.PubKey())), CreatedAt: at, Kind: kind, Tags: [][]string{}, Content: content}
+	return signEventTags(t, sk, kind, content, at, [][]string{})
+}
+
+// signEventTags signs an event with explicit tags (NIP-01 id over the
+// canonical serialisation).
+func signEventTags(t *testing.T, sk *btcec.PrivateKey, kind int, content string, at int64, tags [][]string) *Event {
+	t.Helper()
+	if tags == nil {
+		tags = [][]string{}
+	}
+	ev := &Event{Pubkey: hex.EncodeToString(schnorr.SerializePubKey(sk.PubKey())), CreatedAt: at, Kind: kind, Tags: tags, Content: content}
 	h := sha256.Sum256([]byte(ev.Serialize()))
 	ev.ID = hex.EncodeToString(h[:])
 	sig, err := schnorr.Sign(sk, h[:])
@@ -99,40 +163,64 @@ func signEvent(t *testing.T, sk *btcec.PrivateKey, kind int, content string, at 
 const tNow = int64(1_800_000_000)
 
 // liveApp: one open fixed-time lot (start 100, +10) ending at tNow+100.
+//
+// The lot is created through a real 1440 create event, so it is stored under
+// its (seller, d) coordinate with a genuine auction_root_event_id — the id it
+// returns is that root id, and bids bind to it.
 func liveApp(t *testing.T) (*App, *testMint, string) {
 	m := newTestMint(t)
 	group := hex.EncodeToString(mulG(new(btcec.ModNScalar).SetInt(7)).SerializeCompressed())
 	a := NewApp()
-	a.st.Params = Params{KeysetID: m.id, Keys: map[string]string{}, GroupKey: group, LockMarginSec: 30, MaxProofs: 64,
-		MinWindowSec: 15, MaxWindowSec: 900}
+	a.st.Params = Params{KeysetID: m.id, Keys: map[string]string{}, GroupKey: group, MaxProofs: 64,
+		MinWindowSec: 60, MaxWindowSec: 900, SettlementSafetySec: 900, BidToConsensusLatencySec: 15,
+		MinDurationSec: 20, MaxDurationSec: 100000}
 	for _, amt := range []int64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512} {
 		a.st.Params.Keys[fmt.Sprint(amt)] = hex.EncodeToString(m.A.SerializeCompressed())
 	}
 	a.st.Height, a.st.Time = 10, tNow
-	id := hx(42)
-	a.st.Auctions[id] = &Auction{ID: id, Seller: hx(7), Status: "open", StartPrice: 100, MinIncrement: 10,
-		EndAt: tNow + 100, Mode: "fixed"}
-	a.st.Order = []string{id}
-	return a, m, id
+	seller := newBidder(t)
+	c := CreateContent{Title: "lot", StartPrice: 100, MinIncrement: 10, DurationSec: 100, SellerWallet: seller.wallet, Mode: "fixed"}
+	b, _ := json.Marshal(c)
+	root := signEventTags(t, seller.sk, KindCreate, string(b), tNow, [][]string{{"d", "lot-42"}})
+	if err := a.st.applyCreate(root, tNow, 10, true); err != nil {
+		t.Fatal(err)
+	}
+	// The returned id is the auction's coordinate a = 1440:<seller>:<d> — the
+	// key it is stored under and what bids carry in their content. Its root
+	// event id (what a bid binds to via e) is au.RootID.
+	return a, m, coordOf(seller.pub, "lot-42")
 }
 
+// sellerWallet is the committed seller payout key of the liveApp lot, so a
+// test can build a valid settle template against it.
+func sellerWallet(t *testing.T) string {
+	t.Helper()
+	sk, _ := btcec.PrivKeyFromBytes(append(make([]byte, 31), 9))
+	return hex.EncodeToString(sk.PubKey().SerializeCompressed())
+}
+
+// bidTx builds a signed 2-of-2 bid: proofs locked to the committee key (as the
+// bidder), plus the bidder's pre-signed settle and refund templates.
 func (m *testMint) bidTx(t *testing.T, a *App, b bidder, auction string, amount int64, nonce string) (*Event, []byte) {
 	var proofs []Proof
-	au := a.st.Auctions[auction]
-	lt := au.EndAt + a.st.Params.LockMarginSec
-	if au.Mode == "antisnipe" {
-		lt = a.st.Time + a.st.Params.LockMarginSec
+	au := a.st.byRoot(auction)
+	if au == nil {
+		au = a.st.Auctions[auction] // some tests name the auction by its coordinate
 	}
+	lt := a.st.minLocktime(au, a.st.Time)
 	left, i := amount, 0
 	for d := int64(512); d >= 1; d /= 2 {
 		for left >= d {
-			proofs = append(proofs, m.sign(t, d, lockFor(a.st.Params.GroupKey, b.wallet, lt, fmt.Sprintf("%s%02d", nonce, i))))
+			proofs = append(proofs, m.sign(t, d, lockForSigAll(a.st.Params.GroupKey, b.wallet, lt, fmt.Sprintf("%s%02d", nonce, i))))
 			left -= d
 			i++
 		}
 	}
-	c, _ := json.Marshal(BidContent{Auction: auction, Amount: amount, Wallet: b.wallet, Name: "t", Proofs: proofs})
-	ev := signEvent(t, b.sk, KindBid, string(c), tNow)
+	c, _ := json.Marshal(BidContent{Auction: au.ID, Amount: amount, Wallet: b.wallet, Name: "t", Proofs: proofs,
+		OutcomeTemplates: m.templates(t, b, au.SellerWallet, proofs)})
+	// every bid binds to the auction root: e = auction_root_event_id, plus our
+	// own coordinate a = 1440:<seller>:<d>.
+	ev := signEventTags(t, b.sk, KindBid, string(c), tNow, [][]string{{"e", au.RootID}, {"a", au.ID}})
 	tx, _ := json.Marshal(ev)
 	return ev, tx
 }
@@ -182,13 +270,12 @@ func TestLateBidIsVoidAndRefundable(t *testing.T) {
 			t.Fatal("a void bid's proofs must be marked used")
 		}
 	}
-	// the escrow can be refunded now: policy passes up to the wallet signature
-	out := []SignOutput{{Amount: 128, ID: m.id, B: "02" + strings.Repeat("ab", 32)}, {Amount: 16, ID: m.id, B: "02" + strings.Repeat("ac", 32)},
-		{Amount: 4, ID: m.id, B: "02" + strings.Repeat("ad", 32)}, {Amount: 2, ID: m.id, B: "02" + strings.Repeat("ae", 32)}}
-	if _, code, err := releasePolicy(a, SignReq{Bid: ev2.ID, Purpose: "refund", Outputs: out, Auth: strings.Repeat("00", 64)}); code != 403 {
-		t.Fatalf("void refund must reach the auth check, got %d %v", code, err)
+	// the escrow can be refunded now: policy passes on the committed refund
+	// template (the bid is void, so a refund is due).
+	if _, code, err := releasePolicy(a, SignReq{Bid: ev2.ID, Outcome: "refund"}); code != 200 {
+		t.Fatalf("void refund must be allowed by policy, got %d %v", code, err)
 	}
-	if _, code, _ := releasePolicy(a, SignReq{Bid: ev1.ID, Purpose: "refund", Outputs: out}); code != 409 {
+	if _, code, _ := releasePolicy(a, SignReq{Bid: ev1.ID, Outcome: "refund"}); code != 409 {
 		t.Fatal("the leading bid must not be refundable")
 	}
 	// the same proofs cannot be bid again
@@ -269,14 +356,18 @@ func TestEmptyBlocksKeepAppHash(t *testing.T) {
 func TestCloseTx(t *testing.T) {
 	a, _, id := liveApp(t)
 	au := a.st.Auctions[id]
-	tx := makeClose(id, au.EndAt, tNow+100)
+	// The close tx names the auction by its stable ROOT id (64-char hex), not
+	// by the coordinate: parseClose requires a 64-char hex auction id, and
+	// checkClose resolves it with byRoot, so an edit can never orphan it.
+	root := au.RootID
+	tx := makeClose(root, au.EndAt, tNow+100)
 	c, ok := parseClose(tx)
-	if !ok || c.Auction != id || c.EndAt != au.EndAt {
+	if !ok || c.Auction != root || c.EndAt != au.EndAt {
 		t.Fatal("close tx round trip")
 	}
 	for name, bad := range map[string][]byte{
 		"short id": []byte("close:abc:1:1"), "extra": append(append([]byte{}, tx...), ":1"...), "upper": []byte(strings.ToUpper(string(tx))),
-		"not a number": []byte("close:" + id + ":x:1"),
+		"not a number": []byte("close:" + root + ":x:1"),
 	} {
 		if _, ok := parseClose(bad); ok {
 			t.Errorf("%s: parsed", name)
@@ -288,7 +379,7 @@ func TestCloseTx(t *testing.T) {
 	if r := a.checkClose(c, au.EndAt+60); r.Code == 0 {
 		t.Fatal("a stale close must be refused")
 	}
-	if r := a.checkClose(&closeTx{id, au.EndAt + 5, tNow + 200}, tNow+200); r.Code == 0 {
+	if r := a.checkClose(&closeTx{root, au.EndAt + 5, tNow + 200}, tNow+200); r.Code == 0 {
 		t.Fatal("a close for another EndAt must be refused")
 	}
 	if r := a.checkClose(c, au.EndAt); r.Code != 0 {

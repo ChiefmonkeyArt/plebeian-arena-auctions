@@ -30,15 +30,32 @@ type Params struct {
 	ValidatorNames []string          `json:"validatorNames"`
 	MinWindowSec   int64             `json:"minWindowSec"` // anti-snipe window bounds (ADR 0009)
 	MaxWindowSec   int64             `json:"maxWindowSec"`
-	LockMarginSec  int64             `json:"lockMarginSec"`
-	MinDurationSec int64             `json:"minDurationSec"`
-	MaxDurationSec int64             `json:"maxDurationSec"`
-	MaxProofs      int               `json:"maxProofs"`
-	Threshold      int               `json:"threshold"`
+	// SettlementSafetySec is how long after the end a bid itself establishes
+	// the settlement must land, before the bidder's unilateral refund branch
+	// opens (spec §2.1). It replaces LockMarginSec as the lock driver.
+	SettlementSafetySec int64 `json:"settlementSafetySec"`
+	// BidToConsensusLatencySec covers the gap between the bidder's clock and
+	// the block that admits the bid (spec §2.1). It replaces lockGraceSec.
+	BidToConsensusLatencySec int64 `json:"bidToConsensusLatencySec"`
+	// LockMarginSec is retired as a lock driver: SettlementSafetySec is the
+	// lock rule now (spec §10). It is kept only so an older genesis still
+	// parses; it drives nothing.
+	LockMarginSec  int64 `json:"lockMarginSec,omitempty"`
+	MinDurationSec int64 `json:"minDurationSec"`
+	MaxDurationSec int64 `json:"maxDurationSec"`
+	MaxProofs      int   `json:"maxProofs"`
+	Threshold      int   `json:"threshold"`
+	// Validators is the verdict-publish roster (spec §9, REPLY §3.4): each
+	// validator's own Nostr pubkey, moniker and index.  It lives in Params, so
+	// it is inside the AppHash -- a state commitment (kind 1447) commits to the
+	// roster at that height, which is why a client needs no separate roster
+	// verification in this increment.  A verdict is signed under the validator's
+	// OWN key from this list, never a shared publisher key.
+	Validators []ValidatorKey `json:"validators,omitempty"`
 }
 
 type Auction struct {
-	ID           string   `json:"id"`
+	ID           string   `json:"id"` // coordinate a = 1440:<seller>:<d>; the auction's stable identity
 	Seller       string   `json:"seller"`
 	SellerWallet string   `json:"sellerWallet"`
 	SellerName   string   `json:"sellerName"`
@@ -53,16 +70,33 @@ type Auction struct {
 	EndAt        int64    `json:"endAt"`
 	Mode         string   `json:"mode"`      // fixed | antisnipe (ADR 0009)
 	WindowSec    int64    `json:"windowSec"` // antisnipe: a bid with less than this left resets the clock to it
-	Status       string   `json:"status"` // open | closed
+	Status       string   `json:"status"`    // open | closed
 	HighBid      string   `json:"highBid"`
 	HighAmount   int64    `json:"highAmount"`
 	Bids         []string `json:"bids"`
 	Extensions   int      `json:"extensions"`
 	Winner       string   `json:"winner"`          // bid id
-	Expired      bool     `json:"expired,omitempty"` // antisnipe ran so long the leading escrow neared its locktime: no sale
 	Voids        []string `json:"voids,omitempty"` // late bids, refundable at once (ADR 0007)
 	ClosedAt     int64    `json:"closedAt"`
 	ClosedH      int64    `json:"closedHeight"`
+	// Root pinning and supersession (owner decision 2026-11-12, spec §8). The
+	// auction's identity is (seller, d); the FIRST 1440 event for it is the
+	// root and its id is auction_root_event_id. Later 1440 events are
+	// supersessions gated by the immutable allow-list, and this struct always
+	// holds the latest ACCEPTED version — the one resolution a regular kind
+	// does not get from the relay.
+	D                string `json:"d"`                // the d tag = auction_id
+	RootID           string `json:"rootId"`           // auction_root_event_id
+	VersionID        string `json:"versionId"`        // event id of the canonical (latest accepted) version
+	VersionCreatedAt int64  `json:"versionCreatedAt"` // created_at of that version; gates supersession order
+	DurationSec      int64  `json:"durationSec"`      // frozen duration; EndAt is its materialisation
+	// V4VSplit is the committed value-for-value payout schedule (spec §6). It is
+	// set once, at the create, and is an IMMUTABLE money field (spec §8): no
+	// later event may change it. Each row names a payout recipient and an
+	// integer basis-point share; the seller keeps 10000-sum(allocationBps). The
+	// bidder's pre-signed SETTLE template must carry these exact outputs, so the
+	// money can only reach these recipients (see verifySigAllBidTemplates).
+	V4VSplit []CommittedSplitRow `json:"v4vSplit,omitempty"`
 }
 
 type Bid struct {
@@ -78,10 +112,15 @@ type Bid struct {
 	Time     int64   `json:"time"`
 	Status   string  `json:"status"` // leading | outbid | won | lost | void
 	Extended bool    `json:"extended"`
+	// The bidder's two pre-signed outcome transactions, carried verbatim in
+	// the committed bid (spec §1.2/§2). Every validator re-derives each
+	// template's digest and re-checks the bidder's signature at admission, so
+	// the chain verifies the only two spends the escrow may ever make. A
+	// template that re-locks to the committee key is forbidden (spec §4).
+	OutcomeTemplates *sigAllOutcomeTemplates `json:"outcome_templates,omitempty"`
 	// Push settlement (ADR 0009): the validators moved the escrow themselves.
 	Settled string  `json:"settled,omitempty"` // refund | payout, once the new ecash is minted
 	Out     []Proof `json:"out,omitempty"`     // that ecash, P2PK-locked to the recipient
-	Relocks int     `json:"relocks,omitempty"` // antisnipe: escrow re-locked with a later locktime
 }
 
 type Rejection struct {
@@ -158,7 +197,7 @@ type App struct {
 	appHash    []byte
 	// hash of committed; Info reports it with committedH (ADR 0003 §2)
 	committedHash []byte
-	snap          *snapshotter // nil: no snapshots (tests)
+	snap          *snapshotter  // nil: no snapshots (tests)
 	commitCh      chan struct{} // closed and replaced at every Commit (for /height?after=)
 }
 
@@ -235,6 +274,12 @@ type CreateContent struct {
 	WindowSec    int64  `json:"windowSec"`
 	SellerWallet string `json:"sellerWallet"`
 	Name         string `json:"name"`
+	// V4VSplit is the OPTIONAL committed value-for-value payout schedule (spec
+	// §6). Each row is {role, recipientPubkey, allocationBps}; the seller keeps
+	// the remainder. It is validated by validateV4VSplit, stored immutably on
+	// the auction, and reproduced exactly by the bidder's pre-signed SETTLE
+	// template.
+	V4VSplit []SplitRow `json:"v4vSplit,omitempty"`
 }
 
 type BidContent struct {
@@ -243,6 +288,10 @@ type BidContent struct {
 	Wallet  string  `json:"wallet"`
 	Name    string  `json:"name"`
 	Proofs  []Proof `json:"proofs"`
+	// The bidder's pre-signed settle and refund transactions (spec §1.2). The
+	// chain refuses a bid without them, and refuses any template not locked to
+	// the committed seller (settle) or the bidder (refund) keys.
+	OutcomeTemplates *sigAllOutcomeTemplates `json:"outcome_templates,omitempty"`
 }
 
 // closeTx is the validators' own "close what is due" transaction (ADR 0003
@@ -328,11 +377,126 @@ func isPubHex(s string) bool {
 	return err == nil
 }
 
-// applyCreate validates and (if apply) executes an auction create event at block time now.
-func (s *State) applyCreate(ev *Event, now, height int64, apply bool) error {
-	if _, ok := s.Auctions[ev.ID]; ok {
-		return errors.New("auction already exists")
+// validD: the d tag (auction_id). NIP-01 addressable/parametrised-replaceable
+// charset — [A-Za-z0-9_-], 1..64 chars. An auction whose d fails this is not
+// an auction: the coordinate a = 1440:<seller>:<d> would not be parseable.
+func validD(d string) bool {
+	if len(d) < 1 || len(d) > 64 {
+		return false
 	}
+	for i := 0; i < len(d); i++ {
+		c := d[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// coordOf is OUR coordinate convention for a regular kind: a =
+// 1440:<seller_pubkey>:<d>. This is not NIP-01 addressability — 1440 is
+// regular, so the relay replaces nothing and the latest accepted version must
+// be resolved explicitly (spec §7, §8). The coordinate is the auction's stable
+// identity: bids and the auction map are keyed by it, not by a mutable version
+// event id.
+func coordOf(seller, d string) string {
+	return strconv.Itoa(KindCreate) + ":" + seller + ":" + d
+}
+
+// tagValue returns the first value of the named tag.
+func tagValue(tags [][]string, name string) (string, bool) {
+	for _, t := range tags {
+		if len(t) >= 2 && t[0] == name {
+			return t[1], true
+		}
+	}
+	return "", false
+}
+
+// immutableFields is the allow-list's immutable half, remapped onto his current
+// create payload (owner decision 2026-11-12, spec §8). The principle is
+// display is mutable; money, time and cryptography are not:
+//
+//   - StartPrice        money  — the absolute floor every bid is checked against
+//   - MinIncrement      money  — the step rule
+//   - Mode              time   — fixed | antisnipe decides whether EndAt can move
+//   - WindowSec         time   — the anti-snipe reset amount; EndAt derives from it
+//   - DurationSec       time   — when a fixed lot closes
+//   - SellerWallet      crypto — where settlement pays; the lock's refund/data key
+//
+// The d value and the seller are immutable structurally: they are the
+// coordinate (seller, d), so changing either is a different auction, never an
+// edit. Title, Description and Image are display and stay editable. Category
+// and SellerName are judgement calls, both mutable (see the report): a
+// category is metadata, and a display name is a display field with no bearing
+// on money, time or the lock.
+func immutableChanged(cur *Auction, c *CreateContent, mode string) string {
+	switch {
+	case c.StartPrice != cur.StartPrice:
+		return "StartPrice"
+	case c.MinIncrement != cur.MinIncrement:
+		return "MinIncrement"
+	case mode != cur.Mode:
+		return "Mode"
+	case c.WindowSec != cur.WindowSec:
+		return "WindowSec"
+	case c.DurationSec != cur.DurationSec:
+		return "DurationSec"
+	case strings.ToLower(c.SellerWallet) != cur.SellerWallet:
+		return "SellerWallet"
+	case splitImmutableChanged(cur, c.V4VSplit) != "":
+		// The split is a money field (spec §8). It is checked here, in the one
+		// immutability mechanism, so a supersession that changes who gets paid
+		// is refused by name against the canonical version rather than being
+		// silently accepted and then tripping the bid template check.
+		return "V4VSplit"
+	}
+	return ""
+}
+
+// canonicalAuction resolves (seller, d) to the canonical auction: the latest
+// 1440 event that passed the immutable check. Because 1440 is a regular kind,
+// no relay performed this replacement for us, so the persisted state IS the
+// resolution — a root that never existed, or an update that failed the check,
+// simply never overwrote it, and the entity holds the last accepted version.
+func (s *State) canonicalAuction(seller, d string) *Auction {
+	return s.Auctions[coordOf(seller, d)]
+}
+
+// byRoot finds the auction whose root event id is rootID — or, as a
+// convenience for callers that name the auction by its coordinate, the auction
+// stored under that coordinate key. The validators' own close tx names an
+// auction by its stable root id, not by a mutable version.
+func (s *State) byRoot(rootID string) *Auction {
+	if au := s.Auctions[rootID]; au != nil {
+		return au
+	}
+	for _, au := range s.Auctions {
+		if au.RootID == rootID {
+			return au
+		}
+	}
+	return nil
+}
+
+// applyCreate validates and (if apply) executes a 1440 create event at block
+// time now.
+//
+// The auction's identity is (seller, d), keyed by the coordinate
+// a = 1440:<seller>:<d>. The FIRST event for a coordinate is the ROOT; its
+// event id is auction_root_event_id. A later event for the same coordinate is a
+// SUPERSESSION: it must carry e = <auction_root_event_id> and may change only
+// the allow-listed display fields. A change to any immutable field (money,
+// time, cryptography) is refused with "immutable_field_changed <field>" and
+// ignored — the state keeps the last accepted version.
+func (s *State) applyCreate(ev *Event, now, height int64, apply bool) error {
+	d, ok := tagValue(ev.Tags, "d")
+	if !ok || !validD(d) {
+		return errors.New("create needs a valid d tag")
+	}
+	coord := coordOf(ev.Pubkey, d)
+	root, hasRoot := tagValue(ev.Tags, "e")
+
 	var c CreateContent
 	if err := json.Unmarshal([]byte(ev.Content), &c); err != nil {
 		return errors.New("bad create content")
@@ -360,69 +524,117 @@ func (s *State) applyCreate(ev *Event, now, height int64, apply bool) error {
 	case c.Mode != "antisnipe" && c.WindowSec != 0:
 		return errors.New("a fixed-time lot has no anti-snipe window")
 	}
+	// The committed V4V split is optional but, when present, strictly
+	// validated; a malformed split is refused by name (validateV4VSplit).
+	split, err := validateV4VSplit(c.V4VSplit)
+	if err != nil {
+		return err
+	}
 	mode := c.Mode
 	if mode == "" {
 		mode = "fixed"
 	}
+
+	cur := s.Auctions[coord]
+	if cur == nil {
+		// The root: the first 1440 for this (seller, d). It must not claim a
+		// root it cannot know about — only a supersession carries e.
+		if hasRoot {
+			return errors.New("first create for this (seller, d) must not carry an e tag")
+		}
+		if !apply {
+			return nil
+		}
+		end := now + c.DurationSec
+		s.Auctions[coord] = &Auction{
+			ID: coord, D: d, RootID: ev.ID, VersionID: ev.ID, VersionCreatedAt: ev.CreatedAt, DurationSec: c.DurationSec,
+			Seller: ev.Pubkey, SellerWallet: strings.ToLower(c.SellerWallet), SellerName: c.Name,
+			Title: c.Title, Description: c.Description, Image: c.Image, Category: c.Category,
+			StartPrice: c.StartPrice, MinIncrement: c.MinIncrement, CreatedAt: now, CreatedH: height,
+			EndAt: end, Mode: mode, WindowSec: c.WindowSec, Status: "open", Bids: []string{},
+			V4VSplit: split,
+		}
+		s.Order = append(s.Order, coord)
+		return nil
+	}
+
+	// A supersession. It must point at the ROOT — not at whatever version it
+	// last saw. That is what keeps bids (which also point at the root)
+	// attached across an edit.
+	if !hasRoot || root != cur.RootID {
+		return errors.New("update must reference the auction root (e = auction_root_event_id)")
+	}
+	// Immutable check against the canonical (latest accepted) version. A
+	// refused supersession is ignored, never applied: the state below stays
+	// untouched, so the canonical auction remains the last accepted one.
+	if f := immutableChanged(cur, &c, mode); f != "" {
+		return fmt.Errorf("immutable_field_changed %s", f)
+	}
+	// Latest by created_at that passes the check: an edit no newer than the
+	// canonical version does not win, and a replay is ignored.
+	if ev.CreatedAt <= cur.VersionCreatedAt {
+		return errors.New("stale update ignored")
+	}
 	if !apply {
 		return nil
 	}
-	end := now + c.DurationSec
-	s.Auctions[ev.ID] = &Auction{
-		ID: ev.ID, Seller: ev.Pubkey, SellerWallet: strings.ToLower(c.SellerWallet), SellerName: c.Name,
-		Title: c.Title, Description: c.Description, Image: c.Image, Category: c.Category,
-		StartPrice: c.StartPrice, MinIncrement: c.MinIncrement, CreatedAt: now, CreatedH: height,
-		EndAt: end, Mode: mode, WindowSec: c.WindowSec, Status: "open", Bids: []string{},
-	}
-	s.Order = append(s.Order, ev.ID)
+	// Only display fields change; money, time and cryptography stay put, and
+	// EndAt is never recomputed.
+	cur.Title, cur.Description, cur.Image, cur.Category, cur.SellerName = c.Title, c.Description, c.Image, c.Category, c.Name
+	cur.VersionID, cur.VersionCreatedAt, cur.CreatedH = ev.ID, ev.CreatedAt, height
 	return nil
 }
 
-// lockGraceSec: an anti-snipe bid's locktime is checked against the block
-// time, which the bidder can only estimate, so it may fall this short.
-const lockGraceSec = 30
-
-// minLocktime is the earliest refund locktime a bid on au may carry at block
-// time now. Fixed lots never move their end, so the lock covers end+margin.
-// Anti-snipe lots have no end in advance: the lock covers margin from now and
-// the validators re-lock a leading escrow before it gets close (ADR 0009).
-func (s *State) minLocktime(au *Auction, now int64) int64 {
-	if au.Mode == "antisnipe" {
-		return now + s.Params.LockMarginSec - lockGraceSec
+// establishedEnd is the end time a bid establishes, given whether it extends.
+// For an antisnipe bid that arrives with less than WindowSec left, the lot's
+// end becomes now+WindowSec (see applyBid), so THAT is the end the bid's
+// locktime must clear. For a fixed lot, and for an antisnipe bid that does not
+// extend, it is the lot's current EndAt.
+func (s *State) establishedEnd(au *Auction, now int64, extends bool) int64 {
+	if extends {
+		return now + au.WindowSec
 	}
-	return au.EndAt + s.Params.LockMarginSec
+	if au.Mode == "antisnipe" && au.EndAt < now+au.WindowSec {
+		// The bid arrives inside the window: it wins the extension, so treat
+		// the new end as established even before applyBid commits it.
+		return now + au.WindowSec
+	}
+	return au.EndAt
 }
 
-// checkLock enforces the 3-of-4 validator lock with the bidder's refund path.
-func (s *State) checkLock(proofs []Proof, wallet string, minLock int64) (int64, error) {
-	p := s.Params
-	var firstTags string
-	var lt int64
-	for i, pr := range proofs {
-		l, err := parseP2PK(pr.Secret)
-		if err != nil {
-			return 0, err
-		}
-		if l.Data != strings.ToLower(p.GroupKey) || len(l.Pubkeys) != 0 || l.NSigs != 1 {
-			return 0, errors.New("proofs not locked to the validators' FROST group key")
-		}
-		if l.SigFlag != "SIG_ALL" {
-			return 0, errors.New("lock must use SIG_ALL")
-		}
-		if len(l.Refund) != 1 || l.Refund[0] != wallet {
-			return 0, errors.New("refund path must be the bidder's wallet key only")
-		}
-		if l.Locktime < minLock {
-			return 0, errors.New("locktime too early: validators need time to settle")
-		}
-		if i == 0 {
-			firstTags = l.TagsJSON
-			lt = l.Locktime
-		} else if l.TagsJSON != firstTags {
-			return 0, errors.New("all proofs must share one lock")
-		}
+// minLocktime is the earliest refund locktime a bid on au may carry at block
+// time now, derived from the end THIS bid establishes (spec §2.1/§2.2):
+//
+//	minLocktime = max(establishedEnd, now + WindowSec)
+//	            + SettlementSafetySec + BidToConsensusLatencySec
+//
+// It MUST be evaluated against the post-extension end: checking before the
+// extension would validate an extending bid against the OLD end and collapse
+// the post-end safety margin from SettlementSafetySec to as little as
+// BidToConsensusLatencySec (spec §2.2).
+func (s *State) minLocktime(au *Auction, now int64) int64 {
+	end := s.establishedEnd(au, now, au.Mode == "antisnipe" && au.EndAt-now < au.WindowSec)
+	floor := end
+	// The now+WindowSec term guarantees an anti-snipe bid carries at least a
+	// full window of lock after the moment it extends the end. A fixed lot has
+	// no window (WindowSec is 0 and its end never moves), so the term is
+	// vacuous and the floor is the lot's own end.
+	if au.Mode == "antisnipe" && now+au.WindowSec > floor {
+		floor = now + au.WindowSec
 	}
-	return lt, nil
+	return floor + s.Params.SettlementSafetySec + s.Params.BidToConsensusLatencySec
+}
+
+// checkLock enforces the 2-of-2 [bidder, committee] SIG_ALL escrow lock (spec
+// §1): the bidder's wallet key is the first main key, the committee (FROST
+// group) key is the pubkeys entry, n_sigs is 2, SIG_ALL, refund to the bidder
+// alone, exactly five canonical tags, and the locktime clears minLock -- which
+// minLocktime derives from the end this bid establishes, not the old one.
+func (s *State) checkLock(proofs []Proof, wallet string, minLock int64) (int64, error) {
+	if len(proofs) == 0 {
+		return 0, errors.New("all proofs must share one lock")
+	}
+	return checkSigAllLock(proofs, wallet, s.Params.GroupKey, minLock)
 }
 
 func lower(a []string) []string {
@@ -444,6 +656,18 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 	au, ok := s.Auctions[b.Auction]
 	if !ok {
 		return errors.New("unknown auction")
+	}
+	// 0. The bid binds to the auction ROOT, not to the latest version: it must
+	// carry e = <auction_root_event_id>. This check lives HERE, in the
+	// deterministic transition, not only in CheckTx: admission is a mempool
+	// filter and a Byzantine proposer can include a transaction that never
+	// passed it (spec §8).
+	if e, ok := tagValue(ev.Tags, "e"); !ok || e != au.RootID {
+		return errors.New("bid must reference the auction root (auction_root_event_id)")
+	}
+	// The coordinate convention a = 1440:<seller>:<d>, if present, must match.
+	if a, ok := tagValue(ev.Tags, "a"); ok && a != au.ID {
+		return errors.New("bid's a coordinate does not match the auction")
 	}
 	// 1. Is it a real, fully locked escrow? If not, refuse it outright.
 	wallet := strings.ToLower(b.Wallet)
@@ -495,6 +719,13 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 	if err != nil {
 		return err
 	}
+	// The bidder's pre-signed outcome templates: consensus verifies the only
+	// two spends the escrow may ever make (spec §1.2). A bid without them, or
+	// with a template not locked to the committed seller/bidder keys, is
+	// refused by name -- there is no fallback and no server-side synthesis.
+	if err := verifySigAllBidTemplates(au, &b, s.Params); err != nil {
+		return err
+	}
 	// 2. Did it lose a race? Then it is late: recorded as void, refundable now.
 	var late error
 	min := au.StartPrice
@@ -518,7 +749,8 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 		return late
 	}
 	bid := &Bid{ID: ev.ID, Auction: au.ID, Bidder: ev.Pubkey, Name: b.Name, Wallet: wallet, Amount: b.Amount,
-		Proofs: b.Proofs, Locktime: lt, Height: height, Time: now, Status: "leading"}
+		Proofs: b.Proofs, Locktime: lt, Height: height, Time: now, Status: "leading",
+		OutcomeTemplates: b.OutcomeTemplates}
 	s.Bids[ev.ID] = bid
 	for _, y := range ys {
 		s.UsedY[y] = ev.ID
@@ -544,26 +776,15 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 	return nil
 }
 
-// expiring: an anti-snipe lot's leading escrow is within a quarter of the
-// lock margin of its locktime, so no relock has landed in time.
-func (s *State) expiring(au *Auction, now int64) bool {
-	return au.Mode == "antisnipe" && au.HighBid != "" && s.Bids[au.HighBid].Locktime-now < s.Params.LockMarginSec/4
-}
-
+// closeDue closes every open lot whose end has passed. There is no no-sale
+// path and no expiry: an anti-snipe lot ends when the bidding stops, and a
+// lock may be arbitrarily long -- it freezes only the bidder's own funds
+// (spec §2.3), and the last-resort refund simply arrives later.
 func (s *State) closeDue(now, height int64) {
 	ids := append([]string{}, s.Order...)
 	sort.Strings(ids)
 	for _, id := range ids {
 		au := s.Auctions[id]
-		if au.Status == "open" && now < au.EndAt && s.expiring(au, now) {
-			// the leading escrow is near the point where its bidder could take
-			// it back alone (no relock landed): close with no sale, refund all
-			au.Status, au.ClosedAt, au.ClosedH, au.Expired = "closed", now, height, true
-			for _, bid := range au.Bids {
-				s.Bids[bid].Status = "lost"
-			}
-			continue
-		}
 		if au.Status == "open" && now >= au.EndAt {
 			au.Status, au.ClosedAt, au.ClosedH = "closed", now, height
 			if au.HighBid != "" {
@@ -620,11 +841,13 @@ func (a *App) CheckTx(_ context.Context, req *abci.CheckTxRequest) (*abci.CheckT
 func (a *App) checkClose(c *closeTx, now int64) *abci.CheckTxResponse {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	au := a.st.Auctions[c.Auction]
+	// The close tx names the auction by its stable ROOT id, never by a mutable
+	// version event id: an edit must not be able to orphan an in-flight close.
+	au := a.st.byRoot(c.Auction)
 	switch {
 	case au == nil || au.Status != "open" || au.EndAt != c.EndAt:
 		return &abci.CheckTxResponse{Code: 3, Log: "nothing to close"}
-	case c.EndAt > now && !a.st.expiring(au, now):
+	case c.EndAt > now:
 		return &abci.CheckTxResponse{Code: 3, Log: "not due yet"}
 	case c.Sent < now-30 || c.Sent > now+5:
 		return &abci.CheckTxResponse{Code: 3, Log: "stale close"}
@@ -657,7 +880,7 @@ func (a *App) FinalizeBlock(_ context.Context, req *abci.FinalizeBlockRequest) (
 			s.applySettle(st, v)
 			s.TxCount++
 			res[i] = &abci.ExecTxResult{Code: 0}
-			lines = append(lines, ledgerLine{Height: req.Height, Time: now, Event: st.Bid, Result: "settled", Reason: st.Move, Tx: json.RawMessage(tx[len(settlePrefix):])})
+			lines = append(lines, ledgerLine{Height: req.Height, Time: now, Event: st.Bid, Result: "settled", Reason: st.Outcome, Tx: json.RawMessage(tx[len(settlePrefix):])})
 			continue
 		}
 		ev, err := decodeTx(tx)

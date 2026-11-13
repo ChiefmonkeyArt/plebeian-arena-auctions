@@ -18,11 +18,42 @@ type Event struct {
 	Sig       string     `json:"sig"`
 }
 
+// The auction kind map: the 1440 series, one place only (merged protocol spec
+// §7). All are REGULAR kinds (1000 <= n < 10000 per NIP-01), never the
+// NIP-01 ephemeral range: khatru (nak serve) refuses an ephemeral event with
+// no matching live subscription and does not buffer it, so an ephemeral kind
+// would silently drop auction traffic. KindChat (1442) is his and ours uses it
+// for nothing; it is kept only so a chat event stays recognisable by name.
+//
+// These numbers live here and nowhere else — never as literals through the
+// tree. TestKindMapIsRegularRange pins the whole series to the regular range.
 const (
-	KindCreate = 1440
-	KindBid    = 1441
-	KindChat   = 1442
+	KindCreate       = 1440 // create / root: the auction listing and its supersessions
+	KindBid          = 1441 // bid
+	KindChat         = 1442 // chat (his; we publish nothing on it)
+	KindRefund       = 1443 // refund
+	KindSettle       = 1444 // settle
+	KindOutcome      = 1445 // outcome / validator verdict
+	KindFundingAbort = 1446 // funding abort
+	KindStateCommit  = 1447 // state commitment
 )
+
+// AuctionKinds is the exported map of the whole series, so a reader (or a
+// test) can see and iterate every kind in one place.
+var AuctionKinds = map[string]int{
+	"create":        KindCreate,
+	"bid":           KindBid,
+	"chat":          KindChat,
+	"refund":        KindRefund,
+	"settle":        KindSettle,
+	"outcome":       KindOutcome,
+	"funding_abort": KindFundingAbort,
+	"state_commit":  KindStateCommit,
+}
+
+// regularKind: NIP-01's regular range, where relays are expected to STORE the
+// event. The auction series must stay inside it (spec §7).
+func regularKind(k int) bool { return k >= 1000 && k < 10000 }
 
 func nostrStr(sb *strings.Builder, s string) {
 	sb.WriteByte('"')

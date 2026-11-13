@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec/v2"
 	cfg "github.com/cometbft/cometbft/config"
 	"github.com/cometbft/cometbft/crypto"
 	"github.com/cometbft/cometbft/crypto/ed25519"
@@ -70,7 +70,12 @@ func nodeConfig(home string, i int, peers string) *cfg.Config {
 // amounts, Nutshell 0.21 keysets). "arena init -if-needed" wipes on mismatch.
 // v0.4.0: "4" (hash excludes height/time, void bids, PBTS, close txs).
 // v0.5.0: "5" (two auction modes, push settlement, settle txs).
-const chainFormat = "5"
+// v0.5.3 (this change): "6". Two shape changes at once, so this is a WIPE:
+// there is no migration, and old-shape locks or template-less bids are refused
+// outright. (a) 2-of-2 SIG_ALL escrow with pre-signed outcome templates on the
+// bid and the check-order-correct single locktime rule; (b) Params carries the
+// verdict-publish validator roster (spec §9, §12).
+const chainFormat = "6"
 
 // archiveOldLedgers keeps each validator's tx ledger from a chain that is
 // about to be wiped, as run/chain-archive/<format>-<unix>/vN-ledger.jsonl.
@@ -102,12 +107,12 @@ func cmdInit(args []string) {
 	fs := flag.NewFlagSet("init", flag.ExitOnError)
 	root := fs.String("root", "run/chain", "chain root dir")
 	mint := fs.String("mint", "http://127.0.0.1:3338", "mint url")
-	margin := fs.Int64("lock-margin", 86400, "seconds between hard close and the bid refund locktime; the seller must collect within this window")
+	// -lock-margin is RETIRED as a lock driver (spec §10): the locktime floor
+	// is settlement_safety (+ bid_to_consensus_latency) now. The flag is still
+	// accepted so existing invocations do not break, but it drives nothing.
+	_ = fs.Int64("lock-margin", 86400, "retired: settlement_safety drives the lock now")
 	ifNeeded := fs.Bool("if-needed", false, "keep an existing chain whose format marker matches; otherwise wipe and re-initialise")
 	fs.Parse(args)
-	if *margin < 10 {
-		log.Fatal("-lock-margin must be at least 10 seconds")
-	}
 	if *ifNeeded {
 		if b, err := os.ReadFile(filepath.Join(*root, "FORMAT")); err == nil && strings.TrimSpace(string(b)) == chainFormat {
 			fmt.Printf("chain in %s is format %s, keeping it\n", *root, chainFormat)
@@ -167,9 +172,27 @@ func cmdInit(args []string) {
 		kb, _ := json.MarshalIndent(frostKeyFile{Participant: i + 1, KeyPackage: shares[i], GroupKey: groupKey}, "", " ")
 		check(os.WriteFile(filepath.Join(homeOf(*root, i), "config", "frost_key.json"), kb, 0o600))
 	}
+	// Verdict-publish roster (spec §9): each validator gets its OWN secp256k1
+	// Nostr key, written only to its home.  Params carries the roster, so it is
+	// inside the AppHash; a verdict is signed under that key, never a shared
+	// publisher key -- one shared publisher would make a forged verdict
+	// indistinguishable from a real one.
+	roster := make([]ValidatorKey, 0, 4)
+	for i := 0; i < 4; i++ {
+		sk, err := btcec.NewPrivateKey()
+		check(err)
+		kb, _ := json.MarshalIndent(verdictKeyFile{Pubkey: NostrPubkeyHex(sk), Secret: hex.EncodeToString(sk.Serialize())}, "", " ")
+		check(os.WriteFile(filepath.Join(homeOf(*root, i), "config", "verdict_key.json"), kb, 0o600))
+		roster = append(roster, ValidatorKey{Pubkey: NostrPubkeyHex(sk), Name: names[i], Index: i + 1})
+	}
 	params := Params{MintURL: *mint, KeysetID: kid, Keys: keys.Keysets[0].Keys, GroupKey: groupKey, FrostPublic: pkp, ValidatorNames: names,
-		MinWindowSec: 15, MaxWindowSec: 900, LockMarginSec: *margin, MinDurationSec: 20, MaxDurationSec: 7200,
-		MaxProofs: 64, Threshold: 3}
+		// Spec §10: MinWindowSec 60, MaxWindowSec 900, settlement_safety 900,
+		// bid_to_consensus_latency 15, MinDurationSec 20, MaxDurationSec 259200
+		// (3 days). MaxTotalExtension is removed entirely.
+		MinWindowSec: 60, MaxWindowSec: 900,
+		SettlementSafetySec: 900, BidToConsensusLatencySec: 15,
+		MinDurationSec: 20, MaxDurationSec: 259200,
+		MaxProofs: 64, Threshold: 3, Validators: roster}
 	ab, _ := json.Marshal(params)
 	// PBTS (v0.4.0): block time is the proposer's clock, checked by every
 	// validator against its own within 505 ms + message delay. Under the old
@@ -197,7 +220,7 @@ func cmdInit(args []string) {
 		check(os.WriteFile(filepath.Join(home, "peers.txt"), []byte(strings.Join(peers, ",")), 0o600))
 	}
 	check(os.WriteFile(filepath.Join(*root, "FORMAT"), []byte(chainFormat+"\n"), 0o600))
-	fmt.Printf("initialised 4 validators in %s, keyset %s, FROST group key %s, lock margin %ds\n", *root, kid, groupKey, *margin)
+	fmt.Printf("initialised 4 validators in %s, keyset %s, FROST group key %s, settlement safety %ds, bid-to-consensus latency %ds\n", *root, kid, groupKey, params.SettlementSafetySec, params.BidToConsensusLatencySec)
 }
 
 func cmdNode(args []string) {
@@ -206,6 +229,8 @@ func cmdNode(args []string) {
 	idx := fs.Int("i", 1, "validator number 1-4")
 	every := fs.Int64("snapshot-every", 1000, "write a state snapshot every N blocks (0: only on clean shutdown)")
 	retain := fs.Int64("retain-blocks", 100000, "prune blocks more than N below the newest snapshot (0: keep every block)")
+	var relays relayURLs
+	fs.Var(&relays, "relay", "relay websocket URL: ingests auction events from it and publishes verdicts and state commitments to it (repeatable)")
 	fs.Parse(args)
 	if *every < 0 || *retain < 0 {
 		log.Fatal("-snapshot-every and -retain-blocks must be >= 0")
@@ -251,6 +276,16 @@ func cmdNode(args []string) {
 	log.Printf("%s up: p2p %d rpc %d http %d", names[i], p2pPort(i), rpcPort(i), httpPort(i))
 	stopCloser := make(chan struct{})
 	go runCloser(app, fmt.Sprintf("http://127.0.0.1:%d", rpcPort(i)), stopCloser)
+
+	// Verdict publish path (the write half of the Nostr transport).  Dormant
+	// unless at least one -relay is configured: with no relay a validator
+	// behaves exactly as before.  THE RELAY NOTIFIES, THE CHAIN DECIDES, THE
+	// ANCHOR PROVES: every verdict is published only after its block is
+	// committed, anchored to that committed block's hash, read here from the
+	// node's own block store.
+	if len(relays) > 0 {
+		startVerdictPublish(app, n, home, i, relays)
+	}
 
 	mux := http.NewServeMux()
 	cache := &committedCache{}
@@ -330,9 +365,17 @@ func cmdNode(args []string) {
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() { log.Println(srv.ListenAndServe()) }()
 
+	// Relay ingest: subscribe to the configured relay(s) and submit every
+	// verified auction/bid event into THIS node's mempool.  One observer per
+	// relay, per validator; a client thus never has to know which node leads.
+	stopIngest, err := startRelayIngest(context.Background(), relays, fmt.Sprintf("http://127.0.0.1:%d", rpcPort(i)), log.Default())
+	check(err)
+	defer stopIngest()
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
+	stopIngest()
 	srv.Close()
 	close(stopCloser)
 	n.Stop()
@@ -378,113 +421,47 @@ type Reveal struct {
 }
 
 type SignReq struct {
-	Bid     string       `json:"bid"`
-	Move    string       `json:"move,omitempty"`   // push: refund | payout | relock
-	Reveal  []Reveal     `json:"reveal,omitempty"` // push: one per output
-	Purpose string       `json:"purpose"` // refund | payout (pull, wallet-authorised) | push (validators' own settlement)
-	Outputs []SignOutput `json:"outputs"`
-	Auth    string       `json:"auth"` // BIP340 sig by the bidder (refund) or seller (payout) wallet over the SIG_ALL hash
+	Bid     string `json:"bid"`
+	Outcome string `json:"outcome"` // settle | refund: which committed template to sign
 	// Height the asker read the state at: a validator a block behind waits
 	// for it (at most 2 s) before judging, instead of refusing (v0.5.0)
 	Height int64 `json:"height,omitempty"`
 }
 
-// releasePolicy: this validator agrees to a release of escrowed proofs only
-// when its own copy of the agreed state allows it, and the right wallet has
-// authorised it. Returns the SIG_ALL hash the escrow signature must cover.
+// releasePolicy: this validator agrees to sign a release of escrowed proofs
+// only when its own copy of the agreed state says the outcome is due, and it
+// signs over the bid's COMMITTED template's outputs -- never a caller's. It
+// returns the SIG_ALL hash the committee signature must cover.
+//
+// There is no caller-supplied output and no Auth field any more (spec §4/§5):
+// the bidder's half is already pre-signed inside the committed template, so
+// the only thing a caller names is the bid and the outcome. The old
+// caller-chosen-outputs "pull" path was a liability once the destination is
+// pinned by the bidder's signature, and is deleted.
 func releasePolicy(app *App, req SignReq) (h [32]byte, code int, err error) {
-	var msg, authKey string
+	var msg string
 	app.Read(func(s *State) {
 		bid, ok := s.Bids[req.Bid]
 		if !ok {
 			err = errors.New("unknown bid")
 			return
 		}
-		au := s.Auctions[bid.Auction]
-		if bid.Settled != "" {
-			err = errors.New("escrow already settled")
+		if _, err = s.outcomeDue(bid, req.Outcome, time.Now().Unix(), true); err != nil {
 			return
 		}
-		if req.Purpose == "push" {
-			// no wallet authorises a push: the outputs themselves must be
-			// locked to the key the agreed state names (ADR 0009)
-			now := time.Now().Unix()
-			var to string
-			if to, err = s.moveDue(bid, req.Move, now, true); err != nil {
-				return
-			}
-			if len(req.Reveal) != len(req.Outputs) {
-				err = errors.New("every pushed output must be revealed")
-				return
-			}
-			secrets := make([]string, len(req.Reveal))
-			for k, rv := range req.Reveal {
-				b, e := blinded(rv.Secret, rv.R)
-				if e != nil || b != req.Outputs[k].B {
-					err = errors.New("output does not match its revealed secret")
-					return
-				}
-				secrets[k] = rv.Secret
-			}
-			if _, err = s.checkOutputs(bid, req.Move, to, req.Outputs, secrets, now+s.Params.LockMarginSec-2*lockGraceSec); err != nil {
-				return
-			}
-			msg = sigAllMessage(bid.Proofs, req.Outputs)
+		_, outs, e := s.settlementOutputs(bid, req.Outcome)
+		if e != nil {
+			err = e
 			return
 		}
-		switch req.Purpose {
-		case "refund":
-			if bid.Status != "outbid" && bid.Status != "lost" && bid.Status != "void" {
-				err = fmt.Errorf("bid is %s, not refundable", bid.Status)
-				return
-			}
-			authKey = bid.Wallet
-		case "payout":
-			if au.Status != "closed" || au.Winner != bid.ID {
-				err = errors.New("only the winning bid of a closed auction pays out")
-				return
-			}
-			authKey = au.SellerWallet
-		default:
-			err = errors.New("purpose must be refund or payout")
-			return
-		}
-		if len(req.Outputs) == 0 || len(req.Outputs) > 64 {
-			err = errors.New("bad output count")
-			return
-		}
-		var sum int64
-		for _, o := range req.Outputs {
-			if o.ID != s.Params.KeysetID || o.Amount <= 0 || !lowerHex(o.B, 66) {
-				err = errors.New("bad output")
-				return
-			}
-			if _, ok := s.Params.Keys[fmt.Sprint(o.Amount)]; !ok {
-				err = errors.New("bad output amount")
-				return
-			}
-			if sum > math.MaxInt64-o.Amount {
-				err = errors.New("output total overflows")
-				return
-			}
-			sum += o.Amount
-		}
-		if sum != bid.Amount {
-			err = fmt.Errorf("outputs total %d, escrow is %d", sum, bid.Amount)
-			return
-		}
-		msg = sigAllMessage(bid.Proofs, req.Outputs)
+		// The message is the committed escrow and the committed template's
+		// outputs, so the committee signs exactly what the bidder pre-signed.
+		msg = sigAllMessage(bid.Proofs, outs)
 	})
 	if err != nil {
 		return h, 409, err
 	}
 	h = sha256.Sum256([]byte(msg))
-	if req.Purpose == "push" {
-		return h, 200, nil
-	}
-	if !schnorrVerifyHash(h[:], authKey, req.Auth) {
-		return h, 403, errors.New("authorisation signature invalid")
-	}
 	return h, 200, nil
 }
 
@@ -596,9 +573,15 @@ func runCloser(app *App, rpc string, stop <-chan struct{}) {
 		now := time.Now().Unix()
 		var due [][2]any
 		app.Read(func(s *State) {
-			for id, au := range s.Auctions {
-				if au.Status == "open" && (au.EndAt <= now || s.expiring(au, now)) {
-					due = append(due, [2]any{id, au.EndAt})
+			for _, au := range s.Auctions {
+				// expiring()/no-sale is deleted (spec §11): a lot now closes
+				// on its end alone, and a lock that lapses degrades to a
+				// refund rather than to a closed-with-no-sale lot.
+				if au.Status == "open" && au.EndAt <= now {
+					// name the auction by its stable ROOT id: checkClose
+					// resolves it with byRoot, so a later edit cannot orphan
+					// an in-flight close (spec §8).
+					due = append(due, [2]any{au.RootID, au.EndAt})
 				}
 			}
 		})
@@ -619,4 +602,50 @@ func runCloser(app *App, rpc string, stop <-chan struct{}) {
 			sent = map[string]int64{}
 		}
 	}
+}
+
+// startVerdictPublish wires the publish path onto a live validator (spec §9).
+// It reads the validator's own verdict key from its home, dials the relays, and
+// runs the publisher.  The block-hash source is the node's block store: the
+// anchor on every verdict is the CometBFT block hash of a COMMITTED block, which
+// the ABCI app itself cannot see.  A misconfiguration is logged and disables
+// publishing -- it never takes the validator down, because publishing is a
+// notification path, not the chain.
+func startVerdictPublish(app *App, n *node.Node, home string, i int, relays []string) {
+	vk, err := loadVerdictKey(filepath.Join(home, "config", "verdict_key.json"))
+	if err != nil {
+		log.Printf("%s: verdict publish off: %v", names[i], err)
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	writer, closeRelays, err := DialRelays(ctx, relays)
+	if err != nil {
+		cancel()
+		log.Printf("%s: verdict publish off: %v", names[i], err)
+		return
+	}
+	pub, err := NewPublisher(PublisherConfig{
+		Key: vk, Relay: writer, App: app,
+		BlockHash: func(height int64) (string, bool) {
+			meta := n.BlockStore().LoadBlockMeta(height)
+			if meta == nil {
+				return "", false
+			}
+			return meta.BlockID.Hash.String(), true
+		},
+	})
+	if err != nil {
+		cancel()
+		closeRelays()
+		log.Printf("%s: verdict publish off: %v", names[i], err)
+		return
+	}
+	go pub.Run(ctx, time.Second)
+	// Tie the publisher's life to the node: it stops when the process exits.
+	go func() {
+		n.Wait()
+		cancel()
+		closeRelays()
+	}()
+	log.Printf("%s: publishing verdicts and state commitments to %v", names[i], relays)
 }

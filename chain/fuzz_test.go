@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 )
 
@@ -14,7 +15,7 @@ func FuzzParseP2PK(f *testing.F) {
 }
 
 func FuzzDecodeTx(f *testing.F) {
-	f.Add([]byte(`{"id":"00","pubkey":"00","created_at":1,"kind":1441,"tags":[],"content":"{}","sig":"00"}`))
+	f.Add([]byte(fmt.Sprintf(`{"id":"00","pubkey":"00","created_at":1,"kind":%d,"tags":[],"content":"{}","sig":"00"}`, KindBid)))
 	f.Fuzz(func(t *testing.T, b []byte) { _, _ = decodeTx(b) })
 }
 

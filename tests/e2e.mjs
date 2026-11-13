@@ -1,5 +1,6 @@
 // End-to-end acceptance run against the live 4-validator chain and fake-sats mint.
-// Wallets are Coco (one per user); escrow releases are FROST 3-of-4 signatures.
+// Wallets are Coco (one per user); escrow is a 2-of-2 [bidder, committee]
+// SIG_ALL lock and the commitment is enforced by the graders' FROST co-signature.
 // Usage: node tests/e2e.mjs [http://127.0.0.1:8080]
 import { ArenaClient, newIdentity, idPub, totalSats } from '../web/src/lib/arena.js';
 import { schnorr } from '../web/node_modules/@noble/curves/secp256k1.js';
@@ -111,10 +112,12 @@ await expectReject(c.createAuction(seller, { title: 'x', description: '', image:
 const b1 = await placeBid(alice, A, 100);
 ok(b1.state.auctions[A].highBid === b1.id, 'Alice leads at 100');
 const lock0 = JSON.parse(b1.state.bids[b1.id].proofs[0].secret)[1];
-ok(lock0.data === s.params.groupKey && !lock0.tags.some((t) => t[0] === 'pubkeys' || t[0] === 'n_sigs'), 'escrow is locked to the single FROST group key (no multisig list)');
-ok(Number(lock0.tags.find((t) => t[0] === 'locktime')[1]) >= s.auctions[A].endAt + s.params.lockMarginSec, 'fixed lot: escrow locked until end + margin');
+const ltags = Object.fromEntries(lock0.tags.map(([k, v]) => [k, v]));
+ok(lock0.data === b1.state.bids[b1.id].wallet && ltags.pubkeys === s.params.groupKey && ltags.n_sigs === '2' && ltags.sigflag === 'SIG_ALL' && ltags.refund === b1.state.bids[b1.id].wallet && lock0.tags.length === 5 && !lock0.tags.some((t) => t[0] === 'n_sigs_refund'), 'escrow is a 2-of-2 [bidder, committee] SIG_ALL lock with exactly five canonical tags');
+ok(Number(ltags.locktime) >= s.auctions[A].endAt + s.params.settlementSafetySec + s.params.bidToConsensusLatencySec, 'fixed lot: escrow locked until end + settlement_safety + latency');
+ok(b1.state.bids[b1.id].outcome_templates?.settle && b1.state.bids[b1.id].outcome_templates?.refund, 'the bid carries its committed settle and refund templates');
 ok(await bal(alice) === 900, 'Coco wallet shows 900 after locking 100');
-await expectReject(c.claim(alice, b1.state.bids[b1.id], 'refund', s.params), /validators agreed/, 'validators refuse to refund the leading bid');
+await expectReject(c.claim(alice, b1.state.bids[b1.id], 'refund', s.params), /validators agreed|only .* agreed|refuse/i, 'validators refuse to refund the leading bid');
 
 step(3, 'Outbid -> the refund is pushed to the wallet, nobody asks for it');
 let t = Date.now();
@@ -122,7 +125,7 @@ const b2 = await placeBid(bob, A, 110);
 s = b2.state;
 ok(s.bids[b1.id].status === 'outbid', 'Alice marked outbid');
 const p1 = await pushed(alice, b1.id, "Alice's refund", t);
-ok(await bal(alice) === 1000 && p1.move === 'refund' && p1.cosigners?.length === 3, `Alice's 100 back in her wallet, signed by ${p1.cosigners?.join(', ')} · ${msTxt(p1)}`);
+ok(await bal(alice) === 1000 && p1.outcome === 'refund' && p1.cosigners?.length === 3, `Alice's 100 back in her wallet, signed by ${p1.cosigners?.join(', ')} · ${msTxt(p1)}`);
 ok(p1.proofs.every((p) => JSON.parse(p.secret)[1].data === s.bids[b1.id].wallet), "the pushed ecash is locked to Alice's wallet key");
 await until(async () => (await c.bidWithProofs(b1.id)).settled === 'refund', 10000, 'settle tx on chain');
 ok(true, 'settle tx recorded on chain');
@@ -175,12 +178,12 @@ ok(s.auctions[A].winner === b4.id && s.bids[b4.id].status === 'won', 'Alice wins
 ok(lateBy < 4 && s.auctions[A].closedAt - s.auctions[A].endAt <= 2, `closed by the validators' close txs ${lateBy.toFixed(1)} s after the end (block time +${s.auctions[A].closedAt - s.auctions[A].endAt} s)`);
 const net2 = await until(async () => { const n = (await c.network()).filter((v) => v.up); return n.every((v) => v.height === n[0].height) && n; }, 20000, 'validators at one height');
 ok(new Set(net2.map((v) => v.appHash)).size === 1, `running validators report the same app hash at height ${net2[0].height}`);
-const pay = await pushed(seller, b4.id, 'payout', closedSeen);
-ok(pay.move === 'payout' && await bal(seller) === 250, `seller's 250 pushed ${Math.round(pay.at / 1000 - s.auctions[A].endAt * 1)} s after the end · ${msTxt(pay)}`);
+const pay = await pushed(seller, b4.id, 'settle', closedSeen);
+ok(pay.outcome === 'settle' && await bal(seller) === 250, `seller's 250 pushed ${Math.round(pay.at / 1000 - s.auctions[A].endAt * 1)} s after the end · ${msTxt(pay)}`);
 
 step(7, 'Nobody can redirect a settled escrow');
-await expectReject(c.claim(alice, s.bids[b4.id], 'payout', s.params), /validators agreed|settled/, 'winner cannot take the payout');
-await expectReject(c.claim(seller, s.bids[b2.id], 'payout', s.params), /validators agreed|settled/, 'losing bid cannot be paid to seller');
+await expectReject(c.claim(alice, s.bids[b4.id], 'settle', s.params), /validators agreed|settled/, 'the winner cannot settle to itself');
+await expectReject(c.claim(seller, s.bids[b2.id], 'settle', s.params), /validators agreed|settled/, 'a losing bid cannot be settled to the seller');
 
 step('V', 'Slim client view (v0.3.1): no proofs, 304 when unchanged, gzip, proofs on demand');
 const v1 = await c.view([idPub(bob)]);
@@ -251,7 +254,7 @@ await until(async () => endB0 - Date.now() / 1000 < 12, 30000, 'inside the windo
 const x1 = await placeBid(bob, B, 100);
 const ltB = Number(JSON.parse(x1.state.bids[x1.id].proofs[0].secret)[1].tags.find((tg) => tg[0] === 'locktime')[1]);
 ok(x1.state.bids[x1.id].extended && Math.abs(x1.state.auctions[B].endAt - (x1.state.bids[x1.id].time + 15)) <= 0, `bid with ${(endB0 - x1.state.bids[x1.id].time)} s left reset the clock to 15 s`);
-ok(ltB >= Date.now() / 1000 + sb.params.lockMarginSec - 120 && ltB < endB0 + sb.params.lockMarginSec + 120, 'anti-snipe escrow locked margin from now (validators re-lock it while the lot runs)');
+ok(ltB >= x1.state.auctions[B].endAt + sb.params.settlementSafetySec + sb.params.bidToConsensusLatencySec, 'anti-snipe escrow locked past the NEW end + settlement_safety + latency (check-order amendment, spec §2.2)');
 await sleep(6000);
 t = Date.now();
 const x2 = await placeBid(alice, B, 110);
@@ -264,7 +267,7 @@ const fx = await c.rawRelease((await c.bidWithProofs(x2.id)), [forged], sb.param
 ok(!fx.body.signatures, `mint rejects a signature not made by the group key -> "${String(fx.body.detail).slice(0, 60)}"`);
 sb = await until(async () => { const st = await c.state(); return st.auctions[B].status === 'closed' && st; }, 60000, 'anti-snipe close');
 ok(sb.auctions[B].winner === x2.id && !sb.auctions[B].expired, 'closed 15 s after the last bid; Alice wins');
-const pay2 = await pushed(seller, x2.id, 'anti-snipe payout', Date.now());
+const pay2 = await pushed(seller, x2.id, 'anti-snipe settle', Date.now());
 ok(await bal(seller) === 360, `seller's 110 pushed · ${msTxt(pay2)}`);
 
 step(9, 'Validator 4 (restarted in step 8) caught up from its peers');
@@ -276,14 +279,15 @@ ok(new Set(caught.filter((v) => v.height === caught[0].height).map((v) => v.appH
 
 step('R', 'Rejected bid: bidder reclaims locked sats alone after locktime');
 const st0 = await c.state();
-// Production chains use a long lock margin (24 h by default, audit A3); the
-// reclaim wait is only exercised when the chain was initialised with a short one.
-const longMargin = st0.params.lockMarginSec > 120;
+// The locktime floor is settlement_safety + latency (spec §2.1), 915 s by
+// default; the reclaim wait is only exercised when the chain was initialised
+// with short values.
+const longMargin = (st0.params.settlementSafetySec ?? 900) > 120;
 let pendingReclaim = 0;
 if (longMargin && stranded.length) {
   for (const { locked } of stranded) pendingReclaim += totalSats(locked);
   await expectReject(c.reclaimExpired(stranded[0].u, stranded[0].locked, st0.params), /.+/, 'reclaim before locktime refused by mint');
-  console.log(`  lock margin ${st0.params.lockMarginSec}s: skipping the locktime wait (${pendingReclaim} sats stay locked until then)`);
+  console.log(`  settlement safety ${st0.params.settlementSafetySec}s: skipping the locktime wait (${pendingReclaim} sats stay locked until then)`);
 }
 for (const { u, locked } of longMargin ? [] : stranded) {
   const lt = JSON.parse(locked[0].secret)[1].tags.find((t) => t[0] === 'locktime')[1];
