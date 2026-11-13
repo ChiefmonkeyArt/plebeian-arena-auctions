@@ -6,6 +6,7 @@ require (
 	github.com/btcsuite/btcd/btcec/v2 v2.5.1
 	github.com/cometbft/cometbft v1.0.1
 	github.com/nbd-wtf/go-nostr v0.52.1
+	github.com/gorilla/websocket v1.5.3
 )
 
 require (
@@ -44,7 +45,6 @@ require (
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/orderedcode v0.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/jmhodges/levigo v1.0.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect

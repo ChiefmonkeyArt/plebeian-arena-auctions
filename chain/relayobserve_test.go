@@ -14,7 +14,6 @@ package main
 // the chain only by way of the relay.
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -82,7 +81,7 @@ func startNakRelay(t *testing.T) (string, func()) {
 	_ = listener.Close()
 
 	command := exec.Command(nak, "serve", "--hostname", "127.0.0.1", "--port", fmt.Sprintf("%d", port))
-	var output bytes.Buffer
+	var output syncBuffer // race-safe: -race runs would flag a plain bytes.Buffer here
 	command.Stdout = &output
 	command.Stderr = &output
 	if err := command.Start(); err != nil {

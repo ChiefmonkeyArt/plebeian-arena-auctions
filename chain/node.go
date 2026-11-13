@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec/v2"
 	cfg "github.com/cometbft/cometbft/config"
 	"github.com/cometbft/cometbft/crypto"
 	"github.com/cometbft/cometbft/crypto/ed25519"
@@ -69,10 +70,11 @@ func nodeConfig(home string, i int, peers string) *cfg.Config {
 // amounts, Nutshell 0.21 keysets). "arena init -if-needed" wipes on mismatch.
 // v0.4.0: "4" (hash excludes height/time, void bids, PBTS, close txs).
 // v0.5.0: "5" (two auction modes, push settlement, settle txs).
-// v0.5.3 (this change): "6" (2-of-2 SIG_ALL escrow, pre-signed outcome
-// templates on the bid, the check-order-correct single locktime rule). The
-// lock and bid shapes both change, so this is a WIPE: there is no migration
-// and old-shape locks or template-less bids are refused outright.
+// v0.5.3 (this change): "6". Two shape changes at once, so this is a WIPE:
+// there is no migration, and old-shape locks or template-less bids are refused
+// outright. (a) 2-of-2 SIG_ALL escrow with pre-signed outcome templates on the
+// bid and the check-order-correct single locktime rule; (b) Params carries the
+// verdict-publish validator roster (spec §9, §12).
 const chainFormat = "6"
 
 // archiveOldLedgers keeps each validator's tx ledger from a chain that is
@@ -170,6 +172,19 @@ func cmdInit(args []string) {
 		kb, _ := json.MarshalIndent(frostKeyFile{Participant: i + 1, KeyPackage: shares[i], GroupKey: groupKey}, "", " ")
 		check(os.WriteFile(filepath.Join(homeOf(*root, i), "config", "frost_key.json"), kb, 0o600))
 	}
+	// Verdict-publish roster (spec §9): each validator gets its OWN secp256k1
+	// Nostr key, written only to its home.  Params carries the roster, so it is
+	// inside the AppHash; a verdict is signed under that key, never a shared
+	// publisher key -- one shared publisher would make a forged verdict
+	// indistinguishable from a real one.
+	roster := make([]ValidatorKey, 0, 4)
+	for i := 0; i < 4; i++ {
+		sk, err := btcec.NewPrivateKey()
+		check(err)
+		kb, _ := json.MarshalIndent(verdictKeyFile{Pubkey: NostrPubkeyHex(sk), Secret: hex.EncodeToString(sk.Serialize())}, "", " ")
+		check(os.WriteFile(filepath.Join(homeOf(*root, i), "config", "verdict_key.json"), kb, 0o600))
+		roster = append(roster, ValidatorKey{Pubkey: NostrPubkeyHex(sk), Name: names[i], Index: i + 1})
+	}
 	params := Params{MintURL: *mint, KeysetID: kid, Keys: keys.Keysets[0].Keys, GroupKey: groupKey, FrostPublic: pkp, ValidatorNames: names,
 		// Spec §10: MinWindowSec 60, MaxWindowSec 900, settlement_safety 900,
 		// bid_to_consensus_latency 15, MinDurationSec 20, MaxDurationSec 259200
@@ -177,7 +192,7 @@ func cmdInit(args []string) {
 		MinWindowSec: 60, MaxWindowSec: 900,
 		SettlementSafetySec: 900, BidToConsensusLatencySec: 15,
 		MinDurationSec: 20, MaxDurationSec: 259200,
-		MaxProofs: 64, Threshold: 3}
+		MaxProofs: 64, Threshold: 3, Validators: roster}
 	ab, _ := json.Marshal(params)
 	// PBTS (v0.4.0): block time is the proposer's clock, checked by every
 	// validator against its own within 505 ms + message delay. Under the old
@@ -215,7 +230,7 @@ func cmdNode(args []string) {
 	every := fs.Int64("snapshot-every", 1000, "write a state snapshot every N blocks (0: only on clean shutdown)")
 	retain := fs.Int64("retain-blocks", 100000, "prune blocks more than N below the newest snapshot (0: keep every block)")
 	var relays relayURLs
-	fs.Var(&relays, "relay", "relay websocket URL to ingest auction events from (repeatable)")
+	fs.Var(&relays, "relay", "relay websocket URL: ingests auction events from it and publishes verdicts and state commitments to it (repeatable)")
 	fs.Parse(args)
 	if *every < 0 || *retain < 0 {
 		log.Fatal("-snapshot-every and -retain-blocks must be >= 0")
@@ -261,6 +276,16 @@ func cmdNode(args []string) {
 	log.Printf("%s up: p2p %d rpc %d http %d", names[i], p2pPort(i), rpcPort(i), httpPort(i))
 	stopCloser := make(chan struct{})
 	go runCloser(app, fmt.Sprintf("http://127.0.0.1:%d", rpcPort(i)), stopCloser)
+
+	// Verdict publish path (the write half of the Nostr transport).  Dormant
+	// unless at least one -relay is configured: with no relay a validator
+	// behaves exactly as before.  THE RELAY NOTIFIES, THE CHAIN DECIDES, THE
+	// ANCHOR PROVES: every verdict is published only after its block is
+	// committed, anchored to that committed block's hash, read here from the
+	// node's own block store.
+	if len(relays) > 0 {
+		startVerdictPublish(app, n, home, i, relays)
+	}
 
 	mux := http.NewServeMux()
 	cache := &committedCache{}
@@ -577,4 +602,50 @@ func runCloser(app *App, rpc string, stop <-chan struct{}) {
 			sent = map[string]int64{}
 		}
 	}
+}
+
+// startVerdictPublish wires the publish path onto a live validator (spec §9).
+// It reads the validator's own verdict key from its home, dials the relays, and
+// runs the publisher.  The block-hash source is the node's block store: the
+// anchor on every verdict is the CometBFT block hash of a COMMITTED block, which
+// the ABCI app itself cannot see.  A misconfiguration is logged and disables
+// publishing -- it never takes the validator down, because publishing is a
+// notification path, not the chain.
+func startVerdictPublish(app *App, n *node.Node, home string, i int, relays []string) {
+	vk, err := loadVerdictKey(filepath.Join(home, "config", "verdict_key.json"))
+	if err != nil {
+		log.Printf("%s: verdict publish off: %v", names[i], err)
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	writer, closeRelays, err := DialRelays(ctx, relays)
+	if err != nil {
+		cancel()
+		log.Printf("%s: verdict publish off: %v", names[i], err)
+		return
+	}
+	pub, err := NewPublisher(PublisherConfig{
+		Key: vk, Relay: writer, App: app,
+		BlockHash: func(height int64) (string, bool) {
+			meta := n.BlockStore().LoadBlockMeta(height)
+			if meta == nil {
+				return "", false
+			}
+			return meta.BlockID.Hash.String(), true
+		},
+	})
+	if err != nil {
+		cancel()
+		closeRelays()
+		log.Printf("%s: verdict publish off: %v", names[i], err)
+		return
+	}
+	go pub.Run(ctx, time.Second)
+	// Tie the publisher's life to the node: it stops when the process exits.
+	go func() {
+		n.Wait()
+		cancel()
+		closeRelays()
+	}()
+	log.Printf("%s: publishing verdicts and state commitments to %v", names[i], relays)
 }

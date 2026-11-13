@@ -45,6 +45,13 @@ type Params struct {
 	MaxDurationSec int64 `json:"maxDurationSec"`
 	MaxProofs      int   `json:"maxProofs"`
 	Threshold      int   `json:"threshold"`
+	// Validators is the verdict-publish roster (spec §9, REPLY §3.4): each
+	// validator's own Nostr pubkey, moniker and index.  It lives in Params, so
+	// it is inside the AppHash -- a state commitment (kind 1447) commits to the
+	// roster at that height, which is why a client needs no separate roster
+	// verification in this increment.  A verdict is signed under the validator's
+	// OWN key from this list, never a shared publisher key.
+	Validators []ValidatorKey `json:"validators,omitempty"`
 }
 
 type Auction struct {
