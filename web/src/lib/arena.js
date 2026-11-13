@@ -10,6 +10,19 @@ import { finalizeEvent, getPublicKey } from 'nostr-tools/pure';
 export const KIND_CREATE = 1440;
 export const KIND_BID = 1441;
 export const KIND_CHAT = 1442;
+export const KIND_REFUND = 1443;
+export const KIND_SETTLE = 1444;
+export const KIND_OUTCOME = 1445;
+export const KIND_FUNDING_ABORT = 1446;
+export const KIND_STATE_COMMIT = 1447;
+
+// One kind map for the 1440 series (owner decision 2026-11-12, spec §7). All
+// regular kinds (1000 <= n < 10000), never the NIP-01 ephemeral range. The
+// numbers live here and nowhere else in the client.
+export const AUCTION_KINDS = {
+  create: KIND_CREATE, bid: KIND_BID, chat: KIND_CHAT, refund: KIND_REFUND,
+  settle: KIND_SETTLE, outcome: KIND_OUTCOME, funding_abort: KIND_FUNDING_ABORT, state_commit: KIND_STATE_COMMIT,
+};
 
 export function newIdentity(name) {
   const nostrSk = bytesToHex(secp256k1.utils.randomSecretKey());
@@ -181,10 +194,38 @@ export class ArenaClient {
 
   async submit(ev) { return this.j('/api/tx', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(ev) }); }
 
-  async createAuction(id, lot) {
-    const ev = await this.sign(id, KIND_CREATE, { ...lot, sellerWallet: walletPub(id), name: lot.name || id.name });
+  // The auction's identity is (seller, d) — our own coordinate
+  // a = 1440:<seller>:<d>, not NIP-01 addressability (1440 is a REGULAR kind,
+  // so the relay replaces nothing). The FIRST 1440 for a (seller, d) is the
+  // root; its event id is auction_root_event_id, and later 1440s for the same
+  // coordinate are supersessions that must carry e = <root> and may change only
+  // the display fields (title, description, image, category, name).
+  async createAuction(id, lot, d = lot.d) {
+    // Every auction needs an auction_id (d); generate one if the caller did
+    // not supply it. NIP-01 charset [A-Za-z0-9_-], 1..64 chars.
+    if (!d) d = bytesToHex(randomBytes(12));
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(d)) throw new Error('auction d must be 1..64 of [A-Za-z0-9_-]');
+    const coord = `${KIND_CREATE}:${idPub(id)}:${d}`;
+    const ev = await this.sign(id, KIND_CREATE, { ...lot, sellerWallet: walletPub(id), name: lot.name || id.name }, [['d', d]]);
     const res = await this.submit(ev);
-    return { ...res, id: ev.id };
+    return { ...res, id: ev.id, rootId: ev.id, d, coord };
+  }
+
+  // Supersede an existing auction: same (seller, d), e = the root id, display
+  // fields only. A change to an immutable field (start price, increment, mode,
+  // window, duration, seller wallet) is refused by the chain with
+  // immutable_field_changed and the edit is ignored.
+  async editAuction(id, current, patch) {
+    const tags = [['d', current.d], ['e', current.rootId]];
+    const body = {
+      title: patch.title ?? current.title, description: patch.description ?? current.description,
+      image: patch.image ?? current.image, category: patch.category ?? current.category,
+      startPrice: current.startPrice, minIncrement: current.minIncrement, durationSec: current.durationSec,
+      mode: current.mode, windowSec: current.windowSec, sellerWallet: current.sellerWallet,
+      name: patch.name ?? current.sellerName,
+    };
+    const ev = await this.sign(id, KIND_CREATE, body, tags);
+    return this.submit(ev);
   }
 
   // Coco locks `amount` to the validators' FROST group key (one key; 3 of the 4
@@ -216,7 +257,13 @@ export class ArenaClient {
   }
 
   async bid(id, auction, amount, locked) {
-    const ev = await this.sign(id, KIND_BID, { auction: auction.id, amount, wallet: walletPub(id), name: id.name, proofs: locked }, [['e', auction.id]]);
+    // The bid binds to the auction ROOT, not to the latest version: e =
+    // auction_root_event_id. That is what makes an edit non-destructive — the
+    // bid never referenced the version that changed. We also carry the
+    // coordinate a = 1440:<seller>:<d> so #a filtering stays meaningful.
+    const root = auction.rootId || auction.rootEventId || auction.id;
+    const ev = await this.sign(id, KIND_BID, { auction: auction.id, amount, wallet: walletPub(id), name: id.name, proofs: locked },
+      [['e', root], ...(auction.id && auction.id.includes(':') ? [['a', auction.id]] : [])]);
     const res = await this.submit(ev);
     return { ...res, id: ev.id };
   }

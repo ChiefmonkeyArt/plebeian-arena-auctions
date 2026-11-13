@@ -606,9 +606,12 @@ func runCloser(app *App, rpc string, stop <-chan struct{}) {
 		now := time.Now().Unix()
 		var due [][2]any
 		app.Read(func(s *State) {
-			for id, au := range s.Auctions {
+			for _, au := range s.Auctions {
 				if au.Status == "open" && (au.EndAt <= now || s.expiring(au, now)) {
-					due = append(due, [2]any{id, au.EndAt})
+					// name the auction by its stable ROOT id: checkClose
+					// resolves it with byRoot, so a later edit cannot orphan
+					// an in-flight close (spec §8).
+					due = append(due, [2]any{au.RootID, au.EndAt})
 				}
 			}
 		})

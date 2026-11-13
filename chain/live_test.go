@@ -85,7 +85,17 @@ func newBidder(t *testing.T) bidder {
 }
 
 func signEvent(t *testing.T, sk *btcec.PrivateKey, kind int, content string, at int64) *Event {
-	ev := &Event{Pubkey: hex.EncodeToString(schnorr.SerializePubKey(sk.PubKey())), CreatedAt: at, Kind: kind, Tags: [][]string{}, Content: content}
+	return signEventTags(t, sk, kind, content, at, [][]string{})
+}
+
+// signEventTags signs an event with explicit tags (NIP-01 id over the
+// canonical serialisation).
+func signEventTags(t *testing.T, sk *btcec.PrivateKey, kind int, content string, at int64, tags [][]string) *Event {
+	t.Helper()
+	if tags == nil {
+		tags = [][]string{}
+	}
+	ev := &Event{Pubkey: hex.EncodeToString(schnorr.SerializePubKey(sk.PubKey())), CreatedAt: at, Kind: kind, Tags: tags, Content: content}
 	h := sha256.Sum256([]byte(ev.Serialize()))
 	ev.ID = hex.EncodeToString(h[:])
 	sig, err := schnorr.Sign(sk, h[:])
@@ -99,26 +109,39 @@ func signEvent(t *testing.T, sk *btcec.PrivateKey, kind int, content string, at 
 const tNow = int64(1_800_000_000)
 
 // liveApp: one open fixed-time lot (start 100, +10) ending at tNow+100.
+//
+// The lot is created through a real 1440 create event, so it is stored under
+// its (seller, d) coordinate with a genuine auction_root_event_id — the id it
+// returns is that root id, and bids bind to it.
 func liveApp(t *testing.T) (*App, *testMint, string) {
 	m := newTestMint(t)
 	group := hex.EncodeToString(mulG(new(btcec.ModNScalar).SetInt(7)).SerializeCompressed())
 	a := NewApp()
 	a.st.Params = Params{KeysetID: m.id, Keys: map[string]string{}, GroupKey: group, LockMarginSec: 30, MaxProofs: 64,
-		MinWindowSec: 15, MaxWindowSec: 900}
+		MinWindowSec: 15, MaxWindowSec: 900, MinDurationSec: 20, MaxDurationSec: 100000}
 	for _, amt := range []int64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512} {
 		a.st.Params.Keys[fmt.Sprint(amt)] = hex.EncodeToString(m.A.SerializeCompressed())
 	}
 	a.st.Height, a.st.Time = 10, tNow
-	id := hx(42)
-	a.st.Auctions[id] = &Auction{ID: id, Seller: hx(7), Status: "open", StartPrice: 100, MinIncrement: 10,
-		EndAt: tNow + 100, Mode: "fixed"}
-	a.st.Order = []string{id}
-	return a, m, id
+	seller := newBidder(t)
+	c := CreateContent{Title: "lot", StartPrice: 100, MinIncrement: 10, DurationSec: 100, SellerWallet: seller.wallet, Mode: "fixed"}
+	b, _ := json.Marshal(c)
+	root := signEventTags(t, seller.sk, KindCreate, string(b), tNow, [][]string{{"d", "lot-42"}})
+	if err := a.st.applyCreate(root, tNow, 10, true); err != nil {
+		t.Fatal(err)
+	}
+	// The returned id is the auction's coordinate a = 1440:<seller>:<d> — the
+	// key it is stored under and what bids carry in their content. Its root
+	// event id (what a bid binds to via e) is au.RootID.
+	return a, m, coordOf(seller.pub, "lot-42")
 }
 
 func (m *testMint) bidTx(t *testing.T, a *App, b bidder, auction string, amount int64, nonce string) (*Event, []byte) {
 	var proofs []Proof
-	au := a.st.Auctions[auction]
+	au := a.st.byRoot(auction)
+	if au == nil {
+		au = a.st.Auctions[auction] // some tests name the auction by its coordinate
+	}
 	lt := au.EndAt + a.st.Params.LockMarginSec
 	if au.Mode == "antisnipe" {
 		lt = a.st.Time + a.st.Params.LockMarginSec
@@ -131,8 +154,10 @@ func (m *testMint) bidTx(t *testing.T, a *App, b bidder, auction string, amount 
 			i++
 		}
 	}
-	c, _ := json.Marshal(BidContent{Auction: auction, Amount: amount, Wallet: b.wallet, Name: "t", Proofs: proofs})
-	ev := signEvent(t, b.sk, KindBid, string(c), tNow)
+	c, _ := json.Marshal(BidContent{Auction: au.ID, Amount: amount, Wallet: b.wallet, Name: "t", Proofs: proofs})
+	// every bid binds to the auction root: e = auction_root_event_id, plus our
+	// own coordinate a = 1440:<seller>:<d>.
+	ev := signEventTags(t, b.sk, KindBid, string(c), tNow, [][]string{{"e", au.RootID}, {"a", au.ID}})
 	tx, _ := json.Marshal(ev)
 	return ev, tx
 }
@@ -269,14 +294,18 @@ func TestEmptyBlocksKeepAppHash(t *testing.T) {
 func TestCloseTx(t *testing.T) {
 	a, _, id := liveApp(t)
 	au := a.st.Auctions[id]
-	tx := makeClose(id, au.EndAt, tNow+100)
+	// The close tx names the auction by its stable ROOT id (64-char hex), not
+	// by the coordinate: parseClose requires a 64-char hex auction id, and
+	// checkClose resolves it with byRoot, so an edit can never orphan it.
+	root := au.RootID
+	tx := makeClose(root, au.EndAt, tNow+100)
 	c, ok := parseClose(tx)
-	if !ok || c.Auction != id || c.EndAt != au.EndAt {
+	if !ok || c.Auction != root || c.EndAt != au.EndAt {
 		t.Fatal("close tx round trip")
 	}
 	for name, bad := range map[string][]byte{
 		"short id": []byte("close:abc:1:1"), "extra": append(append([]byte{}, tx...), ":1"...), "upper": []byte(strings.ToUpper(string(tx))),
-		"not a number": []byte("close:" + id + ":x:1"),
+		"not a number": []byte("close:" + root + ":x:1"),
 	} {
 		if _, ok := parseClose(bad); ok {
 			t.Errorf("%s: parsed", name)
@@ -288,7 +317,7 @@ func TestCloseTx(t *testing.T) {
 	if r := a.checkClose(c, au.EndAt+60); r.Code == 0 {
 		t.Fatal("a stale close must be refused")
 	}
-	if r := a.checkClose(&closeTx{id, au.EndAt + 5, tNow + 200}, tNow+200); r.Code == 0 {
+	if r := a.checkClose(&closeTx{root, au.EndAt + 5, tNow + 200}, tNow+200); r.Code == 0 {
 		t.Fatal("a close for another EndAt must be refused")
 	}
 	if r := a.checkClose(c, au.EndAt); r.Code != 0 {

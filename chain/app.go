@@ -30,15 +30,24 @@ type Params struct {
 	ValidatorNames []string          `json:"validatorNames"`
 	MinWindowSec   int64             `json:"minWindowSec"` // anti-snipe window bounds (ADR 0009)
 	MaxWindowSec   int64             `json:"maxWindowSec"`
-	LockMarginSec  int64             `json:"lockMarginSec"`
-	MinDurationSec int64             `json:"minDurationSec"`
-	MaxDurationSec int64             `json:"maxDurationSec"`
-	MaxProofs      int               `json:"maxProofs"`
-	Threshold      int               `json:"threshold"`
+	// SettlementSafetySec is how long after the end a bid itself establishes
+	// the settlement must land, before the bidder's unilateral refund branch
+	// opens (spec §2.1). It replaces LockMarginSec as the lock driver.
+	SettlementSafetySec int64 `json:"settlementSafetySec"`
+	// BidToConsensusLatencySec covers the gap between the bidder's clock and
+	// the block that admits the bid (spec §2.1). It replaces lockGraceSec.
+	BidToConsensusLatencySec int64 `json:"bidToConsensusLatencySec"`
+	// LockMarginSec is retired as a lock driver: settlement_safety is the lock
+	// rule now (spec §10). Kept for the CLI flag's meaning in existing config.
+	LockMarginSec  int64 `json:"lockMarginSec,omitempty"`
+	MinDurationSec int64 `json:"minDurationSec"`
+	MaxDurationSec int64 `json:"maxDurationSec"`
+	MaxProofs      int   `json:"maxProofs"`
+	Threshold      int   `json:"threshold"`
 }
 
 type Auction struct {
-	ID           string   `json:"id"`
+	ID           string   `json:"id"` // coordinate a = 1440:<seller>:<d>; the auction's stable identity
 	Seller       string   `json:"seller"`
 	SellerWallet string   `json:"sellerWallet"`
 	SellerName   string   `json:"sellerName"`
@@ -63,6 +72,18 @@ type Auction struct {
 	Voids        []string `json:"voids,omitempty"` // late bids, refundable at once (ADR 0007)
 	ClosedAt     int64    `json:"closedAt"`
 	ClosedH      int64    `json:"closedHeight"`
+
+	// Root pinning and supersession (owner decision 2026-11-12, spec §8). The
+	// auction's identity is (seller, d); the FIRST 1440 event for it is the
+	// root and its id is auction_root_event_id. Later 1440 events are
+	// supersessions gated by the immutable allow-list, and this struct always
+	// holds the latest ACCEPTED version — the one resolution a regular kind
+	// does not get from the relay.
+	D                string `json:"d"`                // the d tag = auction_id
+	RootID           string `json:"rootId"`           // auction_root_event_id
+	VersionID        string `json:"versionId"`        // event id of the canonical (latest accepted) version
+	VersionCreatedAt int64  `json:"versionCreatedAt"` // created_at of that version; gates supersession order
+	DurationSec      int64  `json:"durationSec"`      // frozen duration; EndAt is its materialisation
 }
 
 type Bid struct {
@@ -328,11 +349,120 @@ func isPubHex(s string) bool {
 	return err == nil
 }
 
-// applyCreate validates and (if apply) executes an auction create event at block time now.
-func (s *State) applyCreate(ev *Event, now, height int64, apply bool) error {
-	if _, ok := s.Auctions[ev.ID]; ok {
-		return errors.New("auction already exists")
+// validD: the d tag (auction_id). NIP-01 addressable/parametrised-replaceable
+// charset — [A-Za-z0-9_-], 1..64 chars. An auction whose d fails this is not
+// an auction: the coordinate a = 1440:<seller>:<d> would not be parseable.
+func validD(d string) bool {
+	if len(d) < 1 || len(d) > 64 {
+		return false
 	}
+	for i := 0; i < len(d); i++ {
+		c := d[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// coordOf is OUR coordinate convention for a regular kind: a =
+// 1440:<seller_pubkey>:<d>. This is not NIP-01 addressability — 1440 is
+// regular, so the relay replaces nothing and the latest accepted version must
+// be resolved explicitly (spec §7, §8). The coordinate is the auction's stable
+// identity: bids and the auction map are keyed by it, not by a mutable version
+// event id.
+func coordOf(seller, d string) string {
+	return strconv.Itoa(KindCreate) + ":" + seller + ":" + d
+}
+
+// tagValue returns the first value of the named tag.
+func tagValue(tags [][]string, name string) (string, bool) {
+	for _, t := range tags {
+		if len(t) >= 2 && t[0] == name {
+			return t[1], true
+		}
+	}
+	return "", false
+}
+
+// immutableFields is the allow-list's immutable half, remapped onto his current
+// create payload (owner decision 2026-11-12, spec §8). The principle is
+// display is mutable; money, time and cryptography are not:
+//
+//   - StartPrice        money  — the absolute floor every bid is checked against
+//   - MinIncrement      money  — the step rule
+//   - Mode              time   — fixed | antisnipe decides whether EndAt can move
+//   - WindowSec         time   — the anti-snipe reset amount; EndAt derives from it
+//   - DurationSec       time   — when a fixed lot closes
+//   - SellerWallet      crypto — where settlement pays; the lock's refund/data key
+//
+// The d value and the seller are immutable structurally: they are the
+// coordinate (seller, d), so changing either is a different auction, never an
+// edit. Title, Description and Image are display and stay editable. Category
+// and SellerName are judgement calls, both mutable (see the report): a
+// category is metadata, and a display name is a display field with no bearing
+// on money, time or the lock.
+func immutableChanged(cur *Auction, c *CreateContent, mode string) string {
+	switch {
+	case c.StartPrice != cur.StartPrice:
+		return "StartPrice"
+	case c.MinIncrement != cur.MinIncrement:
+		return "MinIncrement"
+	case mode != cur.Mode:
+		return "Mode"
+	case c.WindowSec != cur.WindowSec:
+		return "WindowSec"
+	case c.DurationSec != cur.DurationSec:
+		return "DurationSec"
+	case strings.ToLower(c.SellerWallet) != cur.SellerWallet:
+		return "SellerWallet"
+	}
+	return ""
+}
+
+// canonicalAuction resolves (seller, d) to the canonical auction: the latest
+// 1440 event that passed the immutable check. Because 1440 is a regular kind,
+// no relay performed this replacement for us, so the persisted state IS the
+// resolution — a root that never existed, or an update that failed the check,
+// simply never overwrote it, and the entity holds the last accepted version.
+func (s *State) canonicalAuction(seller, d string) *Auction {
+	return s.Auctions[coordOf(seller, d)]
+}
+
+// byRoot finds the auction whose root event id is rootID — or, as a
+// convenience for callers that name the auction by its coordinate, the auction
+// stored under that coordinate key. The validators' own close tx names an
+// auction by its stable root id, not by a mutable version.
+func (s *State) byRoot(rootID string) *Auction {
+	if au := s.Auctions[rootID]; au != nil {
+		return au
+	}
+	for _, au := range s.Auctions {
+		if au.RootID == rootID {
+			return au
+		}
+	}
+	return nil
+}
+
+// applyCreate validates and (if apply) executes a 1440 create event at block
+// time now.
+//
+// The auction's identity is (seller, d), keyed by the coordinate
+// a = 1440:<seller>:<d>. The FIRST event for a coordinate is the ROOT; its
+// event id is auction_root_event_id. A later event for the same coordinate is a
+// SUPERSESSION: it must carry e = <auction_root_event_id> and may change only
+// the allow-listed display fields. A change to any immutable field (money,
+// time, cryptography) is refused with "immutable_field_changed <field>" and
+// ignored — the state keeps the last accepted version.
+func (s *State) applyCreate(ev *Event, now, height int64, apply bool) error {
+	d, ok := tagValue(ev.Tags, "d")
+	if !ok || !validD(d) {
+		return errors.New("create needs a valid d tag")
+	}
+	coord := coordOf(ev.Pubkey, d)
+	root, hasRoot := tagValue(ev.Tags, "e")
+
 	var c CreateContent
 	if err := json.Unmarshal([]byte(ev.Content), &c); err != nil {
 		return errors.New("bad create content")
@@ -364,17 +494,53 @@ func (s *State) applyCreate(ev *Event, now, height int64, apply bool) error {
 	if mode == "" {
 		mode = "fixed"
 	}
+
+	cur := s.Auctions[coord]
+	if cur == nil {
+		// The root: the first 1440 for this (seller, d). It must not claim a
+		// root it cannot know about — only a supersession carries e.
+		if hasRoot {
+			return errors.New("first create for this (seller, d) must not carry an e tag")
+		}
+		if !apply {
+			return nil
+		}
+		end := now + c.DurationSec
+		s.Auctions[coord] = &Auction{
+			ID: coord, D: d, RootID: ev.ID, VersionID: ev.ID, VersionCreatedAt: ev.CreatedAt, DurationSec: c.DurationSec,
+			Seller: ev.Pubkey, SellerWallet: strings.ToLower(c.SellerWallet), SellerName: c.Name,
+			Title: c.Title, Description: c.Description, Image: c.Image, Category: c.Category,
+			StartPrice: c.StartPrice, MinIncrement: c.MinIncrement, CreatedAt: now, CreatedH: height,
+			EndAt: end, Mode: mode, WindowSec: c.WindowSec, Status: "open", Bids: []string{},
+		}
+		s.Order = append(s.Order, coord)
+		return nil
+	}
+
+	// A supersession. It must point at the ROOT — not at whatever version it
+	// last saw. That is what keeps bids (which also point at the root)
+	// attached across an edit.
+	if !hasRoot || root != cur.RootID {
+		return errors.New("update must reference the auction root (e = auction_root_event_id)")
+	}
+	// Immutable check against the canonical (latest accepted) version. A
+	// refused supersession is ignored, never applied: the state below stays
+	// untouched, so the canonical auction remains the last accepted one.
+	if f := immutableChanged(cur, &c, mode); f != "" {
+		return fmt.Errorf("immutable_field_changed %s", f)
+	}
+	// Latest by created_at that passes the check: an edit no newer than the
+	// canonical version does not win, and a replay is ignored.
+	if ev.CreatedAt <= cur.VersionCreatedAt {
+		return errors.New("stale update ignored")
+	}
 	if !apply {
 		return nil
 	}
-	end := now + c.DurationSec
-	s.Auctions[ev.ID] = &Auction{
-		ID: ev.ID, Seller: ev.Pubkey, SellerWallet: strings.ToLower(c.SellerWallet), SellerName: c.Name,
-		Title: c.Title, Description: c.Description, Image: c.Image, Category: c.Category,
-		StartPrice: c.StartPrice, MinIncrement: c.MinIncrement, CreatedAt: now, CreatedH: height,
-		EndAt: end, Mode: mode, WindowSec: c.WindowSec, Status: "open", Bids: []string{},
-	}
-	s.Order = append(s.Order, ev.ID)
+	// Only display fields change; money, time and cryptography stay put, and
+	// EndAt is never recomputed.
+	cur.Title, cur.Description, cur.Image, cur.Category, cur.SellerName = c.Title, c.Description, c.Image, c.Category, c.Name
+	cur.VersionID, cur.VersionCreatedAt, cur.CreatedH = ev.ID, ev.CreatedAt, height
 	return nil
 }
 
@@ -444,6 +610,18 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 	au, ok := s.Auctions[b.Auction]
 	if !ok {
 		return errors.New("unknown auction")
+	}
+	// 0. The bid binds to the auction ROOT, not to the latest version: it must
+	// carry e = <auction_root_event_id>. This check lives HERE, in the
+	// deterministic transition, not only in CheckTx: admission is a mempool
+	// filter and a Byzantine proposer can include a transaction that never
+	// passed it (spec §8).
+	if e, ok := tagValue(ev.Tags, "e"); !ok || e != au.RootID {
+		return errors.New("bid must reference the auction root (auction_root_event_id)")
+	}
+	// The coordinate convention a = 1440:<seller>:<d>, if present, must match.
+	if a, ok := tagValue(ev.Tags, "a"); ok && a != au.ID {
+		return errors.New("bid's a coordinate does not match the auction")
 	}
 	// 1. Is it a real, fully locked escrow? If not, refuse it outright.
 	wallet := strings.ToLower(b.Wallet)
@@ -620,7 +798,9 @@ func (a *App) CheckTx(_ context.Context, req *abci.CheckTxRequest) (*abci.CheckT
 func (a *App) checkClose(c *closeTx, now int64) *abci.CheckTxResponse {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	au := a.st.Auctions[c.Auction]
+	// The close tx names the auction by its stable ROOT id, never by a mutable
+	// version event id: an edit must not be able to orphan an in-flight close.
+	au := a.st.byRoot(c.Auction)
 	switch {
 	case au == nil || au.Status != "open" || au.EndAt != c.EndAt:
 		return &abci.CheckTxResponse{Code: 3, Log: "nothing to close"}

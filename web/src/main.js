@@ -1,6 +1,6 @@
 import './template.css';
 import './arena.css';
-import { newIdentity, ensureSeed, idPub, walletPub, totalSats, lockOf } from './lib/arena.js';
+import { newIdentity, ensureSeed, idPub, walletPub, totalSats, lockOf, KIND_BID } from './lib/arena.js';
 import { WalletClient } from './lib/wallet.js';
 import { CATALOGUE, PARODY, randomLot } from './lib/catalogue.js';
 import { loginExtension, loginBunker, loginNostrConnect, signerFor, logoutSigner, fetchProfile } from './lib/login.js';
@@ -680,7 +680,7 @@ function onNewState(prev) {
   const a = currentLot();
   if (prev && !firstState) {
     for (const r of S.rejections.slice(prev.rejections.length)) {
-      if (r.kind === 1441 && r.pubkey === mePub()) toast(`Bid not accepted: ${esc(r.reason)}. Those sats return to your wallet automatically after the escrow locktime.`, 'danger');
+      if (r.kind === KIND_BID && r.pubkey === mePub()) toast(`Bid not accepted: ${esc(r.reason)}. Those sats return to your wallet automatically after the escrow locktime.`, 'danger');
     }
   }
   // closing moments

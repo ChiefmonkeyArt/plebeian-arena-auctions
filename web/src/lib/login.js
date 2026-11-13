@@ -5,6 +5,7 @@
 // kind 0, read with a small WebSocket client: at most 6 relays, 4 s each.
 import { bytesToHex, hexToBytes, randomBytes } from '@noble/hashes/utils.js';
 import { getPublicKey, verifyEvent } from 'nostr-tools/pure';
+import { AUCTION_KINDS } from './arena.js';
 
 export const PROFILE_RELAYS = ['wss://relay.chiefmonkey.art', 'wss://nos.lol', 'wss://purplepag.es'];
 export const CONNECT_RELAYS = ['wss://relay.chiefmonkey.art', 'wss://nos.lol'];
@@ -42,7 +43,7 @@ export async function loginBunker(uri, onauth) {
 export async function loginNostrConnect(onUri, signal) {
   const { createNostrConnectURI, BunkerSigner } = await import('nostr-tools/nip46');
   const sk = randomBytes(32);
-  const uri = createNostrConnectURI({ clientPubkey: getPublicKey(sk), relays: CONNECT_RELAYS, secret: bytesToHex(randomBytes(8)), name: 'Plebeian Auctions Arena', perms: ['sign_event:1440', 'sign_event:1441', 'sign_event:1442'] });
+  const uri = createNostrConnectURI({ clientPubkey: getPublicKey(sk), relays: CONNECT_RELAYS, secret: bytesToHex(randomBytes(8)), name: 'Plebeian Auctions Arena', perms: [AUCTION_KINDS.create, AUCTION_KINDS.bid, AUCTION_KINDS.chat].map((k) => `sign_event:${k}`) });
   onUri(uri);
   const signer = await BunkerSigner.fromURI(sk, uri, {}, signal);
   const pubkey = await signer.getPublicKey();
