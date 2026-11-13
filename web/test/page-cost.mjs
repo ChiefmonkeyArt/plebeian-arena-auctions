@@ -21,7 +21,8 @@ ok(performance.now() - t < 50, `4000 memoised lookups in ${(performance.now() - 
 // A stand-in Worker: answers in-process like wallet-worker.js would.
 const sent = [];
 class FakeWorker {
-  constructor(url, opts) { this.url = String(url); this.opts = opts; FakeWorker.last = this; }
+  constructor(url, opts) { this.url = String(url); this.opts = opts; FakeWorker.last = this; setTimeout(() => this.ready(), 0); }
+  ready() { this.onmessage({ data: { ready: true } }); } // v0.5.2 handshake
   postMessage(m) {
     sent.push(m); if (m.op === 'init') return;
     queueMicrotask(() => this.onmessage({ data: m.op === 'claim'
@@ -34,8 +35,8 @@ globalThis.Worker = FakeWorker;
 const { WalletClient } = await import('../src/lib/wallet.js');
 const w = new WalletClient('http://x');
 ok(/wallet-worker\.js$/.test(FakeWorker.last.url) && FakeWorker.last.opts.type === 'module', 'starts a module worker');
-ok(sent[0].op === 'init' && sent[0].args[0] === 'http://x', 'worker gets the API base');
 const r = await w.balance(id);
+ok(sent[0].op === 'init' && sent[0].base === 'http://x' && sent[1].base === 'http://x', 'worker gets the API base');
 ok(r.op === 'balance' && r.args[0].walletSk === id.walletSk, 'balance runs in the worker');
 try { await w.claim(id, {}, 'refund', {}); ok(false, 'claim error passes through'); }
 catch (e) { ok(e instanceof Error && e.message === 'not enough cosigners' && e.refusals[0] === 'V4', 'worker errors keep message and refusals'); }
@@ -43,7 +44,7 @@ ok(typeof w.view === 'function' && w.view === ArenaClient.prototype.view, 'reads
 
 // Worker fails to load: queued and later calls run in the page.
 ArenaClient.prototype.balance = async function () { return 'local:' + this.base; };
-class DeadWorker extends FakeWorker { postMessage(m) { if (m.op !== 'init') queueMicrotask(() => this.onerror({ message: 'load failed', preventDefault() {} })); } }
+class DeadWorker extends FakeWorker { ready() { if (!this.dead) this.onerror({ message: 'load failed', preventDefault() {} }); } postMessage(m) { if (m.op !== 'init') queueMicrotask(() => this.onerror({ message: 'load failed', preventDefault() {} })); } }
 globalThis.Worker = DeadWorker;
 const d = new WalletClient('http://y');
 ok((await d.balance(id)) === 'local:http://y', 'a failed worker retries the call in the page');

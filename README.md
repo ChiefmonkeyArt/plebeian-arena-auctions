@@ -21,6 +21,7 @@ gateway :8080 ── static UI, /api/* (incl. /api/release), /mint/* proxy, supe
 - Two auction modes (v0.5.0, [ADR 0009](docs/adr/0009-push-settlement-two-auction-modes.md), chain format 5): **fixed time** ends on the clock and never later; **anti-snipe** puts the clock back to the seller's window (15 s to 15 min) whenever a bid lands inside it, with no cap and no hidden hard end.
 - Push settlement (v0.5.0): a settler in the gateway asks all four validators to sign each due refund, payout or re-lock, and uses the first three that agree. It swaps at the mint, checks the DLEQ proofs, records a `settle` transaction and pushes the new ecash (P2PK-locked to the recipient) over `/api/events`. A long anti-snipe lot's leading escrow is re-locked before its locktime. Measured locally: FROST round 10–30 ms, mint swap about 25 ms.
 - Nostr login (v0.5.0, [ADR 0010](docs/adr/0010-nostr-login-one-click-lots.md)): NIP-07 extensions and NIP-46 signers (`bunker://`, `nostrconnect://`). You bid as yourself beside the demo characters, with the same fake sats; your wallet key stays in this browser. Your name and picture come from your own relays. One-click lots list a random parody lot (Bitcoin merch "sold" by leaders of the past) in either mode.
+- Fixes (v0.5.2, ADR 0011 addendum): the wallet worker now says "ready" before the page sends it anything. iOS dropped the early start-up message, so every top-up and bid failed with "wallet worker: unknown op". If the worker never gets ready, the wallet runs in the page.
 - Fixes (v0.5.1, [ADR 0011](docs/adr/0011-wallet-resync-after-lost-storage.md)): a wallet whose browser store was cleared (counters back at 0, so the mint refused "outputs already signed") repairs itself with Cashu restore (NUT-09) and gets its unspent ecash back. Top-up and bot failures now show. The photo and gallery follow the next lot the moment it takes over. The outcome panel closes when the next lot starts. The demo Seller no longer bids.
 - Keys: `arena init` runs a FROST (secp256k1, Taproot/BIP-340) key ceremony between the four validators; each keeps only its own share in `vN/config/frost_key.json`. Genesis carries the group key.
 - Pull release (fallback since v0.5.0): `/api/release` asks every validator for a nonce commitment; each one only commits to a refund for an outbid, lost or void bid (authorised by the bidder) or a payout of the winning bid to the seller. Three that agree on the same message sign their share, and the shares combine into one ordinary Schnorr signature the mint accepts. Fewer than three: no signature. If validators vanish, the bidder reclaims alone after locktime.
@@ -69,7 +70,7 @@ The Torii Suite installs a pinned release with `installers/install-auctions.sh` 
 Build a tarball locally:
 
 ```bash
-scripts/package.sh v0.5.1 dist-release
+scripts/package.sh v0.5.2 dist-release
 ```
 
 Design decisions: [ADR 0001](docs/adr/0001-frost-escrow-coco-wallet.md), [ADR 0002](docs/adr/0002-strict-locks-nutshell-021.md), [ADR 0003 (proposed)](docs/adr/0003-block-growth-snapshots-pruning.md). Threat model: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
