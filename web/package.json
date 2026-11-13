@@ -1,10 +1,10 @@
 {
   "name": "web",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "test": "node test/page-cost.mjs && node test/login.mjs",
+    "test": "node test/page-cost.mjs && node test/login.mjs && node test/worker-ready.mjs",
     "build": "vite build"
   },
   "keywords": [],

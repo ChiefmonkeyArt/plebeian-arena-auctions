@@ -17,3 +17,12 @@ Each identity's Coco wallet makes its ecash outputs from a seed kept in localSto
 - A wallet whose store was lost repairs itself on its next action, and gets its unspent ecash back.
 - A restore costs a few mint calls (batches of blinded messages) once per lost store.
 - Test: `web/test/resync.mjs`, 8 checks against the local stack: top-up, bid lock and receive on a lost store.
+
+## Addendum (v0.5.2): wallet worker handshake
+
+The owner's phone (Brave on iOS) then showed "wallet worker: unknown op faucet" on page load. The page posted its `init` message to the wallet worker (v0.4.2) before the worker's module graph had loaded. iOS WebKit dropped that message, so the worker had no client and refused every wallet operation. Top-ups, refunds and bot bids all failed. Before v0.5.1 those failures were silent, so this was probably part of the original "bids stopped" report too.
+
+- **Handshake.** The worker posts `ready` once its handler is installed. The page queues wallet calls until `ready`, then sends `init` and the queue.
+- **Belt and braces.** Every message carries the API base, and the worker builds its client on the first call if `init` was lost.
+- **Fallback.** If no `ready` arrives within 8 s, or the worker errors, the page stops the worker and runs the wallet in the page (as before v0.4.2).
+- Test: `web/test/worker-ready.mjs`, 9 checks with a fake worker that drops early messages or never becomes ready.
