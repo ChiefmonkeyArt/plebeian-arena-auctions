@@ -47,6 +47,12 @@ type supervisor struct {
 }
 
 func (s *supervisor) start(i int) error {
+	return s.startWith(i, []string{"node", "-root", s.root, "-i", fmt.Sprint(i + 1)})
+}
+
+// startWith starts validator i with explicit arguments, so the gateway can pass
+// relay flags through to each node's ingest.
+func (s *supervisor) startWith(i int, args []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.procs[i] != nil {
@@ -56,7 +62,7 @@ func (s *supervisor) start(i int) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(s.bin, "node", "-root", s.root, "-i", fmt.Sprint(i+1))
+	cmd := exec.Command(s.bin, args...)
 	cmd.Stdout, cmd.Stderr = lf, lf
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
@@ -124,12 +130,19 @@ func cmdGateway(args []string) {
 	addr := fs.String("addr", "127.0.0.1:8080", "listen addr")
 	mint := fs.String("mint", "http://127.0.0.1:3338", "mint")
 	demo := fs.Bool("demo-controls", false, "expose the unauthenticated validator stop/start route (demo only, never on a real-sats deployment)")
+	var relays relayURLs
+	fs.Var(&relays, "relay", "relay websocket URL clients publish to (repeatable); the relay is the primary transport")
 	fs.Parse(args)
 	bin, _ := os.Executable()
 	sup := &supervisor{root: *root, bin: bin, logs: filepath.Dir(*root)}
 	for i := 0; i < 4; i++ {
-		check(sup.start(i))
+		args := []string{"node", "-root", *root, "-i", fmt.Sprint(i+1)}
+		for _, relay := range relays {
+			args = append(args, "-relay", relay)
+		}
+		check(sup.startWith(i, args))
 	}
+	publisher := newRelayPublisher(relays)
 
 	var chatMu sync.Mutex
 	chat := []chatMsg{}
@@ -246,7 +259,11 @@ func cmdGateway(args []string) {
 		writeJSON(w, 200, out)
 	})
 
-	// broadcast a signed Nostr event as a transaction; fail over across validators
+	// Publish a signed Nostr event.  When the gateway is configured with a
+	// relay, the relay is the primary transport: the event goes there, every
+	// validator's observer ingests it into that validator's own mempool, and
+	// the gateway does not need to know which validator leads.  The direct
+	// submit below is kept as a fallback for a deployment with no relay.
 	mu.HandleFunc("/api/tx", func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		if err != nil || r.Method != http.MethodPost {
@@ -259,6 +276,21 @@ func cmdGateway(args []string) {
 			return
 		}
 		tx := "0x" + hex.EncodeToString(compact.Bytes())
+
+		if publisher != nil {
+			var event Event
+			if json.Unmarshal(compact.Bytes(), &event) != nil || event.Verify() != nil {
+				writeJSON(w, 400, map[string]string{"error": "invalid signed event"})
+				return
+			}
+			if pubErr := publisher.Publish(r.Context(), event); pubErr == nil {
+				writeJSON(w, 200, map[string]any{"ok": true, "via": "relay"})
+				return
+			} else {
+				log.Printf("relay publish failed, falling back to direct submit: %v", pubErr)
+			}
+		}
+
 		for i := 0; i < 4; i++ {
 			if !sup.running(i) {
 				continue
