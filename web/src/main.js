@@ -194,8 +194,19 @@ function topup(n, amount, quiet) {
   topping[n] = topupNow(n, amount, quiet).finally(() => { delete topping[n]; });
   return topping[n];
 }
+// v0.5.1: wallet and bot failures used to vanish (quiet bids, background
+// top-ups). Say so, at most once a minute per kind, so a stuck wallet shows.
+const said = {};
+function sayOnce(kind, html) {
+  if (Date.now() - (said[kind] || 0) < 60000) return;
+  said[kind] = Date.now(); toast(html, 'danger');
+}
 async function topupNow(n, amount, quiet) {
-  BAL[n] = await api.faucet(ids[n], amount);
+  try { BAL[n] = await api.faucet(ids[n], amount); } catch (e) {
+    console.warn('top-up', n, e.message);
+    sayOnce('topup', `${esc(n === 'You' ? 'Your' : n + "'s")} fake-sats top-up failed: ${esc(e.message)}`);
+    throw e;
+  }
   ledger(n, 'topup', amount, 'Fake-sats faucet (test mint) · Coco wallet'); saveW();
   if (!quiet && n === ui.me) { pulse($('.wallet-chip'), 'got'); toast(`+${fmt(amount)} fake sats minted`, 'good'); }
 }
@@ -407,14 +418,21 @@ async function botLoop() {
   if (pending || busy.has('bid:' + ui.me) || Date.now() - humanAt < BOT_HOLD_MS) return;
   const gap = { chill: [6000, 12000], busy: [3000, 6000], frenzy: [1200, 2600] }[ui.bots];
   botAt = Date.now() + gap[0] + Math.random() * (gap[1] - gap[0]);
-  const rivals = USERS.filter((n) => n !== ui.me && idPub(ids[n]) !== a.seller && !(a.highBid && S.bids[a.highBid].bidder === idPub(ids[n])));
+  // the demo Seller only lists; a "Seller is winning" bid read as the lot's own seller
+  const rivals = USERS.filter((n) => n !== 'Seller' && n !== ui.me && idPub(ids[n]) !== a.seller && !(a.highBid && S.bids[a.highBid].bidder === idPub(ids[n])));
   if (!rivals.length) return;
   const ceiling = a.startPrice * (ui.bots === 'frenzy' ? 40 : 12);
   if (minNext(a) > ceiling && Math.random() < 0.8) return;
   const n = rivals[Math.floor(Math.random() * rivals.length)];
   const steps = Math.random() < 0.2 ? 2 : 0;
-  placeBid(n, a, stepAmt(a, steps), { quiet: true });
+  const r = await placeBid(n, a, stepAmt(a, steps), { quiet: true });
+  if (r.ok) botFails = 0;
+  else if (r.reason && !/settling|closed|already|highest|moved|least/i.test(r.reason) && ++botFails >= 3) {
+    console.warn('demo bot bid', n, r.reason);
+    sayOnce('bots', `The demo bots can't bid: ${esc(r.reason)}`);
+  }
 }
+let botFails = 0;
 
 // ---------- rendering ----------
 // [data-v] slots are all in index.html, so each key's elements are looked up once.
@@ -470,10 +488,19 @@ function timerText(a) {
 // v0.4.2: it used to run on every animation frame, 60 times a second.
 let frameReq = 0, frameTimer = 0;
 function kick() { if (!frameReq) frameReq = requestAnimationFrame(() => { frameReq = 0; renderFrame(); }); }
+let drawnLot = null;
 function renderFrame() {
   clearTimeout(frameTimer); frameTimer = setTimeout(kick, 100);
   const a = currentLot();
   if (!S) return;
+  // v0.5.1: the page moves on to the next lot by the clock, not only on a
+  // new block, so the photo, gallery, feeds and queue follow here too
+  // (they used to keep the previous lot's until the next block).
+  if ((a && a.id) !== drawnLot) {
+    drawnLot = a && a.id; ui.img = 0;
+    renderMedia(a); renderFeeds(a); renderChat(a); renderQueue(a);
+    if (ui.olot && ui.olot !== drawnLot) $('[data-modal=outcome]').hidden = true;
+  }
   const live = a && a.status === 'open';
   setV('balance', fmt(bal(ui.me)));
   setV('held', fmt(heldBy(ui.me)));
@@ -506,7 +533,8 @@ function renderFrame() {
     const bs = bidsOf(a);
     setV('bidcountn', String(bs.length));
     setV('bidders', String(new Set(bs.map((b) => b.bidder)).size));
-    setV('extensionsn', String(a.extensions));
+    setV('extensionsn', a.mode === 'antisnipe' ? String(a.extensions) : '–');
+    setV('resetslabel', a.mode === 'antisnipe' ? 'clock resets' : 'fixed time, no resets');
     setV('escrownote', `Bids lock ecash to one FROST key the 4 validators share; any 3 can sign. Outbid? The validators sign and push your refund at once; the winner's sats go to the seller the moment the clock hits zero. Fallback: ${a.mode === 'antisnipe' ? 'while the clock keeps resetting the validators re-lock the leading bid, and you can reclaim alone after its locktime' : `you can reclaim alone after ${clock(a.endAt + S.params.lockMarginSec + 15)}`}.`);
     const r = remaining(a);
     $$('[data-urgent]').forEach((el) => { el.classList.toggle('urgent', live && r < 10); el.classList.toggle('ended', !live); });
@@ -640,6 +668,7 @@ function outcomeHTML(a, tab) {
 }
 function openOutcome(tab) {
   const a = currentLot();
+  ui.olot = a && a.id;
   if (!tab) { const r = role(a); tab = r === 'winner' ? 'winner' : r === 'seller' ? 'seller' : r === 'loser' ? 'loser' : ui.otab || 'winner'; }
   ui.otab = tab;
   $$('[data-act=otab]').forEach((b) => b.classList.toggle('on', b.dataset.o === tab));
@@ -776,7 +805,7 @@ async function pollState() {
     const a = currentLot();
     document.body.classList.toggle('arena-loading', !a);
     renderMedia(a); renderFeeds(a); renderChat(a); renderQueue(a); renderWallet(); kick();
-    if (!$('[data-modal=outcome]').hidden) $('[data-slot=outcome]').innerHTML = outcomeHTML(a, ui.otab);
+    if (!$('[data-modal=outcome]').hidden && S.auctions[ui.olot]) $('[data-slot=outcome]').innerHTML = outcomeHTML(S.auctions[ui.olot], ui.otab);
   } catch (e) { /* gateway down */ } finally { polling = false; }
 }
 async function pollNet() { try { NET = await api.network(); if (S) S.height = Math.max(S.height, ...NET.map((v) => v.height || 0)); renderNetwork(); } catch {} }

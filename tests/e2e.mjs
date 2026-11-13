@@ -140,7 +140,8 @@ await expectReject(placeBid(carol, A, 115), /at least 120/, 'under-increment bid
   ok(sv.bids[r.id].status === 'void' && !sv.auctions[A].bids.includes(r.id) && sv.auctions[A].highBid === b2.id, 'recorded on chain as void; Bob still leads');
   const pv = await pushed(carol, r.id, "Carol's late bid", t);
   ok(await bal(carol) === 1000, `Carol's late 115 pushed back · ${msTxt(pv)}`);
-  const v = await c.view([idPub(carol)]);
+  // the push can land before the block that records the settle tx (v0.5.1)
+  const v = await until(async () => { const x = await c.view([idPub(carol)]); return x.state.bids[r.id]?.settled && x; }, 5000, 'void settle tx').catch(() => c.view([idPub(carol)]));
   ok(v.state.bids[r.id]?.status === 'void' && v.state.bids[r.id]?.settled === 'refund' && !(await c.view([idPub(alice)])).state.bids[r.id], "the void bid is in Carol's view only, marked settled");
 }
 await expectReject((async () => { const st = await c.state(); return c.bid(seller, st.auctions[A], 500, []); })(), /proof count/, 'a bid without an escrow is refused outright');
