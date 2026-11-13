@@ -174,9 +174,12 @@ func newChainHarness(t *testing.T) *chainHarness {
 	t.Helper()
 	app := NewApp()
 	params := Params{
-		GroupKey:     "02" + repeat("11", 32),
-		SoftCloseSec: 20, ExtendSec: 20, MaxExtendSec: 60, LockMarginSec: 86400,
-		MinDurationSec: 20, MaxDurationSec: 7200, MaxProofs: 64, Threshold: 3,
+		GroupKey: "02" + repeat("11", 32),
+		// v0.5.0 removed SoftCloseSec/ExtendSec/MaxExtendSec (ADR 0009); the
+		// anti-snipe window and the settlement margin replaced them (spec §10).
+		MinWindowSec: 60, MaxWindowSec: 900,
+		SettlementSafetySec: 900, BidToConsensusLatencySec: 15,
+		MinDurationSec: 20, MaxDurationSec: 259200, MaxProofs: 64, Threshold: 3,
 	}
 	raw, _ := json.Marshal(params)
 	if _, err := app.InitChain(context.Background(), &abci.InitChainRequest{AppStateBytes: raw}); err != nil {
@@ -272,8 +275,15 @@ func (h *chainHarness) auctionIDs(t *testing.T) map[string]bool {
 	t.Helper()
 	ids := map[string]bool{}
 	h.app.Read(func(s *State) {
-		for id := range s.Auctions {
+		for id, au := range s.Auctions {
 			ids[id] = true
+			// Auctions are keyed by their stable coordinate (spec §8). A test
+			// that published a create knows that event's id, which is the
+			// auction's root, so index by the root as well — otherwise the
+			// lookup silently misses a create that did in fact commit.
+			if au.RootID != "" {
+				ids[au.RootID] = true
+			}
 		}
 	})
 	return ids
@@ -298,17 +308,44 @@ func signedCreate(t *testing.T, secret, title string, createdAt int64) nostr.Eve
 		"title": title, "description": "d", "image": "", "category": "c",
 		"startPrice": 1000, "minIncrement": 100, "durationSec": 300,
 		"sellerWallet": "02" + repeat("33", 32), "name": "seller",
+		// v0.5.0 modes (ADR 0009) and the allow-list: a create must name a
+		// mode, and its `d` tag is what makes it addressable as an auction
+		// root — without one, applyCreate refuses it.
+		"mode": "fixed",
 	})
 	event := nostr.Event{
 		PubKey:    pub,
 		CreatedAt: nostr.Timestamp(createdAt),
 		Kind:      KindCreate,
 		Content:   string(content),
+		Tags:      nostr.Tags{{"d", dTagFor(title)}},
 	}
 	if err := event.Sign(secret); err != nil {
 		t.Fatalf("sign: %v", err)
 	}
 	return event
+}
+
+// dTagFor derives a `d` that validD accepts ([a-zA-Z0-9_-], 1..64) from a
+// human title. The tests use titles with spaces, which the validator rightly
+// refuses; the `d` is the auction's stable identity, so it has to be a legal
+// identifier rather than a display string.
+func dTagFor(title string) string {
+	var b strings.Builder
+	b.WriteString("relay-lot-")
+	for _, r := range strings.ToLower(title) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-' || r == '_':
+			b.WriteRune(r)
+		case r == ' ':
+			b.WriteRune('-')
+		}
+	}
+	s := b.String()
+	if len(s) > 64 {
+		s = s[:64]
+	}
+	return s
 }
 
 func waitForObserverSubscribed(t *testing.T, observer *Observer) {
@@ -368,7 +405,15 @@ func TestRelayIngestCommitsSignedCreateThroughRealRelay(t *testing.T) {
 		"auction to appear in committed state from a relayed event")
 
 	h.app.Read(func(s *State) {
-		if auction := s.Auctions[event.ID]; auction == nil || auction.Seller != event.PubKey {
+		// Auctions are keyed by their stable coordinate (spec §8); the test
+		// knows the create's event id, which is the auction's root.
+		var auction *Auction
+		for _, au := range s.Auctions {
+			if au.RootID == event.ID {
+				auction = au
+			}
+		}
+		if auction == nil || auction.Seller != event.PubKey {
 			t.Fatalf("committed auction seller = %v, want %s", auction, event.PubKey)
 		}
 	})
@@ -615,6 +660,12 @@ func TestRelayIngestConnectionHelpersStayRaceFree(t *testing.T) {
 	publishEvent(t, url, event)
 	waitFor(t, 10*time.Second, func() bool { return h.auctionIDs(t)[event.ID] },
 		"helper-published event to commit")
+	// SubmitEvent appends to accepted only after its commitBlock returns, so the
+	// state can be visible for a moment before the record lands. Poll for the
+	// record, then hold a grace window so a duplicate delivery would show up.
+	waitFor(t, 5*time.Second, func() bool { return len(submitter.acceptedEvents()) == 1 },
+		"observer to record exactly one accepted event")
+	time.Sleep(500 * time.Millisecond)
 	if accepted := submitter.acceptedEvents(); len(accepted) != 1 || accepted[0] != event.ID {
 		t.Fatalf("accepted = %v, want exactly [%s]", accepted, event.ID)
 	}

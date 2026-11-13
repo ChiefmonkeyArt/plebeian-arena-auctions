@@ -182,7 +182,7 @@ func TestSigAllExtendingBidUnderNewFloorRefused(t *testing.T) {
 	}
 	c, _ := json.Marshal(BidContent{Auction: id, Amount: 150, Wallet: alice.wallet, Name: "t", Proofs: proofs,
 		OutcomeTemplates: m.templates(t, alice, au.SellerWallet, proofs)})
-	ev := signEvent(t, alice.sk, KindBid, string(c), tNow)
+	ev := signEventTags(t, alice.sk, KindBid, string(c), tNow, [][]string{{"e", au.RootID}})
 	err := a.st.applyBid(ev, tNow, 11, true, true)
 	if err == nil || !strings.Contains(err.Error(), "locktime below the floor for this lot") {
 		t.Fatalf("an extending bid below the new floor was not refused by name: %v", err)
@@ -224,7 +224,7 @@ func TestSigAllTemplateWrongDestinationRefusedByName(t *testing.T) {
 	sig, _ := schnorr.Sign(bob.walletSk, mustHex(d))
 	c.OutcomeTemplates.Settle.Digest, c.OutcomeTemplates.Settle.BidderSignature = d, hex.EncodeToString(sig.Serialize())
 
-	err := a.st.applyBid(&Event{ID: hx(88), Pubkey: bob.pub, Content: string(must(json.Marshal(c)))}, tNow, 11, true, true)
+	err := a.st.applyBid(&Event{ID: hx(88), Pubkey: bob.pub, Tags: [][]string{{"e", a.st.Auctions[id].RootID}}, Content: string(must(json.Marshal(c)))}, tNow, 11, true, true)
 	if err == nil || !strings.Contains(err.Error(), "is not locked to the auction's committed seller payout key") {
 		t.Fatalf("wrong destination not refused by name: %v", err)
 	}
@@ -250,7 +250,7 @@ func TestSigAllRelockTemplateRefusedByName(t *testing.T) {
 	sig, _ := schnorr.Sign(bob.walletSk, mustHex(d))
 	c.OutcomeTemplates.Settle.Digest, c.OutcomeTemplates.Settle.BidderSignature = d, hex.EncodeToString(sig.Serialize())
 
-	err := a.st.applyBid(&Event{ID: hx(92), Pubkey: bob.pub, Content: string(must(json.Marshal(c)))}, tNow, 11, true, true)
+	err := a.st.applyBid(&Event{ID: hx(92), Pubkey: bob.pub, Tags: [][]string{{"e", a.st.Auctions[id].RootID}}, Content: string(must(json.Marshal(c)))}, tNow, 11, true, true)
 	if err == nil || !strings.Contains(err.Error(), "re-locks the escrow to the committee key, which is forbidden") {
 		t.Fatalf("group-key re-lock template not refused by name: %v", err)
 	}
@@ -265,7 +265,7 @@ func TestSigAllTemplateUnsignedRefused(t *testing.T) {
 	json.Unmarshal([]byte(ev.Content), &c)
 	c.OutcomeTemplates.Refund.BidderSignature = strings.Repeat("00", 64)
 
-	err := a.st.applyBid(&Event{ID: hx(89), Pubkey: bob.pub, Content: string(must(json.Marshal(c)))}, tNow, 11, true, true)
+	err := a.st.applyBid(&Event{ID: hx(89), Pubkey: bob.pub, Tags: [][]string{{"e", a.st.Auctions[id].RootID}}, Content: string(must(json.Marshal(c)))}, tNow, 11, true, true)
 	if err == nil || !strings.Contains(err.Error(), "bidder signature does not verify") {
 		t.Fatalf("unsigned template not refused by name: %v", err)
 	}
@@ -281,7 +281,7 @@ func TestSigAllTemplateInputsMustBeCommittedProofs(t *testing.T) {
 	json.Unmarshal([]byte(ev.Content), &c)
 	c.OutcomeTemplates.Settle.Inputs[0].Secret = `["P2PK",{"nonce":"` + strings.Repeat("bb", 32) + `","data":"` + bob.wallet + `","tags":[["sigflag","SIG_ALL"]]}]`
 
-	err := a.st.applyBid(&Event{ID: hx(90), Pubkey: bob.pub, Content: string(must(json.Marshal(c)))}, tNow, 11, true, true)
+	err := a.st.applyBid(&Event{ID: hx(90), Pubkey: bob.pub, Tags: [][]string{{"e", a.st.Auctions[id].RootID}}, Content: string(must(json.Marshal(c)))}, tNow, 11, true, true)
 	if err == nil || !strings.Contains(err.Error(), "is not the committed proof's secret") {
 		t.Fatalf("foreign template input not refused by name: %v", err)
 	}
@@ -296,7 +296,9 @@ func TestSigAllTemplateDigestMismatchRefused(t *testing.T) {
 	json.Unmarshal([]byte(ev.Content), &c)
 	c.OutcomeTemplates.Refund.Digest = strings.Repeat("00", 32)
 
-	err := a.st.applyBid(&Event{ID: hx(93), Pubkey: bob.pub, Content: string(must(json.Marshal(c)))}, tNow, 11, true, true)
+	// The bid must still carry the root binding, or it is refused for that
+	// reason first (the allow-list's admission order).
+	err := a.st.applyBid(&Event{ID: hx(93), Pubkey: bob.pub, Tags: [][]string{{"e", a.st.Auctions[id].RootID}}, Content: string(must(json.Marshal(c)))}, tNow, 11, true, true)
 	if err == nil || !strings.Contains(err.Error(), "digest does not match its inputs and outputs") {
 		t.Fatalf("tampered digest not refused by name: %v", err)
 	}
@@ -310,7 +312,7 @@ func TestSigAllBidWithoutTemplatesRefused(t *testing.T) {
 	var c BidContent
 	json.Unmarshal([]byte(ev.Content), &c)
 	c.OutcomeTemplates = nil
-	err := a.st.applyBid(&Event{ID: hx(91), Pubkey: bob.pub, Content: string(must(json.Marshal(c)))}, tNow, 11, true, true)
+	err := a.st.applyBid(&Event{ID: hx(91), Pubkey: bob.pub, Tags: [][]string{{"e", a.st.Auctions[id].RootID}}, Content: string(must(json.Marshal(c)))}, tNow, 11, true, true)
 	if err == nil || !strings.Contains(err.Error(), "must publish outcome_templates") {
 		t.Fatalf("template-less bid not refused by name: %v", err)
 	}
