@@ -362,38 +362,54 @@ func verifySigAllBidTemplates(au *Auction, content *BidContent, params Params) e
 		if len(template.Outputs) == 0 {
 			return fmt.Errorf("sigall %s template has no outputs", e.name)
 		}
-		// (c) conserve the bid's amount and name the pinned keyset.
-		var total int64
-		for index, out := range template.Outputs {
-			if out.Amount <= 0 {
-				return fmt.Errorf("sigall %s output %d has no positive amount", e.name, index)
+		if e.name == "settle" && len(au.V4VSplit) > 0 {
+			// The settle template must reproduce the committed V4V split
+			// EXACTLY: one output per committed row (same recipient, same
+			// amount, same order) plus the seller remainder. This runs before
+			// any generic amount check so an omitting, adding, reordering or
+			// repricing template is refused by its own name. The mint knows
+			// nothing about V4V -- this is the protocol rule (spec §6/§1.3).
+			if err := settleMatchesSplit(au, content.Amount, template, params.KeysetID); err != nil {
+				return err
 			}
-			if out.Amount > (1<<62)-total {
-				return fmt.Errorf("sigall %s output amounts overflow", e.name)
-			}
-			total += out.Amount
-			if out.ID != params.KeysetID {
-				return fmt.Errorf("sigall %s output %d names keyset %q, not the pinned %q", e.name, index, out.ID, params.KeysetID)
-			}
-		}
-		if total != content.Amount {
-			return fmt.Errorf("sigall %s outputs sum to %d, not the bid's amount %d", e.name, total, content.Amount)
-		}
-		// (d) settle and (e) refund: every output locked to the one committed
-		// destination, and never to the committee key (a forbidden re-lock).
-		for index, out := range template.Outputs {
-			if sigAllOutputIsEscrowRelock(out.Secret, params.GroupKey) {
-				return fmt.Errorf("sigall %s output %d re-locks the escrow to the committee key, which is forbidden", e.name, index)
-			}
-			recipient, err := sigAllOutputRecipient(out.Secret)
-			if err != nil {
-				return fmt.Errorf("sigall %s output %d: %w", e.name, index, err)
-			}
-			if strings.ToLower(recipient) != strings.ToLower(e.dest) {
-				if e.name == "settle" {
-					return fmt.Errorf("sigall settle output %d is not locked to the auction's committed seller payout key", index)
+		} else {
+			// (c) conserve the bid's amount and name the pinned keyset.
+			var total int64
+			for index, out := range template.Outputs {
+				if out.Amount <= 0 {
+					return fmt.Errorf("sigall %s output %d has no positive amount", e.name, index)
 				}
-				return fmt.Errorf("sigall refund output %d is not locked to the bid's wallet spend key", index)
+				if out.Amount > (1<<62)-total {
+					return fmt.Errorf("sigall %s output amounts overflow", e.name)
+				}
+				total += out.Amount
+				if out.ID != params.KeysetID {
+					return fmt.Errorf("sigall %s output %d names keyset %q, not the pinned %q", e.name, index, out.ID, params.KeysetID)
+				}
+			}
+			if total != content.Amount {
+				return fmt.Errorf("sigall %s outputs sum to %d, not the bid's amount %d", e.name, total, content.Amount)
+			}
+			// (d) settle and (e) refund: every output locked to the one committed
+			// destination, never to the committee key; and a REFUND must not pay
+			// a committed V4V split row (refunds stay bidder-only, spec §6).
+			for index, out := range template.Outputs {
+				if sigAllOutputIsEscrowRelock(out.Secret, params.GroupKey) {
+					return fmt.Errorf("sigall %s output %d re-locks the escrow to the committee key, which is forbidden", e.name, index)
+				}
+				recipient, err := sigAllOutputRecipient(out.Secret)
+				if err != nil {
+					return fmt.Errorf("sigall %s output %d: %w", e.name, index, err)
+				}
+				if e.name == "refund" && isSplitRecipient(au, recipient) {
+					return fmt.Errorf("sigall refund output %d pays a committed v4v split recipient", index)
+				}
+				if !sameKey(recipient, e.dest) {
+					if e.name == "settle" {
+						return fmt.Errorf("sigall settle output %d is not locked to the auction's committed seller payout key", index)
+					}
+					return fmt.Errorf("sigall refund output %d is not locked to the bid's wallet spend key", index)
+				}
 			}
 		}
 		// (f) stored digest must be the one the inputs and outputs derive.

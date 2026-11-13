@@ -72,7 +72,6 @@ type Auction struct {
 	Voids        []string `json:"voids,omitempty"` // late bids, refundable at once (ADR 0007)
 	ClosedAt     int64    `json:"closedAt"`
 	ClosedH      int64    `json:"closedHeight"`
-
 	// Root pinning and supersession (owner decision 2026-11-12, spec §8). The
 	// auction's identity is (seller, d); the FIRST 1440 event for it is the
 	// root and its id is auction_root_event_id. Later 1440 events are
@@ -84,6 +83,13 @@ type Auction struct {
 	VersionID        string `json:"versionId"`        // event id of the canonical (latest accepted) version
 	VersionCreatedAt int64  `json:"versionCreatedAt"` // created_at of that version; gates supersession order
 	DurationSec      int64  `json:"durationSec"`      // frozen duration; EndAt is its materialisation
+	// V4VSplit is the committed value-for-value payout schedule (spec §6). It is
+	// set once, at the create, and is an IMMUTABLE money field (spec §8): no
+	// later event may change it. Each row names a payout recipient and an
+	// integer basis-point share; the seller keeps 10000-sum(allocationBps). The
+	// bidder's pre-signed SETTLE template must carry these exact outputs, so the
+	// money can only reach these recipients (see verifySigAllBidTemplates).
+	V4VSplit []CommittedSplitRow `json:"v4vSplit,omitempty"`
 }
 
 type Bid struct {
@@ -261,6 +267,12 @@ type CreateContent struct {
 	WindowSec    int64  `json:"windowSec"`
 	SellerWallet string `json:"sellerWallet"`
 	Name         string `json:"name"`
+	// V4VSplit is the OPTIONAL committed value-for-value payout schedule (spec
+	// §6). Each row is {role, recipientPubkey, allocationBps}; the seller keeps
+	// the remainder. It is validated by validateV4VSplit, stored immutably on
+	// the auction, and reproduced exactly by the bidder's pre-signed SETTLE
+	// template.
+	V4VSplit []SplitRow `json:"v4vSplit,omitempty"`
 }
 
 type BidContent struct {
@@ -425,6 +437,12 @@ func immutableChanged(cur *Auction, c *CreateContent, mode string) string {
 		return "DurationSec"
 	case strings.ToLower(c.SellerWallet) != cur.SellerWallet:
 		return "SellerWallet"
+	case splitImmutableChanged(cur, c.V4VSplit) != "":
+		// The split is a money field (spec §8). It is checked here, in the one
+		// immutability mechanism, so a supersession that changes who gets paid
+		// is refused by name against the canonical version rather than being
+		// silently accepted and then tripping the bid template check.
+		return "V4VSplit"
 	}
 	return ""
 }
@@ -499,6 +517,12 @@ func (s *State) applyCreate(ev *Event, now, height int64, apply bool) error {
 	case c.Mode != "antisnipe" && c.WindowSec != 0:
 		return errors.New("a fixed-time lot has no anti-snipe window")
 	}
+	// The committed V4V split is optional but, when present, strictly
+	// validated; a malformed split is refused by name (validateV4VSplit).
+	split, err := validateV4VSplit(c.V4VSplit)
+	if err != nil {
+		return err
+	}
 	mode := c.Mode
 	if mode == "" {
 		mode = "fixed"
@@ -521,6 +545,7 @@ func (s *State) applyCreate(ev *Event, now, height int64, apply bool) error {
 			Title: c.Title, Description: c.Description, Image: c.Image, Category: c.Category,
 			StartPrice: c.StartPrice, MinIncrement: c.MinIncrement, CreatedAt: now, CreatedH: height,
 			EndAt: end, Mode: mode, WindowSec: c.WindowSec, Status: "open", Bids: []string{},
+			V4VSplit: split,
 		}
 		s.Order = append(s.Order, coord)
 		return nil

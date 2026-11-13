@@ -137,6 +137,11 @@ type settleCheck struct {
 // template names, and the group signature covers the old escrow and exactly
 // those committed outputs. Nothing here reads a caller-supplied output: the
 // outputs are re-derived from the committed template alone.
+//
+// Destination: a settle with a committed V4V split (spec §6) pays one output per
+// committed row plus the seller remainder, so each output must be locked to ITS
+// committed recipient; a settle with no split, and every refund, stays on the
+// single committed destination from outcomeDue.
 func (s *State) verifySettle(st *settleTx, now int64) (*settleCheck, error) {
 	bid := s.Bids[st.Bid]
 	if bid == nil {
@@ -149,9 +154,22 @@ func (s *State) verifySettle(st *settleTx, now int64) (*settleCheck, error) {
 	if !isCompressedPub(to) {
 		return nil, errors.New("outcome has no committed destination")
 	}
+	au := s.Auctions[bid.Auction]
+	// expected[i] is the committed destination of output i. With no split it is
+	// the single destination repeated; with a split it is the committed row's
+	// recipient (and the seller's remainder last).
+	var expected []string
+	if st.Outcome == "settle" && au != nil && len(au.V4VSplit) > 0 {
+		for _, o := range splitSats(au.SellerWallet, au.V4VSplit, bid.Amount) {
+			expected = append(expected, o.Recipient)
+		}
+	}
 	template, outs, err := s.settlementOutputs(bid, st.Outcome)
 	if err != nil {
 		return nil, err
+	}
+	if len(expected) > 0 && len(expected) != len(outs) {
+		return nil, errors.New("committed split does not match the committed template's outputs")
 	}
 	if len(st.Proofs) == 0 || len(st.Proofs) > maxOutProofs(s.Params) || len(st.Proofs) != len(outs) {
 		return nil, errors.New("settle proofs do not match the committed template")
@@ -182,8 +200,14 @@ func (s *State) verifySettle(st *settleTx, now int64) (*settleCheck, error) {
 		if b != outs[i].B {
 			return nil, errors.New("outcome proof does not blind to the committed output")
 		}
-		// And it must be locked to the committed destination (spec §4).
-		if !s.recipientMatches(pr.Secret, to) {
+		// And it must be locked to the committed destination of THIS output: the
+		// committed split row's recipient, or the single committed destination
+		// (spec §4/§6).
+		dest := to
+		if len(expected) > 0 {
+			dest = expected[i]
+		}
+		if !s.recipientMatches(pr.Secret, dest) {
 			return nil, errors.New("outcome output is not locked to the committed destination")
 		}
 		y, err := proofY(pr.Secret)
