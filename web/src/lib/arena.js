@@ -51,6 +51,26 @@ const keysetOf = (params) => ({ id: params.keysetId, keys: params.keys });
 // NUT-11 SIG_ALL message, as Nutshell 0.21 checks it: each input's secret and C,
 // then each output's amount and B_ (amounts covered: internal audit A6).
 const sigAllHash = (inputs, outputs) => sha256(new TextEncoder().encode(inputs.map((p) => p.secret + p.C).join('') + outputs.map((o) => String(o.amount) + o.B_).join('')));
+// B_ = hash_to_curve(secret) + r*G, the point the mint signs for an output.
+const sigAllOutputPoint = (secret, rHex) => {
+  const Y = secp256k1.Point.fromHex(hashToCurve(new TextEncoder().encode(secret)).toHex(true));
+  const B_ = Y.add(secp256k1.Point.BASE.multiply(BigInt('0x' + rHex)));
+  return bytesToHex(B_.toBytes(true));
+};
+// The layout-B digest of one exact outcome template (inputs secret+C, outputs amount+B_).
+const sigAllTemplateDigest = (t) => bytesToHex(sigAllHash(t.inputs, t.outputs.map((o) => ({ amount: o.amount, B_: sigAllOutputPoint(o.secret, o.r) }))));
+// A NUT-10 P2PK output secret locked to one compressed recipient key.
+const buildP2PKOutputSecret = (recipient, nonce) => JSON.stringify(['P2PK', { nonce, data: recipient, tags: [['sigflag', 'SIG_INPUTS']] }]);
+const signDigest = (digestHex, sk) => bytesToHex(schnorr.sign(hexToBytes(digestHex), sk));
+const hex32 = () => bytesToHex(secp256k1.utils.randomSecretKey());
+// Rebuild the unblinded proofs for an outcome from the committed template: the
+// destination and the opening (secret + r) are the bidder's, not the caller's.
+const unblindCommitted = (template, sigs, params) => template.outputs.map((o, i) => {
+  const s = sigs[i];
+  const A = secp256k1.Point.fromHex(params.keys[String(s.amount)]);
+  const C = secp256k1.Point.fromHex(s.C_).subtract(A.multiply(BigInt('0x' + o.r)));
+  return { id: s.id, amount: s.amount, secret: o.secret, C: bytesToHex(C.toBytes(true)) };
+});
 // Turn the mint's blind signatures into proofs (cashu-ts 5 wants Amount objects).
 const unblind = (outs, sigs, params) => outs.map((o, i) => plain(o.toProof({ ...sigs[i], amount: Amount.from(sigs[i].amount) }, keysetOf(params))));
 const blank = (amount, params) => {
@@ -228,13 +248,18 @@ export class ArenaClient {
     return this.submit(ev);
   }
 
-  // Coco locks `amount` to the validators' FROST group key (one key; 3 of the 4
-  // validators must cooperate to sign for it), SIG_ALL, refundable to the
-  // bidder's own wallet key after locktime.
-  // Locktime (ADR 0009): a fixed lot ends when it says, so its escrows stay
-  // locked until end + margin. An anti-snipe lot has no end in advance: the
-  // lock runs margin from now (chain time `now`) and the validators re-lock a
-  // leading escrow before it gets near.
+  // Coco locks `amount` to a 2-of-2 [bidder, committee] SIG_ALL condition: the
+  // bidder's own wallet key is the first main key, the validators' FROST group
+  // key is the second (one key; 3 of the 4 validators must cooperate to sign
+  // for it), n_sigs = 2, refundable to the bidder's own wallet key after
+  // locktime. cashu-ts emits exactly the canonical five-tag secret for these
+  // options (locktime, pubkeys, n_sigs, refund, sigflag), which is what the
+  // chain's strict parser and the mint both require (spec §1.1).
+  // Locktime (spec §2.1): minLock = max(end, now + window) + settlement_safety
+  // + bid_to_consensus_latency, where `end` is the end THIS bid establishes --
+  // an anti-snipe bid with less than the window left resets the clock to the
+  // window, so the lock must clear now + window + safety + latency, not the old
+  // end.
   async lockForBid(id, amount, params, auction, { force = false, state, now = Date.now() / 1000 } = {}) {
     if (!force) {
       const min = auction.highBid ? auction.highAmount + auction.minIncrement : auction.startPrice;
@@ -247,43 +272,103 @@ export class ArenaClient {
   }
   async lockOnce(id, amount, params, auction, now) {
     const m = await this.coco(id);
-    const locktime = Math.ceil(auction.mode === 'antisnipe' ? now + params.lockMarginSec + 60 : auction.endAt + params.lockMarginSec + 15);
+    const safety = num(params.settlementSafetySec ?? 900);
+    const latency = num(params.bidToConsensusLatencySec ?? 15);
+    // the end this bid establishes: an anti-snipe bid inside the window resets
+    // the clock to the window (chain §3), so the lock must clear now+window.
+    const window = auction.mode === 'antisnipe' ? num(auction.windowSec) : 0;
+    const end = auction.mode === 'antisnipe' ? Math.max(auction.endAt, now + window) : auction.endAt;
+    const locktime = Math.ceil(Math.max(end, now + window) + safety + latency);
     const prep = await m.ops.send.prepare({
       mintUrl: this.mintUrl, amount,
-      target: { type: 'p2pk', options: { kind: 'P2PK', data: params.groupKey, locktime, refundKeys: [walletPub(id)], sigFlag: 'SIG_ALL' } },
+      target: { type: 'p2pk', options: {
+        kind: 'P2PK',
+        data: walletPub(id),                 // first main key: the bidder
+        pubkeys: [params.groupKey],          // the rest: the committee (FROST group key)
+        requiredSignatures: 2,               // n_sigs = 2
+        refundKeys: [walletPub(id)],         // refund branch: the bidder alone, after locktime
+        locktime,
+        sigFlag: 'SIG_ALL',
+      } },
     });
     const { token } = await m.ops.send.execute(prep);
     return { locked: token.proofs.map(plain) };
   }
 
+  // The two exact transactions the bidder pre-signs: settle pays the auction's
+  // committed seller payout key, refund returns to the bidder's own wallet key.
+  // They travel INSIDE the bid content (json `outcome_templates`), so every
+  // validator re-derives each digest and re-checks the bidder's signature at
+  // admission, and the committee can submit one of these two transactions with
+  // the bidder offline -- without ever choosing a destination itself (spec §1.2).
+  buildOutcomeTemplates(id, locked, sellerKey) {
+    const spendKey = hexToBytes(id.walletSk);
+    const build = (recipient) => {
+      if (!/^0[23][0-9a-f]{64}$/.test(recipient)) throw new Error('output recipient must be a compressed secp256k1 key');
+      const inputs = locked.map((p) => ({ amount: num(p.amount), id: p.id, secret: String(p.secret), C: String(p.C) }));
+      const outputs = locked.map((p) => ({ amount: num(p.amount), id: p.id, secret: buildP2PKOutputSecret(recipient, hex32()), r: hex32() }));
+      const unsigned = { inputs, outputs, digest: '', bidder_signature: '' };
+      const digest = sigAllTemplateDigest(unsigned);
+      return { inputs, outputs, digest, bidder_signature: signDigest(digest, spendKey) };
+    };
+    return { settle: build(sellerKey), refund: build(walletPub(id)) };
+  }
+
   async bid(id, auction, amount, locked) {
-    // The bid binds to the auction ROOT, not to the latest version: e =
-    // auction_root_event_id. That is what makes an edit non-destructive — the
-    // bid never referenced the version that changed. We also carry the
-    // coordinate a = 1440:<seller>:<d> so #a filtering stays meaningful.
+    // Two things ride together here: the bid binds to the auction ROOT, not to
+    // the latest version (e = auction_root_event_id), which is what makes an
+    // edit non-destructive — and it carries the bidder's two pre-signed
+    // outcome templates, which is what pins the destinations (spec §1).
     const root = auction.rootId || auction.rootEventId || auction.id;
-    const ev = await this.sign(id, KIND_BID, { auction: auction.id, amount, wallet: walletPub(id), name: id.name, proofs: locked },
+    const content = { auction: auction.id, amount, wallet: walletPub(id), name: id.name, proofs: locked,
+      outcome_templates: this.buildOutcomeTemplates(id, locked, auction.sellerWallet) };
+    const ev = await this.sign(id, KIND_BID, content,
       [['e', root], ...(auction.id && auction.id.includes(':') ? [['a', auction.id]] : [])]);
     const res = await this.submit(ev);
     return { ...res, id: ev.id };
   }
 
-  // Release an escrow (refund to the bidder, or payout to the seller). The
-  // wallet that may receive it authorises the exact outputs; the gateway runs
-  // one FROST round and returns a single aggregated BIP-340 signature, which
-  // the mint checks against the group key like any one-key P2PK lock.
-  async claim(id, bid, purpose, params) {
-    if (!Array.isArray(bid.proofs)) bid = await this.bidWithProofs(bid.id);
-    const { outs, outputs } = blank(bid.amount, params);
-    const auth = bytesToHex(schnorr.sign(sigAllHash(bid.proofs, outputs), hexToBytes(id.walletSk)));
-    let rel;
-    try { rel = await this.j('/api/release', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bid: bid.id, purpose, outputs, auth }) }); }
-    catch (e) { e.refusals = e.body?.refusals; throw e; }
-    const jr = await this.swap(bid.proofs, outputs, [rel.signature]);
+  // Submit one of the two COMMITTED outcome templates. The caller names the bid
+  // and the outcome only -- never outputs (the endpoint is deleted, spec §5).
+  // The gateway runs one FROST round over the committed template and returns a
+  // single aggregated BIP-340 signature; the mint then checks it against the
+  // lock (n_sigs=2 for settle, or the refund branch after locktime).
+  async claim(id, bid, outcome, params) {
+    if (!Array.isArray(bid.proofs) || !bid.outcome_templates) bid = await this.bidWithProofs(bid.id);
+    const template = bid.outcome_templates && bid.outcome_templates[outcome];
+    if (!template) throw new Error(`bid has no committed ${outcome} template`);
+    const outputs = template.outputs.map((o) => ({ amount: o.amount, id: o.id, B_: sigAllOutputPoint(o.secret, o.r) }));
+    const sigs = [template.bidder_signature];
+    let cosigners, refusals;
+    if (outcome === 'settle' || !this.afterLocktime(bid)) {
+      // the committee's half is required; ask for it. After locktime the refund
+      // needs only the bidder, but going through the template is also fine.
+      const rel = await this.submitOutcome(bid.id, outcome);
+      sigs.unshift(rel.signature);
+      cosigners = rel.cosigners; refusals = rel.refusals;
+    }
+    const jr = await this.swap(bid.proofs, outputs, sigs);
     if (!jr.signatures) { const e = new Error(jr.detail || 'mint rejected release'); e.mint = jr; throw e; }
-    const proofs = unblind(outs, jr.signatures, params);
+    const proofs = unblindCommitted(template, jr.signatures, params);
     await this.receive(id, proofs);
-    return { amount: sum(proofs), cosigners: rel.cosigners, refusals: rel.refusals, signature: rel.signature };
+    return { amount: sum(proofs), cosigners, refusals, signature: sigs[0] };
+  }
+
+  afterLocktime(bid) { const lt = num(bid.locktime || 0); return lt > 0 && Date.now() / 1000 >= lt; }
+
+  // The committee's half of a release (FROST round over the bid's COMMITTED
+  // template). The caller names the bid and the outcome only -- never outputs,
+  // and there is no auth: the bidder's half is already inside the template
+  // (spec §5). The gateway relays this to every validator's signer and the
+  // browser assembles the aggregate signature.
+  //
+  // NOTE: this is the automated path the settler uses. A page should normally
+  // NOT need it -- the settler pushes refunds and the payout, so by the time a
+  // bid is due the money has usually already moved. It stays available for the
+  // operations view, which is why the route exists at all.
+  async submitOutcome(bidId, outcome) {
+    try { return await this.j('/api/settle', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bid: bidId, outcome }) }); }
+    catch (e) { e.refusals = e.body?.refusals; throw e; }
   }
 
   async swap(inputs, outputs, signatures) {

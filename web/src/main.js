@@ -350,13 +350,14 @@ async function settleLoop() {
     for (const b of Object.values(S.bids)) {
       if (claimed.has(b.id) || busy.has('c:' + b.id)) continue;
       const au = S.auctions[b.auction];
-      let purpose = null;
-      if (b.bidder === pk && refundable(b)) purpose = 'refund';
-      if (au.seller === pk && b.status === 'won' && au.sellerWallet === walletPub(ids[n])) purpose = 'payout';
-      if (!purpose) continue;
-      // ADR 0009: the validators push refunds and payouts. A settled bid's new
-      // ecash is collected from the chain if the push was missed; the old
-      // pull claim is only the backstop, after 10 s without a push.
+      let outcome = null;
+      if (b.bidder === pk && refundable(b)) outcome = 'refund';
+      if (au.seller === pk && b.status === 'won' && au.sellerWallet === walletPub(ids[n])) outcome = 'settle';
+      if (!outcome) continue;
+      // ADR 0009: the validators push refunds and settles. A settled bid's new
+      // ecash is collected from the chain if the push was missed. There is no
+      // pull release any more (spec §5): the bidder's half is pre-signed, the
+      // committee's is collected automatically.
       if (!b.settled) {
         const since = firstRefundable.get(b.id) || (firstRefundable.set(b.id, Date.now()), Date.now());
         if (Date.now() - since < 10000) continue;
@@ -368,13 +369,13 @@ async function settleLoop() {
           if (claimed.has(b.id) || !full.out?.length) continue;
           await api.receive(ids[n], full.out);
           claimed.add(b.id); await refreshBal(n);
-          ledger(n, b.settled === 'payout' ? 'pay' : 'refund', b.amount, `${b.settled === 'payout' ? 'Payout' : 'Refund'} · pushed by the validators (collected)`);
+          ledger(n, b.settled === 'settle' ? 'pay' : 'refund', b.amount, `${b.settled === 'settle' ? 'Payout' : 'Refund'} · pushed by the validators (collected)`);
           saveW(); continue;
         }
-        const r = await api.claim(ids[n], b, purpose, S.params);
+        const r = await api.claim(ids[n], b, outcome, S.params);
         claimed.add(b.id); await refreshBal(n);
         const who = r.cosigners.map((v) => v.replace('Validator ', 'V')).join(', ');
-        if (purpose === 'refund') {
+        if (outcome === 'refund') {
           ledger(n, 'refund', b.amount, `Refund · FROST signature by ${who}`);
           if (n === ui.me) {
             const by = au.highBid && S.bids[au.highBid] ? nameOfBid(S.bids[au.highBid]) : 'the winner';
@@ -535,7 +536,7 @@ function renderFrame() {
     setV('bidders', String(new Set(bs.map((b) => b.bidder)).size));
     setV('extensionsn', a.mode === 'antisnipe' ? String(a.extensions) : '–');
     setV('resetslabel', a.mode === 'antisnipe' ? 'clock resets' : 'fixed time, no resets');
-    setV('escrownote', `Bids lock ecash to one FROST key the 4 validators share; any 3 can sign. Outbid? The validators sign and push your refund at once; the winner's sats go to the seller the moment the clock hits zero. Fallback: ${a.mode === 'antisnipe' ? 'while the clock keeps resetting the validators re-lock the leading bid, and you can reclaim alone after its locktime' : `you can reclaim alone after ${clock(a.endAt + S.params.lockMarginSec + 15)}`}.`);
+    setV('escrownote', `Bids lock ecash 2-of-2: your own key AND the 4 validators' shared FROST key must both sign (spec §1). You pre-sign a settle (to the seller) and a refund (to you) at bid time, so only those two destinations are reachable. Outbid? the validators co-sign your refund. Fallback: you can reclaim alone after locktime.`);
     const r = remaining(a);
     $$('[data-urgent]').forEach((el) => { el.classList.toggle('urgent', live && r < 10); el.classList.toggle('ended', !live); });
     document.body.classList.toggle('is-ended', !live);
@@ -758,7 +759,7 @@ async function onSettled(d) {
     const ms = d.ms ? ` · ${d.ms.total} ms` : '';
     const amt = (d.proofs || []).reduce((s, p) => s + p.amount, 0);
     const b = S?.bids[d.bid], au = S?.auctions[d.auction];
-    if (d.move === 'payout') {
+    if (d.outcome === 'settle') {
       ledger(n, 'pay', amt, `Payout for “${short(au?.title || '', 26)}” · pushed, FROST ${who}${ms}`);
       if (n === ui.me) { toast(`Payout <b>${fmt(amt)}</b> sats pushed to your wallet · ${who}${ms}`, 'good'); flyCoins($('.c-price'), 10); }
     } else {

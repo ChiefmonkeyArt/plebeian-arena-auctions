@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -310,22 +309,6 @@ func parseP2PK(secret string) (*p2pkLock, error) {
 		}
 	}
 	return l, nil
-}
-
-func sameSet(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	x := append([]string{}, a...)
-	y := append([]string{}, b...)
-	sort.Strings(x)
-	sort.Strings(y)
-	for i := range x {
-		if x[i] != y[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // schnorrVerifyMsg verifies a BIP340 signature over sha256(msg) by a 02/03-prefixed or x-only key.

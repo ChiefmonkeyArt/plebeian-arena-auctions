@@ -3,19 +3,32 @@ package main
 // Regression tests for the internal security audit (docs/SECURITY_AUDIT_2026-11-10.md).
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/btcsuite/btcd/btcec/v2"
 )
 
 var (
-	tG = "02" + strings.Repeat("11", 32)
-	tW = "02" + strings.Repeat("33", 32)
+	// Real secp256k1 points: the strict 2-of-2 parser compares x-only keys, so
+	// a fake hex string is not a key (spec §1.4). tG stands in for the
+	// committee (FROST group) key, tW for a bidder's wallet key.
+	tG = hex.EncodeToString(mulG(new(btcec.ModNScalar).SetInt(13)).SerializeCompressed())
+	tW = hex.EncodeToString(mulG(new(btcec.ModNScalar).SetInt(17)).SerializeCompressed())
 )
 
-func auditState() *State { return &State{Params: Params{GroupKey: tG, LockMarginSec: 30}} }
+func auditState() *State {
+	return &State{Params: Params{GroupKey: tG, SettlementSafetySec: 900, BidToConsensusLatencySec: 15}}
+}
 
-const goodLock = `["P2PK",{"nonce":"aa","data":"021111111111111111111111111111111111111111111111111111111111111111","tags":[["locktime","9999999999"],["refund","023333333333333333333333333333333333333333333333333333333333333333"],["sigflag","SIG_ALL"]]}]`
+// goodLock is the canonical 2-of-2 [bidder, committee] SIG_ALL lock: data =
+// the bidder (tW), pubkeys = [committee] (tG), n_sigs 2, refund = the bidder
+// alone, SIG_ALL, five tags in canonical order (spec §1.1).
+var goodLock = `["P2PK",{"nonce":"` + strings.Repeat("aa", 32) +
+	`","data":"` + tW + `","tags":[["locktime","9999999999"],["pubkeys","` + tG +
+	`"],["n_sigs","2"],["refund","` + tW + `"],["sigflag","SIG_ALL"]]}]`
 
 func TestA1GoodLockAccepted(t *testing.T) {
 	if _, err := auditState().checkLock([]Proof{{Secret: goodLock}}, tW, 1000); err != nil {
@@ -24,24 +37,22 @@ func TestA1GoodLockAccepted(t *testing.T) {
 }
 
 // A1: each of these was read one way by the validators and another way by
-// the mint (Nutshell). All must now be refused.
+// the mint (Nutshell). All must now be refused by the strict 2-of-2 parser.
 func TestA1ParserDifferentialsRejected(t *testing.T) {
 	cases := map[string]string{
-		"case-variant data key": `["P2PK",{"nonce":"aa","data":"032222222222222222222222222222222222222222222222222222222222222222","Data":"021111111111111111111111111111111111111111111111111111111111111111","tags":[["locktime","9999999999"],["refund","023333333333333333333333333333333333333333333333333333333333333333"],["sigflag","SIG_ALL"]]}]`,
-		"case-variant tags key": `["P2PK",{"nonce":"aa","data":"021111111111111111111111111111111111111111111111111111111111111111","tags":[["locktime","1"],["refund","023333333333333333333333333333333333333333333333333333333333333333"]],"Tags":[["locktime","9999999999"],["refund","023333333333333333333333333333333333333333333333333333333333333333"],["sigflag","SIG_ALL"]]}]`,
-		"duplicate locktime":    `["P2PK",{"nonce":"aa","data":"021111111111111111111111111111111111111111111111111111111111111111","tags":[["locktime","1"],["locktime","9999999999"],["refund","023333333333333333333333333333333333333333333333333333333333333333"],["sigflag","SIG_ALL"]]}]`,
-		"duplicate sigflag":     `["P2PK",{"nonce":"aa","data":"021111111111111111111111111111111111111111111111111111111111111111","tags":[["sigflag","SIG_INPUTS"],["sigflag","SIG_ALL"],["locktime","9999999999"],["refund","023333333333333333333333333333333333333333333333333333333333333333"]]}]`,
-		"duplicate data key":    `["P2PK",{"nonce":"aa","data":"032222222222222222222222222222222222222222222222222222222222222222","data":"021111111111111111111111111111111111111111111111111111111111111111","tags":[["locktime","9999999999"],["refund","023333333333333333333333333333333333333333333333333333333333333333"],["sigflag","SIG_ALL"]]}]`,
+		"case-variant data key": `["P2PK",{"nonce":"` + repeat("aa", 32) + `","data":"` + tG + `","Data":"` + tW + `","tags":[["locktime","9999999999"],["pubkeys","` + tG + `"],["n_sigs","2"],["refund","` + tW + `"],["sigflag","SIG_ALL"]]}]`,
+		"case-variant tags key": `["P2PK",{"nonce":"` + repeat("aa", 32) + `","data":"` + tW + `","tags":[["locktime","1"],["refund","` + tW + `"]],"Tags":[["locktime","9999999999"],["pubkeys","` + tG + `"],["n_sigs","2"],["refund","` + tW + `"],["sigflag","SIG_ALL"]]}]`,
+		"duplicate locktime":    strings.Replace(goodLock, `["locktime","9999999999"]`, `["locktime","9999999999"],["locktime","1"]`, 1),
+		"duplicate data key":    strings.Replace(goodLock, `"data":`, `"data":"`+tG+`","data":`, 1),
 		"escaped string":        strings.Replace(goodLock, `"SIG_ALL"`, `"SIG\u005fALL"`, 1),
-		"unknown key":           strings.Replace(goodLock, `"nonce":"aa"`, `"nonce":"aa","extra":1`, 1),
+		"unknown key":           strings.Replace(goodLock, `"nonce":`, `"extra":1,"nonce":`, 1),
 		"two-value locktime":    strings.Replace(goodLock, `["locktime","9999999999"]`, `["locktime","9999999999","1"]`, 1),
 		"padded locktime":       strings.Replace(goodLock, `"9999999999"`, `"09999999999"`, 1),
-		"uppercase data":        strings.Replace(goodLock, `"data":"0211`, `"data":"02AA`, 1),
+		"uppercase data":        strings.Replace(goodLock, `"data":"`+tW+`"`, `"data":"`+strings.ToUpper(tW)+`"`, 1),
 		"missing sigflag":       strings.Replace(goodLock, `,["sigflag","SIG_ALL"]`, ``, 1),
-		"missing refund":        strings.Replace(goodLock, `,["refund","023333333333333333333333333333333333333333333333333333333333333333"]`, ``, 1),
-		"pubkeys tag":           strings.Replace(goodLock, `["sigflag","SIG_ALL"]`, `["sigflag","SIG_ALL"],["pubkeys","023333333333333333333333333333333333333333333333333333333333333333"]`, 1),
+		"missing n_sigs":        strings.Replace(goodLock, `,["n_sigs","2"]`, ``, 1),
 		"trailing data":         goodLock + ` []`,
-		"invalid utf8":          strings.Replace(goodLock, `"aa"`, "\"a\xff\"", 1),
+		"invalid utf8":          strings.Replace(goodLock, `"nonce":"aaaa`, "\"nonce\":\"a\xffaa", 1),
 	}
 	for name, sec := range cases {
 		if _, err := auditState().checkLock([]Proof{{Secret: sec}}, tW, 1000); err == nil {

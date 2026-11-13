@@ -159,7 +159,7 @@ func TestViewETagIgnoresHeightButNotChanges(t *testing.T) {
 
 func TestCommitSerialisesOnceAndHashMatches(t *testing.T) {
 	a := NewApp()
-	p, _ := json.Marshal(Params{GroupKey: tG, LockMarginSec: 30})
+	p, _ := json.Marshal(Params{GroupKey: tG, SettlementSafetySec: 900, BidToConsensusLatencySec: 15})
 	if _, err := a.InitChain(context.Background(), &abci.InitChainRequest{AppStateBytes: p}); err != nil {
 		t.Fatal(err)
 	}

@@ -37,8 +37,9 @@ type Params struct {
 	// BidToConsensusLatencySec covers the gap between the bidder's clock and
 	// the block that admits the bid (spec §2.1). It replaces lockGraceSec.
 	BidToConsensusLatencySec int64 `json:"bidToConsensusLatencySec"`
-	// LockMarginSec is retired as a lock driver: settlement_safety is the lock
-	// rule now (spec §10). Kept for the CLI flag's meaning in existing config.
+	// LockMarginSec is retired as a lock driver: SettlementSafetySec is the
+	// lock rule now (spec §10). It is kept only so an older genesis still
+	// parses; it drives nothing.
 	LockMarginSec  int64 `json:"lockMarginSec,omitempty"`
 	MinDurationSec int64 `json:"minDurationSec"`
 	MaxDurationSec int64 `json:"maxDurationSec"`
@@ -62,13 +63,12 @@ type Auction struct {
 	EndAt        int64    `json:"endAt"`
 	Mode         string   `json:"mode"`      // fixed | antisnipe (ADR 0009)
 	WindowSec    int64    `json:"windowSec"` // antisnipe: a bid with less than this left resets the clock to it
-	Status       string   `json:"status"` // open | closed
+	Status       string   `json:"status"`    // open | closed
 	HighBid      string   `json:"highBid"`
 	HighAmount   int64    `json:"highAmount"`
 	Bids         []string `json:"bids"`
 	Extensions   int      `json:"extensions"`
 	Winner       string   `json:"winner"`          // bid id
-	Expired      bool     `json:"expired,omitempty"` // antisnipe ran so long the leading escrow neared its locktime: no sale
 	Voids        []string `json:"voids,omitempty"` // late bids, refundable at once (ADR 0007)
 	ClosedAt     int64    `json:"closedAt"`
 	ClosedH      int64    `json:"closedHeight"`
@@ -99,10 +99,15 @@ type Bid struct {
 	Time     int64   `json:"time"`
 	Status   string  `json:"status"` // leading | outbid | won | lost | void
 	Extended bool    `json:"extended"`
+	// The bidder's two pre-signed outcome transactions, carried verbatim in
+	// the committed bid (spec §1.2/§2). Every validator re-derives each
+	// template's digest and re-checks the bidder's signature at admission, so
+	// the chain verifies the only two spends the escrow may ever make. A
+	// template that re-locks to the committee key is forbidden (spec §4).
+	OutcomeTemplates *sigAllOutcomeTemplates `json:"outcome_templates,omitempty"`
 	// Push settlement (ADR 0009): the validators moved the escrow themselves.
 	Settled string  `json:"settled,omitempty"` // refund | payout, once the new ecash is minted
 	Out     []Proof `json:"out,omitempty"`     // that ecash, P2PK-locked to the recipient
-	Relocks int     `json:"relocks,omitempty"` // antisnipe: escrow re-locked with a later locktime
 }
 
 type Rejection struct {
@@ -179,7 +184,7 @@ type App struct {
 	appHash    []byte
 	// hash of committed; Info reports it with committedH (ADR 0003 §2)
 	committedHash []byte
-	snap          *snapshotter // nil: no snapshots (tests)
+	snap          *snapshotter  // nil: no snapshots (tests)
 	commitCh      chan struct{} // closed and replaced at every Commit (for /height?after=)
 }
 
@@ -264,6 +269,10 @@ type BidContent struct {
 	Wallet  string  `json:"wallet"`
 	Name    string  `json:"name"`
 	Proofs  []Proof `json:"proofs"`
+	// The bidder's pre-signed settle and refund transactions (spec §1.2). The
+	// chain refuses a bid without them, and refuses any template not locked to
+	// the committed seller (settle) or the bidder (refund) keys.
+	OutcomeTemplates *sigAllOutcomeTemplates `json:"outcome_templates,omitempty"`
 }
 
 // closeTx is the validators' own "close what is due" transaction (ADR 0003
@@ -544,51 +553,56 @@ func (s *State) applyCreate(ev *Event, now, height int64, apply bool) error {
 	return nil
 }
 
-// lockGraceSec: an anti-snipe bid's locktime is checked against the block
-// time, which the bidder can only estimate, so it may fall this short.
-const lockGraceSec = 30
-
-// minLocktime is the earliest refund locktime a bid on au may carry at block
-// time now. Fixed lots never move their end, so the lock covers end+margin.
-// Anti-snipe lots have no end in advance: the lock covers margin from now and
-// the validators re-lock a leading escrow before it gets close (ADR 0009).
-func (s *State) minLocktime(au *Auction, now int64) int64 {
-	if au.Mode == "antisnipe" {
-		return now + s.Params.LockMarginSec - lockGraceSec
+// establishedEnd is the end time a bid establishes, given whether it extends.
+// For an antisnipe bid that arrives with less than WindowSec left, the lot's
+// end becomes now+WindowSec (see applyBid), so THAT is the end the bid's
+// locktime must clear. For a fixed lot, and for an antisnipe bid that does not
+// extend, it is the lot's current EndAt.
+func (s *State) establishedEnd(au *Auction, now int64, extends bool) int64 {
+	if extends {
+		return now + au.WindowSec
 	}
-	return au.EndAt + s.Params.LockMarginSec
+	if au.Mode == "antisnipe" && au.EndAt < now+au.WindowSec {
+		// The bid arrives inside the window: it wins the extension, so treat
+		// the new end as established even before applyBid commits it.
+		return now + au.WindowSec
+	}
+	return au.EndAt
 }
 
-// checkLock enforces the 3-of-4 validator lock with the bidder's refund path.
-func (s *State) checkLock(proofs []Proof, wallet string, minLock int64) (int64, error) {
-	p := s.Params
-	var firstTags string
-	var lt int64
-	for i, pr := range proofs {
-		l, err := parseP2PK(pr.Secret)
-		if err != nil {
-			return 0, err
-		}
-		if l.Data != strings.ToLower(p.GroupKey) || len(l.Pubkeys) != 0 || l.NSigs != 1 {
-			return 0, errors.New("proofs not locked to the validators' FROST group key")
-		}
-		if l.SigFlag != "SIG_ALL" {
-			return 0, errors.New("lock must use SIG_ALL")
-		}
-		if len(l.Refund) != 1 || l.Refund[0] != wallet {
-			return 0, errors.New("refund path must be the bidder's wallet key only")
-		}
-		if l.Locktime < minLock {
-			return 0, errors.New("locktime too early: validators need time to settle")
-		}
-		if i == 0 {
-			firstTags = l.TagsJSON
-			lt = l.Locktime
-		} else if l.TagsJSON != firstTags {
-			return 0, errors.New("all proofs must share one lock")
-		}
+// minLocktime is the earliest refund locktime a bid on au may carry at block
+// time now, derived from the end THIS bid establishes (spec §2.1/§2.2):
+//
+//	minLocktime = max(establishedEnd, now + WindowSec)
+//	            + SettlementSafetySec + BidToConsensusLatencySec
+//
+// It MUST be evaluated against the post-extension end: checking before the
+// extension would validate an extending bid against the OLD end and collapse
+// the post-end safety margin from SettlementSafetySec to as little as
+// BidToConsensusLatencySec (spec §2.2).
+func (s *State) minLocktime(au *Auction, now int64) int64 {
+	end := s.establishedEnd(au, now, au.Mode == "antisnipe" && au.EndAt-now < au.WindowSec)
+	floor := end
+	// The now+WindowSec term guarantees an anti-snipe bid carries at least a
+	// full window of lock after the moment it extends the end. A fixed lot has
+	// no window (WindowSec is 0 and its end never moves), so the term is
+	// vacuous and the floor is the lot's own end.
+	if au.Mode == "antisnipe" && now+au.WindowSec > floor {
+		floor = now + au.WindowSec
 	}
-	return lt, nil
+	return floor + s.Params.SettlementSafetySec + s.Params.BidToConsensusLatencySec
+}
+
+// checkLock enforces the 2-of-2 [bidder, committee] SIG_ALL escrow lock (spec
+// §1): the bidder's wallet key is the first main key, the committee (FROST
+// group) key is the pubkeys entry, n_sigs is 2, SIG_ALL, refund to the bidder
+// alone, exactly five canonical tags, and the locktime clears minLock -- which
+// minLocktime derives from the end this bid establishes, not the old one.
+func (s *State) checkLock(proofs []Proof, wallet string, minLock int64) (int64, error) {
+	if len(proofs) == 0 {
+		return 0, errors.New("all proofs must share one lock")
+	}
+	return checkSigAllLock(proofs, wallet, s.Params.GroupKey, minLock)
 }
 
 func lower(a []string) []string {
@@ -673,6 +687,13 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 	if err != nil {
 		return err
 	}
+	// The bidder's pre-signed outcome templates: consensus verifies the only
+	// two spends the escrow may ever make (spec §1.2). A bid without them, or
+	// with a template not locked to the committed seller/bidder keys, is
+	// refused by name -- there is no fallback and no server-side synthesis.
+	if err := verifySigAllBidTemplates(au, &b, s.Params); err != nil {
+		return err
+	}
 	// 2. Did it lose a race? Then it is late: recorded as void, refundable now.
 	var late error
 	min := au.StartPrice
@@ -696,7 +717,8 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 		return late
 	}
 	bid := &Bid{ID: ev.ID, Auction: au.ID, Bidder: ev.Pubkey, Name: b.Name, Wallet: wallet, Amount: b.Amount,
-		Proofs: b.Proofs, Locktime: lt, Height: height, Time: now, Status: "leading"}
+		Proofs: b.Proofs, Locktime: lt, Height: height, Time: now, Status: "leading",
+		OutcomeTemplates: b.OutcomeTemplates}
 	s.Bids[ev.ID] = bid
 	for _, y := range ys {
 		s.UsedY[y] = ev.ID
@@ -722,26 +744,15 @@ func (s *State) applyBid(ev *Event, now, height int64, apply, timed bool) error 
 	return nil
 }
 
-// expiring: an anti-snipe lot's leading escrow is within a quarter of the
-// lock margin of its locktime, so no relock has landed in time.
-func (s *State) expiring(au *Auction, now int64) bool {
-	return au.Mode == "antisnipe" && au.HighBid != "" && s.Bids[au.HighBid].Locktime-now < s.Params.LockMarginSec/4
-}
-
+// closeDue closes every open lot whose end has passed. There is no no-sale
+// path and no expiry: an anti-snipe lot ends when the bidding stops, and a
+// lock may be arbitrarily long -- it freezes only the bidder's own funds
+// (spec §2.3), and the last-resort refund simply arrives later.
 func (s *State) closeDue(now, height int64) {
 	ids := append([]string{}, s.Order...)
 	sort.Strings(ids)
 	for _, id := range ids {
 		au := s.Auctions[id]
-		if au.Status == "open" && now < au.EndAt && s.expiring(au, now) {
-			// the leading escrow is near the point where its bidder could take
-			// it back alone (no relock landed): close with no sale, refund all
-			au.Status, au.ClosedAt, au.ClosedH, au.Expired = "closed", now, height, true
-			for _, bid := range au.Bids {
-				s.Bids[bid].Status = "lost"
-			}
-			continue
-		}
 		if au.Status == "open" && now >= au.EndAt {
 			au.Status, au.ClosedAt, au.ClosedH = "closed", now, height
 			if au.HighBid != "" {
@@ -804,7 +815,7 @@ func (a *App) checkClose(c *closeTx, now int64) *abci.CheckTxResponse {
 	switch {
 	case au == nil || au.Status != "open" || au.EndAt != c.EndAt:
 		return &abci.CheckTxResponse{Code: 3, Log: "nothing to close"}
-	case c.EndAt > now && !a.st.expiring(au, now):
+	case c.EndAt > now:
 		return &abci.CheckTxResponse{Code: 3, Log: "not due yet"}
 	case c.Sent < now-30 || c.Sent > now+5:
 		return &abci.CheckTxResponse{Code: 3, Log: "stale close"}
@@ -837,7 +848,7 @@ func (a *App) FinalizeBlock(_ context.Context, req *abci.FinalizeBlockRequest) (
 			s.applySettle(st, v)
 			s.TxCount++
 			res[i] = &abci.ExecTxResult{Code: 0}
-			lines = append(lines, ledgerLine{Height: req.Height, Time: now, Event: st.Bid, Result: "settled", Reason: st.Move, Tx: json.RawMessage(tx[len(settlePrefix):])})
+			lines = append(lines, ledgerLine{Height: req.Height, Time: now, Event: st.Bid, Result: "settled", Reason: st.Outcome, Tx: json.RawMessage(tx[len(settlePrefix):])})
 			continue
 		}
 		ev, err := decodeTx(tx)

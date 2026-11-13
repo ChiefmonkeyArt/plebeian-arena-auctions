@@ -355,12 +355,25 @@ func cmdGateway(args []string) {
 		return resp.StatusCode, nil
 	})
 	check(err)
-	// push settlement (ADR 0009): refunds, payouts and relocks the moment
-	// they are due. ARENA_PUSH=0 turns it off (pull release only).
+	// push settlement (ADR 0009, spec §5): refunds and settles the moment they
+	// are due, over the bid's committed outcome templates. The settler is an
+	// executor: it names the bid and the outcome and submits the bidder's own
+	// pre-signed template.
 	if os.Getenv("ARENA_PUSH") != "0" {
 		go newSettler(rc, *mint, sup.running, hub, filepath.Join(filepath.Dir(*root), "settle-journal.jsonl")).run()
 	}
-	mu.HandleFunc("/api/release", func(w http.ResponseWriter, r *http.Request) {
+
+	// The committee's half of a release, for the operations view and for any
+	// page that outlives the settler: run one FROST round over the bid's
+	// COMMITTED outcome template and return the aggregate signature. The caller
+	// names the bid and the outcome and nothing else -- there are no
+	// caller-chosen outputs and no auth field (spec §5), because under the
+	// 2-of-2 the destination is already fixed by the bidder's own signature.
+	//
+	// This is NOT the product path: the settler pushes refunds and the payout
+	// automatically off committed blocks. It exists so a page or an operator
+	// can still finish a move when the settler is behind.
+	mu.HandleFunc("/api/settle", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, 405, map[string]string{"error": "POST only"})
 			return

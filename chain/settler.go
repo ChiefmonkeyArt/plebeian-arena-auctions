@@ -1,25 +1,29 @@
 package main
 
-// The gateway's settler (ADR 0009, v0.5.0): the moment a block makes an
-// escrow move due (a refund, the winner's payout, an anti-snipe relock), it
-// asks the validators for one FROST signature, swaps the escrow at the mint
-// into new ecash locked to the recipient's wallet key, pushes that ecash to
-// the page over the event stream and records it on chain with a settle tx.
+// The gateway's settler (ADR 0009, v0.5.0; 2-of-2 rework, spec §5): the moment
+// a block makes an escrow move due (a refund, the winner's settle), it asks
+// the validators for one FROST signature over the bid's COMMITTED outcome
+// template, swaps the escrow at the mint into that template's own outputs,
+// pushes the new ecash to the page over the event stream and records it on
+// chain with a settle tx.
 //
-// The settler holds no key. Every validator checks the move against its own
-// copy of the chain and recomputes each blinded output from the revealed
-// secret, so the most a broken gateway can do is delay a settlement: the
-// bidder's locktime refund path and the pull release stay as fallbacks.
+// The settler is an EXECUTOR, not an author. It builds no outputs and chooses
+// no destination: the outputs are the bidder's, fixed by its pre-signature in
+// the committed template. It names the bid and the outcome (settle|refund);
+// every validator re-derives the committed template's outputs from its own
+// copy of the chain and signs that exact digest, so the most a broken gateway
+// can do is DELAY a settlement. The old pull-release endpoint is gone (spec §5):
+// the bidder's half is already pre-signed, and the committee's half is
+// collected automatically, so there is nothing for a page to request.
 //
-// Crash safety: every attempt is journalled (outputs, secrets, blinding
-// factors) before the mint swap. If the swap went through but the gateway
-// died before it saw the answer, the mint's restore endpoint (NUT-09) gives
-// back the same blind signatures for the journalled outputs.
+// Crash safety: every attempt is journalled (the committed template's outputs,
+// secrets, blinding factors, and the bidder signature) before the mint swap.
+// If the swap went through but the gateway died before it saw the answer, the
+// mint's restore endpoint (NUT-09) gives back the same blind signatures.
 
 import (
 	"bufio"
 	"bytes"
-	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -28,18 +32,15 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/btcsuite/btcd/btcec/v2"
 )
 
 const settleWorkers = 4
 
-// backoff: an escrow that failed to settle (say its owner pulled it first,
+// backoff: an escrow that failed to settle (say its owner already spent it,
 // or the mint is down) is retried after 5 s, 10 s, 20 s ... up to 10 min,
 // so a stuck escrow does not cost a mint request every block.
 type backoff struct {
@@ -47,16 +48,20 @@ type backoff struct {
 	next time.Time
 }
 
+// settleAttempt journals one submission of a committed outcome template. The
+// outputs and their openings are the template's own; the bidder signature is
+// the one carried in the committed bid.
 type settleAttempt struct {
-	Bid     string       `json:"bid"`
-	Move    string       `json:"move"`
-	To      string       `json:"to"`
-	Auction string       `json:"auction,omitempty"`
-	Outputs []SignOutput `json:"outputs"`
-	Reveal  []Reveal     `json:"reveal"`
-	Sig     string       `json:"sig,omitempty"`
-	Proofs  []Proof      `json:"proofs,omitempty"` // set once unblinded
-	At      int64        `json:"at"`
+	Bid       string       `json:"bid"`
+	Outcome   string       `json:"outcome"`
+	To        string       `json:"to"`
+	Auction   string       `json:"auction,omitempty"`
+	Outputs   []SignOutput `json:"outputs"`          // the committed template's outputs (recomputed B_)
+	Reveal    []Reveal     `json:"reveal"`           // their secrets and openings, from the committed template
+	BidderSig string       `json:"bidder_sig"`       // the bidder's pre-signature over the committed digest
+	Sig       string       `json:"sig,omitempty"`    // the committee's FROST signature
+	Proofs    []Proof      `json:"proofs,omitempty"` // set once unblinded
+	At        int64        `json:"at"`
 }
 
 type settler struct {
@@ -204,19 +209,45 @@ func (s *settler) sweep() {
 			}
 			s.mu.Unlock()
 			if err != nil {
-				log.Printf("settle %s %s: %v", it.Move, it.Bid.ID[:12], err)
+				log.Printf("settle %s %s: %v", it.Outcome, it.Bid.ID[:12], err)
 			}
 		}()
 	}
 }
 
-// settle moves one due escrow end to end.
+// templateMaterial turns the bid's committed outcome template into the exact
+// outputs and openings the swap needs, plus the bidder's pre-signature. If the
+// bid carries no such template (an old-shape bid) the move is refused: the
+// settler never builds an output of its own.
+func (s *settler) templateMaterial(bid *Bid, outcome string) ([]SignOutput, []Reveal, string, error) {
+	template, err := sigAllTemplateNamed(bid.OutcomeTemplates, outcome)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	outs := make([]SignOutput, 0, len(template.Outputs))
+	reveal := make([]Reveal, 0, len(template.Outputs))
+	for i, o := range template.Outputs {
+		point, err := sigAllOutputPoint(o.Secret, o.R)
+		if err != nil {
+			return nil, nil, "", fmt.Errorf("committed template output %d: %w", i, err)
+		}
+		outs = append(outs, SignOutput{Amount: o.Amount, ID: o.ID, B: point})
+		reveal = append(reveal, Reveal{Secret: o.Secret, R: o.R})
+	}
+	if len(outs) == 0 {
+		return nil, nil, "", errors.New("committed template has no outputs")
+	}
+	return outs, reveal, template.BidderSignature, nil
+}
+
+// settle moves one due escrow end to end: submit the committed template, take
+// the committee's FROST half, swap at the mint with BOTH signatures, record.
 func (s *settler) settle(it dueMove, height int64) error {
 	t0 := time.Now()
 	s.mu.Lock()
 	d := s.done[it.Bid.ID]
 	s.mu.Unlock()
-	if d != nil && d.Move == it.Move && (d.Move != "relock" || !sameProofs(d.Proofs, it.Bid.Proofs)) {
+	if d != nil && d.Outcome == it.Outcome {
 		// already minted, the settle tx just has not landed yet
 		return s.submit(d)
 	}
@@ -225,24 +256,28 @@ func (s *settler) settle(it dueMove, height int64) error {
 	if spent, _ := s.spent(it.Bid.Proofs); spent {
 		return s.recover(it)
 	}
-	a, err := s.build(it, time.Now().Unix())
+	outs, reveal, bidderSig, err := s.templateMaterial(it.Bid, it.Outcome)
 	if err != nil {
 		return err
 	}
+	a := &settleAttempt{Bid: it.Bid.ID, Outcome: it.Outcome, To: it.To, Auction: it.Bid.Auction,
+		Outputs: outs, Reveal: reveal, BidderSig: bidderSig, At: time.Now().Unix()}
 	if err := s.write(a); err != nil {
 		return fmt.Errorf("journal: %w", err)
 	}
 	s.mu.Lock()
 	s.tries[a.Bid] = append(s.tries[a.Bid], a)
 	s.mu.Unlock()
-	req, _ := json.Marshal(SignReq{Bid: a.Bid, Purpose: "push", Move: a.Move, Outputs: a.Outputs, Reveal: a.Reveal, Height: height})
+	// The settler names the bid and the outcome only; the validators derive the
+	// outputs from the committed template themselves (spec §5).
+	req, _ := json.Marshal(SignReq{Bid: a.Bid, Outcome: a.Outcome, Height: height})
 	code, res := s.rc.release(req)
 	tFrost := time.Since(t0)
 	if code != 200 || res.Signature == "" {
 		return fmt.Errorf("validators refused (%d): %s %v", code, res.Error, res.Refusals)
 	}
 	a.Sig = res.Signature
-	sigs, err := s.swap(it.Bid.Proofs, a.Outputs, a.Sig)
+	sigs, err := s.swap(it.Bid.Proofs, a.Outputs, a.BidderSig, a.Sig)
 	tMint := time.Since(t0) - tFrost
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "spent") {
@@ -255,70 +290,6 @@ func (s *settler) settle(it dueMove, height int64) error {
 	}
 	s.announce(a, map[string]int64{"frost": tFrost.Milliseconds(), "mint": tMint.Milliseconds(), "total": time.Since(t0).Milliseconds()}, res.Cosigners)
 	return s.submit(a)
-}
-
-// build makes the new outputs: the escrow's amount split into powers of two,
-// each locked to the recipient (or, for a relock, to the escrow lock again
-// with a fresh locktime), with a random blinding factor.
-func (s *settler) build(it dueMove, now int64) (*settleAttempt, error) {
-	a := &settleAttempt{Bid: it.Bid.ID, Move: it.Move, To: it.To, Auction: it.Bid.Auction, At: now}
-	var tags [][]string
-	if it.Move == "relock" {
-		lt := now + s.p.LockMarginSec
-		tags = [][]string{{"sigflag", "SIG_ALL"}, {"locktime", strconv.FormatInt(lt, 10)}, {"refund", it.Bid.Wallet}}
-	} else {
-		tags = [][]string{}
-	}
-	amts := splitAmount(it.Bid.Amount, s.p.Keys)
-	if amts == nil {
-		return nil, errors.New("amount cannot be split into the keyset's denominations")
-	}
-	for _, amt := range amts {
-		nonce := make([]byte, 32)
-		rb := make([]byte, 32)
-		if _, err := rand.Read(nonce); err != nil {
-			return nil, err
-		}
-		var r btcec.ModNScalar
-		for {
-			if _, err := rand.Read(rb); err != nil {
-				return nil, err
-			}
-			if overflow := r.SetByteSlice(rb); !overflow && !r.IsZero() {
-				break
-			}
-		}
-		body, _ := json.Marshal(map[string]any{"nonce": hex.EncodeToString(nonce), "data": it.To, "tags": tags})
-		secret := `["P2PK",` + string(body) + `]`
-		rh := hex.EncodeToString(rb)
-		B, err := blinded(secret, rh)
-		if err != nil {
-			return nil, err
-		}
-		a.Outputs = append(a.Outputs, SignOutput{Amount: amt, ID: s.p.KeysetID, B: B})
-		a.Reveal = append(a.Reveal, Reveal{Secret: secret, R: rh})
-	}
-	return a, nil
-}
-
-// splitAmount writes n as a sum of the keyset's powers of two (largest
-// first); nil when it cannot.
-func splitAmount(n int64, keys map[string]string) []int64 {
-	var out []int64
-	for bit := int64(1) << 62; bit > 0; bit >>= 1 {
-		if n&bit == 0 {
-			continue
-		}
-		if _, ok := keys[strconv.FormatInt(bit, 10)]; !ok {
-			return nil
-		}
-		out = append(out, bit)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	if len(out) == 0 {
-		return nil
-	}
-	return out
 }
 
 type blindSig struct {
@@ -345,7 +316,11 @@ func (s *settler) post(path string, body any, out any) (int, []byte, error) {
 	return resp.StatusCode, raw, nil
 }
 
-func (s *settler) swap(inputs []Proof, outs []SignOutput, sig string) ([]blindSig, error) {
+// swap spends the escrow's committed proofs against the committed template's
+// outputs, with the witness carrying BOTH signatures: the bidder's (from the
+// committed template) and the committee's (from the FROST round). The mint
+// needs two, so a committee that is missing the bidder half cannot spend.
+func (s *settler) swap(inputs []Proof, outs []SignOutput, bidderSig, committeeSig string) ([]blindSig, error) {
 	type in struct {
 		ID      string `json:"id"`
 		Amount  int64  `json:"amount"`
@@ -353,7 +328,7 @@ func (s *settler) swap(inputs []Proof, outs []SignOutput, sig string) ([]blindSi
 		C       string `json:"C"`
 		Witness string `json:"witness,omitempty"`
 	}
-	w, _ := json.Marshal(map[string][]string{"signatures": {sig}})
+	w, _ := json.Marshal(map[string][]string{"signatures": {bidderSig, committeeSig}})
 	ins := make([]in, len(inputs))
 	for i, p := range inputs {
 		ins[i] = in{ID: p.ID, Amount: p.Amount, Secret: p.Secret, C: p.C}
@@ -414,7 +389,7 @@ func (s *settler) recover(it dueMove) error {
 	s.mu.Unlock()
 	for i := len(tries) - 1; i >= 0; i-- {
 		a := tries[i]
-		if a.Move != it.Move {
+		if a.Outcome != it.Outcome {
 			continue
 		}
 		var r struct {
@@ -428,7 +403,7 @@ func (s *settler) recover(it dueMove) error {
 		if a.Sig == "" {
 			// crash between signing and journalling the signature: the
 			// proofs are good, but the settle tx needs the group signature
-			return errors.New("escrow swapped by an attempt whose signature was not journalled; pull release or locktime refund remains")
+			return errors.New("escrow swapped by an attempt whose signature was not journalled; the bidder's last-resort refund after locktime remains")
 		}
 		if err := s.finish(a, r.Signatures); err != nil {
 			continue
@@ -478,19 +453,19 @@ func (s *settler) finish(a *settleAttempt, sigs []blindSig) error {
 	return nil
 }
 
-// announce pushes refunds and payouts to every open page at once; the ecash
-// is locked to the recipient's wallet key, so only they can spend it.
+// announce pushes refunds and settles to every open page at once; the ecash is
+// locked to the recipient's wallet key, so only they can spend it.
 func (s *settler) announce(a *settleAttempt, ms map[string]int64, cosigners []string) {
-	if a.Move == "relock" || s.hub == nil {
+	if s.hub == nil {
 		return
 	}
-	b, _ := json.Marshal(map[string]any{"type": "settled", "bid": a.Bid, "auction": a.Auction, "move": a.Move, "to": a.To, "proofs": a.Proofs, "ms": ms, "cosigners": cosigners})
+	b, _ := json.Marshal(map[string]any{"type": "settled", "bid": a.Bid, "auction": a.Auction, "outcome": a.Outcome, "to": a.To, "proofs": a.Proofs, "ms": ms, "cosigners": cosigners})
 	s.hub.broadcast(b)
 }
 
 // submit records the settlement on chain.
 func (s *settler) submit(a *settleAttempt) error {
-	tx := makeSettle(&settleTx{Bid: a.Bid, Move: a.Move, Proofs: a.Proofs, Sig: a.Sig})
+	tx := makeSettle(&settleTx{Bid: a.Bid, Outcome: a.Outcome, Proofs: a.Proofs, Sig: a.Sig})
 	i := s.validator()
 	if i < 0 {
 		return errors.New("no validator running")
@@ -517,16 +492,4 @@ func (s *settler) submit(a *settleAttempt) error {
 		return fmt.Errorf("settle tx refused: %s", rr.Result.Log)
 	}
 	return nil
-}
-
-func sameProofs(a, b []Proof) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].Secret != b[i].Secret {
-			return false
-		}
-	}
-	return true
 }
