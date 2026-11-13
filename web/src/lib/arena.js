@@ -105,6 +105,31 @@ export class ArenaClient {
     return this.cocos.get(key);
   }
 
+  // Coco makes its outputs from the identity's seed with counters it keeps in
+  // IndexedDB. A browser can drop IndexedDB but keep localStorage (where the
+  // seed lives); the counters then start again at 0 and the mint refuses
+  // every new output as "already signed", so top-ups, received refunds and
+  // bids all fail. v0.5.1: on that refusal, run Cashu restore (NUT-09), which
+  // moves the counters past every output the mint has signed and brings back
+  // the identity's unspent ecash, then try once more.
+  async resync(id) {
+    const key = walletPub(id);
+    this.resyncs ??= new Map();
+    if (!this.resyncs.has(key)) {
+      this.resyncs.set(key, (async () => { const m = await this.coco(id); await m.wallet.restore(this.mintUrl); })()
+        .finally(() => this.resyncs.delete(key)));
+    }
+    return this.resyncs.get(key);
+  }
+  async resynced(id, fn) {
+    try { return await fn(); } catch (e) {
+      if (!/already signed/i.test(String(e?.message || e))) throw e;
+      console.warn('wallet counters behind the mint; restoring', e.message);
+      await this.resync(id);
+      return fn();
+    }
+  }
+
   async balance(id) {
     const m = await this.coco(id);
     const b = await m.wallet.balances.byMint();
@@ -117,7 +142,7 @@ export class ArenaClient {
   // identity's Coco wallet.
   async receive(id, proofs) {
     const m = await this.coco(id);
-    await m.wallet.receive(getEncodedToken({ mint: this.mintUrl, unit: 'sat', proofs }));
+    await this.resynced(id, () => m.wallet.receive(getEncodedToken({ mint: this.mintUrl, unit: 'sat', proofs })));
     return sum(proofs);
   }
 
@@ -125,7 +150,8 @@ export class ArenaClient {
   // does not move `updated_at` when that happens, which Coco 2 treats as a
   // conflicting observation, so we wait for PAID ourselves and import the
   // settled quote into Coco, then let Coco mint it.
-  async faucet(id, amount) {
+  async faucet(id, amount) { return this.resynced(id, () => this.faucetOnce(id, amount)); }
+  async faucetOnce(id, amount) {
     const m = await this.coco(id);
     const pj = (u, b) => fetch(this.mintUrl + u, b ? { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) } : {}).then((r) => r.json());
     let q = await pj('/v1/mint/quote/bolt11', { amount, unit: 'sat' });
@@ -135,7 +161,7 @@ export class ArenaClient {
     const op = await m.ops.mint.prepare({ quote, amount });
     let done = await m.ops.mint.execute(op.id);
     for (let i = 0; i < 20 && done.state !== 'finalized'; i++) { await sleep(250); done = await m.ops.mint.get(op.id); }
-    if (done.state !== 'finalized') throw new Error('faucet mint did not finish');
+    if (done.state !== 'finalized') throw new Error('faucet mint did not finish' + (done.error ? ': ' + done.error : ''));
     return this.balance(id);
   }
 
@@ -176,6 +202,9 @@ export class ArenaClient {
       if (state && auction.highBid && state.bids[auction.highBid].bidder === idPub(id)) throw new Error('you are already the highest bidder');
       if ((await this.balance(id)) < amount) throw new Error('not enough sats in wallet');
     }
+    return this.resynced(id, () => this.lockOnce(id, amount, params, auction, now));
+  }
+  async lockOnce(id, amount, params, auction, now) {
     const m = await this.coco(id);
     const locktime = Math.ceil(auction.mode === 'antisnipe' ? now + params.lockMarginSec + 60 : auction.endAt + params.lockMarginSec + 15);
     const prep = await m.ops.send.prepare({
